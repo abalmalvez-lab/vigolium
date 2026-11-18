@@ -16,9 +16,14 @@ import (
 )
 
 type probe struct {
-	path        string
-	name        string
-	markers     []string
+	path string
+	name string
+	// markers is an AND-of-OR group set (see modkit.MatchAllGroups): the body must
+	// contain at least one substring from EVERY group. Generic UI/company words
+	// ("Oracle", "Management Console", "Web Console", "Administration Console") never
+	// form a group on their own — they match any login wall or landing page that
+	// merely mentions them; only the product-name anchor confirms the console.
+	markers     [][]string
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
@@ -27,9 +32,10 @@ type probe struct {
 var probes = []probe{
 	// WildFly / JBoss
 	{
-		path:        "/console",
-		name:        "WildFly/JBoss Admin Console",
-		markers:     []string{"WildFly", "JBoss", "HAL Management Console", "Management Console"},
+		path: "/console",
+		name: "WildFly/JBoss Admin Console",
+		// Drop the bare "Management Console" UI token; anchor on the product.
+		markers:     [][]string{{"WildFly", "JBoss", "HAL Management Console"}},
 		antiMarkers: []string{"404", "Not Found", "H2 Console", "h2-console", "WebLogic"},
 		sev:         severity.High,
 		desc:        "WildFly/JBoss administration console exposed, enabling server management and application deployment",
@@ -37,33 +43,39 @@ var probes = []probe{
 	{
 		path:        "/management",
 		name:        "WildFly Management Endpoint",
-		markers:     []string{`"management-major-version"`, `"product-name"`, "WildFly", "JBoss"},
+		markers:     [][]string{{`"management-major-version"`, `"product-name"`, "WildFly", "JBoss"}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE", "actuator"},
 		sev:         severity.High,
 		desc:        "WildFly/JBoss HTTP management endpoint exposed, providing REST access to server management operations",
 	},
 	// WebLogic
 	{
-		path:        "/console/login/LoginForm.jsp",
-		name:        "WebLogic Admin Console",
-		markers:     []string{"WebLogic", "Oracle", "Console Login", "wl_login"},
+		path: "/console/login/LoginForm.jsp",
+		name: "WebLogic Admin Console",
+		// Drop "Oracle" (a company name on countless pages) and "Console Login"
+		// (generic); anchor on WebLogic-unique strings.
+		markers:     [][]string{{"WebLogic", "wl_login", "console_title"}},
 		antiMarkers: []string{"404", "Not Found"},
 		sev:         severity.High,
 		desc:        "Oracle WebLogic Server admin console login page exposed, a high-value target with multiple known CVEs",
 	},
 	{
-		path:        "/console/",
-		name:        "WebLogic Console (root)",
-		markers:     []string{"WebLogic", "Oracle", "Console"},
+		path: "/console/",
+		name: "WebLogic Console (root)",
+		// Require the WebLogic product string — the bare word "Console" is a common
+		// UI/title token and the path slug, and "Oracle" matches any page that
+		// mentions the company, so neither confirms a console on its own.
+		markers:     [][]string{{"WebLogic", "wl_login"}},
 		antiMarkers: []string{"404", "Not Found", "WildFly", "JBoss", "H2"},
 		sev:         severity.High,
 		desc:        "Oracle WebLogic admin console accessible",
 	},
 	// GlassFish / Payara
 	{
-		path:        "/common/index.jsf",
-		name:        "GlassFish Admin Console",
-		markers:     []string{"GlassFish", "Payara", "Administration Console", "Sun Microsystems"},
+		path: "/common/index.jsf",
+		name: "GlassFish Admin Console",
+		// Drop the generic "Administration Console" UI token.
+		markers:     [][]string{{"GlassFish", "Payara", "Sun Microsystems"}},
 		antiMarkers: []string{"404", "Not Found"},
 		sev:         severity.High,
 		desc:        "GlassFish/Payara administration console exposed, enabling server management and application deployment",
@@ -71,24 +83,27 @@ var probes = []probe{
 	{
 		path:        "/admin-console/",
 		name:        "GlassFish Admin Console (alt)",
-		markers:     []string{"GlassFish", "Payara", "Administration Console"},
+		markers:     [][]string{{"GlassFish", "Payara"}},
 		antiMarkers: []string{"404", "Not Found"},
 		sev:         severity.High,
 		desc:        "GlassFish/Payara admin console accessible at alternate path",
 	},
 	// JBoss legacy
 	{
-		path:        "/jmx-console/",
-		name:        "JBoss JMX Console",
-		markers:     []string{"JBoss", "JMX", "MBean", "Agent View"},
+		path: "/jmx-console/",
+		name: "JBoss JMX Console",
+		// "MBean"/"Agent View" are the JMX-console-specific tokens; drop bare "JMX"
+		// (appears on many Java monitoring pages).
+		markers:     [][]string{{"JBoss", "MBean", "Agent View", "jboss.system"}},
 		antiMarkers: []string{"404", "Not Found"},
 		sev:         severity.Critical,
 		desc:        "JBoss JMX Console exposed without authentication, enabling direct MBean access and potential remote code execution",
 	},
 	{
-		path:        "/web-console/",
-		name:        "JBoss Web Console",
-		markers:     []string{"JBoss", "Web Console", "Administration Console"},
+		path: "/web-console/",
+		name: "JBoss Web Console",
+		// Anchor on the product; "Web Console"/"Administration Console" are generic.
+		markers:     [][]string{{"JBoss"}},
 		antiMarkers: []string{"404", "Not Found"},
 		sev:         severity.High,
 		desc:        "JBoss legacy web console exposed",
@@ -96,7 +111,7 @@ var probes = []probe{
 	{
 		path:        "/invoker/JMXInvokerServlet",
 		name:        "JBoss JMXInvoker",
-		markers:     []string{"\xac\xed"},
+		markers:     [][]string{{"\xac\xed"}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Critical,
 		desc:        "JBoss JMXInvokerServlet exposed, enabling Java deserialization attacks for remote code execution",
@@ -156,17 +171,29 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
+	urlx, err := ctx.URL()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Walk the web root plus any context-path prefixes of the observed URL so an
+	// admin console mounted under a context path (e.g. /myapp/admin-console) is
+	// reached, not just the root. Claim each (host, base) pair up front so a
+	// fully-deduped request issues no traffic — including the soft-404 fingerprint.
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
 		return nil, nil
 	}
 
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
-	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p, fp); result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, p := range probes {
+			if result := m.probeEndpoint(ctx, httpClient, p, base+p.path, fp); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 
@@ -188,11 +215,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -211,22 +236,21 @@ func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	p probe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, p.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -265,6 +289,13 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Catch-all / shell guard: a body textually equivalent to the originally
+	// observed page means the app served its standard shell for this path too —
+	// "the same body with or without the probe".
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
 			return nil
@@ -275,20 +306,23 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
-	}
-	if !matched {
+	// Strip the reflected probe path before matching so a marker that echoes the
+	// requested path (a console path reflected into an href/breadcrumb) can't
+	// satisfy the check on its own.
+	matchBody := modkit.StripReflectedProbePath(body, probePath)
+
+	// Require every marker group (product anchor + any corroboration), not a single
+	// generic UI/company word, then drop the finding if a nonexistent sibling under
+	// the same parent satisfies the same groups (a sub-directory catch-all that 200s
+	// every child path). Root-level probes are covered by the random-path 404
+	// fingerprint above.
+	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, matchBody, p.markers)
+	if !ok {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
 		URL:              targetURL,

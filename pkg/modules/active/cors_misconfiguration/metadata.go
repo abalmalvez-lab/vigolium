@@ -9,22 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects CORS (Cross-Origin Resource Sharing) misconfigurations that allow unauthorized
-cross-origin access. Tests for reflected origins, null origin acceptance, wildcard with
-credentials, and subdomain bypass patterns.
+	ModuleDesc = `**What it means:** The server returns a permissive Cross-Origin Resource Sharing (CORS) policy letting outside origins read its responses, confirmed via Access-Control-Allow-Origin reflecting an attacker-chosen origin, allowing null, pairing wildcard with credentials, or accepting forged subdomain or scheme variants.
 
-## Notes
-- Runs once per host with internal deduplication
-- Sends 4 probes with different Origin headers per host
-- Low false-positive rate due to strict header matching
+**How it's exploited:** An attacker hosts a page that scripts an authenticated cross-origin request. Because the server trusts the attacker's origin, the browser hands the response to attacker JavaScript, leaking session data like API or CSRF tokens.
 
-## References
-- https://portswigger.net/web-security/cors
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/11-Client-side_Testing/07-Testing_Cross_Origin_Resource_Sharing`
+**Fix:** Validate Origin against a strict allowlist of exact trusted origins, never reflect arbitrary origins, never combine the wildcard with credentials, and reject null.`
 
 	ModuleConfirmation = "Confirmed when the server reflects a controlled Origin value in the Access-Control-Allow-Origin header, indicating permissive CORS policy"
-	ModuleSeverity     = severity.Medium
+	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"misconfiguration", "auth-bypass", "moderate"}
 )

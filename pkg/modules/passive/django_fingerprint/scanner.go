@@ -49,7 +49,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 
 	host := urlx.Host
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if diskSet != nil && diskSet.Contains(host) {
 		return nil, nil
 	}
 
@@ -91,8 +91,9 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		extracted = append(extracted, "Body: csrfmiddlewaretoken hidden field")
 	}
 
-	// Signal 4: Response body contains "django" or "Django" in admin/error contexts
-	bodyLower := strings.ToLower(body)
+	// Signal 4: Response body contains "django" or "Django" in admin/error contexts.
+	// Shared, memoized lowercased body (computed once per response across modules).
+	bodyLower := ctx.Response().BodyLowerString()
 	if strings.Contains(body, "Django administration") ||
 		strings.Contains(body, "django-admin") ||
 		strings.Contains(bodyLower, "powered by django") {
@@ -150,6 +151,11 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 
 	scanCtx.MarkTech(host, "django")
 
+	// Claim the host only now that it matched: a host whose
+	// first response showed nothing stays open for later responses.
+	if diskSet != nil && !diskSet.ClaimOnMatch(host) {
+		return nil, nil
+	}
 	return []*output.ResultEvent{
 		{
 			ModuleID:         ModuleID,

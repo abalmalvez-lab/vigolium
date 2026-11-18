@@ -37,6 +37,14 @@ bin
 !pkg/audit/bin/_bin/
 !pkg/audit/bin/_bin/.gitkeep
 !pkg/audit/bin/_bin/.gitignore
+
+# Same trap, second victim: build/npm/bin/vigolium.js is the npm launcher that
+# build/npm/build.mjs copies into the published package (LAUNCHER_SRC). The
+# `bin` rules above kept it untracked, so it was never committed and every
+# fresh clone failed `make npm-build` with ENOENT on copyFileSync. It is
+# hand-written source, not a build artifact.
+!build/npm/bin/
+!build/npm/bin/vigolium.js
 .vscode
 
 # Go build artifacts
@@ -89,6 +97,10 @@ test/integration/*-test/
 **/vigolium-results/findings-draft/
 **/vigolium-results/longshot/
 **/vigolium-results/attack-surface/
+**/vigolium-results/codeql-artifacts/
+**/vigolium-results/codeql-queries/
+**/vigolium-results/semgrep-res/
+**/vigolium-results/semgrep-rules/
 **/piolium/audit-state.json
 **/piolium/file-records/
 **/piolium/attack-surface/
@@ -96,8 +108,8 @@ test/integration/*-test/
 
 # some binaries and outputs from the skill that we don't want to accidentally commit
 # better to ignore the whole directory since there are multiple outputs and it can be hard to keep track of them all
-public/presets/deparos/jsscan/jsscan-*
-internal/resources/deparos/jsscan/*
+public/presets/deparos/jstangle/jstangle-*
+internal/resources/deparos/jstangle/*
 
 internal/resources/spitolas/chromium/*
 
@@ -110,4 +122,14 @@ internal/resources/spitolas/chromium/*
 build/dist-license/
 build/dist-public/
 build/dist-npm/
+build/dist-packages/
+build/packaging/__pycache__/
 build/public-install.sh
+
+# Local planning documents
+/docs/planning/
+
+# Archon audit SAST working artifacts
+/archon/codeql-artifacts/
+/archon/codeql-queries/
+/archon/semgrep-res/

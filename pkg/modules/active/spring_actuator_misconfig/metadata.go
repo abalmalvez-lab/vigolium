@@ -9,20 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects exposed Spring Boot Actuator endpoints that leak sensitive application
-information such as environment variables, health status, and configuration.
+	ModuleDesc = `**What it means:** Spring Boot Actuator endpoints (/env, /beans, /health, /metrics, /mappings, /loggers) are reachable without authentication, exposing internal application state meant only for operators.
 
-## Notes
-- Checks common actuator paths (/actuator, /env, /health, /info, /mappings, etc.)
-- Runs per-request to detect misconfigured access controls
-- Exposed actuators can leak secrets, internal URLs, and database credentials
+**How it's exploited:** Attackers read /env or /beans to harvest environment variables, database credentials, API keys, and internal hostnames, then map routes via /mappings - enabling lateral movement, or remote code execution where endpoints are writable. Hits are confirmed by their actuator-specific JSON structure to rule out soft-404 shells.
 
-## References
-- https://docs.spring.io/spring-boot/reference/actuator/endpoints.html
-- https://www.veracode.com/blog/research/exploiting-spring-boot-actuators`
+**Fix:** Require authentication on Actuator, expose only /health publicly, and restrict management endpoints via management.endpoints.web.exposure and network controls.`
 
-	ModuleConfirmation = "Confirmed when actuator endpoints return valid JSON responses containing application configuration or health data"
+	ModuleConfirmation = "Confirmed when an actuator path returns JSON matching that endpoint's specific actuator structure, the response is not the host's wildcard/soft-404 shell, and a guaranteed-nonexistent sibling under the same directory does not return the same content (ruling out catch-all handlers)"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"spring", "java", "misconfiguration", "info-disclosure", "light"}

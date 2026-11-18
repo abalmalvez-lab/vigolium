@@ -5,15 +5,34 @@ import type { Adapter } from "../adapters/adapter.js";
 import type { ContentLoader, ContentVariant } from "../content-loader.js";
 import { OrchestratorBus, type OrchestratorEvent } from "./events.js";
 import { scheduleBatches, topologicalOrder } from "./phase.js";
-import { StateStore, buildAuditId, newAuditRecord } from "./state.js";
+import {
+  StateStore,
+  buildAuditId,
+  findResumableAudit,
+  findResumableAuditById,
+  newAuditRecord,
+} from "./state.js";
 import type { AuditContext, AuditMode, AuditRecord, CommandDef, PhaseDef } from "./types.js";
-import { listTrackedFiles, probeGit } from "./git.js";
-import { compact, parseIntEnv, round2, sleepInterruptible } from "./util.js";
-import { adapterEventHasQuotaLimit, adapterEventHasRetryableError, isTransientError, valueContainsQuotaLimit } from "../adapters/claude-events.js";
+import {
+  isGitWorktreeCleanForKnowledgeBaseReuse,
+  listTrackedFiles,
+  probeGit,
+} from "./git.js";
+import { compact, round2 } from "./util.js";
+import { resolveRetryConfig, runWithRetry } from "./retry.js";
+import { adapterEventHasQuotaLimit, adapterEventHasRetryableError, isTransientError, quotaResetDelayMs, valueContainsQuotaLimit } from "../adapters/claude-events.js";
 import { CheckpointStore } from "./checkpoint.js";
+import { CostManager } from "./cost.js";
 import { detectDraftOwner, startFindingsWatcher, summarizeFindings } from "./findings.js";
-import { stripRawArtifacts } from "./strip-artifacts.js";
+import { finalizeOutput } from "./redact-artifacts.js";
 import { composeUserPrompt, parseToolsField } from "./prompts.js";
+import { evaluatePhaseArtifacts, formatArtifactFailures } from "./artifact-gates.js";
+import { archivePriorCoreArtifacts, isCoreAuditMode } from "./artifact-lifecycle.js";
+import {
+  knowledgeBaseReference,
+  stageKnowledgeBaseInput,
+  type ResolvedKnowledgeBase,
+} from "./knowledge-base.js";
 
 export interface OrchestratorOptions {
   adapter: Adapter;
@@ -29,6 +48,8 @@ export interface OrchestratorOptions {
   failurePolicy?: "skip-and-continue" | "strict";
   /** Resume the latest in-progress audit for this mode if one exists. */
   resume?: boolean;
+  /** Exact resumable audit selected by a higher-level router. */
+  resumeAuditId?: string;
   /** External signal to abort the audit cleanly. */
   abortSignal?: AbortSignal;
   /**
@@ -70,6 +91,12 @@ export interface OrchestratorOptions {
    */
   stripRaw?: boolean;
   /**
+   * When the post-`complete` strip runs, retain DB snapshots and skip
+   * scrubbing secrets from `confirm-workspace/` JSON + logs. The junk sweep
+   * still runs. Default: redact. See `RunOptions.keepSecrets`.
+   */
+  keepSecrets?: boolean;
+  /**
    * User-supplied focus prose (already loaded from --focus-file). Injected
    * as a soft hint into every phase's user prompt and persisted into the
    * audit record so chained modes can inherit it.
@@ -81,6 +108,8 @@ export interface OrchestratorOptions {
    * phase's user prompt and persisted into the audit record.
    */
   expectedBehaviors?: string;
+  /** Resolved immutable documentation corpus staged after fresh-run archival. */
+  knowledgeBase?: ResolvedKnowledgeBase;
   /**
    * Live HTTP(S) endpoint for `confirm` mode. Substituted for `$ARGUMENTS`
    * in the command body and surfaced as a `Live target:` header in every
@@ -139,26 +168,29 @@ export class Orchestrator {
   readonly bus = new OrchestratorBus();
   private readonly state: StateStore;
   private readonly checkpoints: CheckpointStore;
-  private totalUsd = 0;
-  private totalIn = 0;
-  private totalOut = 0;
-  private warnedAtUsd = 0;
+  /**
+   * Cumulative spend + token tracker. Owns the cost-cap policy and the internal
+   * abort signal fired when the cap is breached (composed with `opts.abortSignal`
+   * so adapters see one signal that fires on either SIGINT or budget exhaustion).
+   */
+  private readonly cost: CostManager;
   /**
    * Phase IDs of the running command, cached from `run()` so per-failure
    * quarantine doesn't re-parse the command YAML on every failed phase.
    */
   private allPhaseIds: string[] | null = null;
-  /**
-   * Internal abort controller fired when the cost cap is breached. Composed
-   * with `opts.abortSignal` so adapters see a single signal that fires on
-   * either user-initiated SIGINT or budget exhaustion.
-   */
-  private readonly costAbort = new AbortController();
+  /** Start of the active audit, used to reject untouched artifacts from older fresh runs. */
+  private activeAuditStartedAtMs: number | undefined;
 
   constructor(private readonly opts: OrchestratorOptions) {
     const resultsDir = opts.resultsDir ?? join(opts.targetDir, "vigolium-results");
     this.state = new StateStore(resultsDir);
     this.checkpoints = new CheckpointStore(resultsDir);
+    this.cost = new CostManager(opts.maxCost, (args) => {
+      // Fire-and-forget: a cost-warning listener must never abort the audit.
+      // Swallow listener failures so an unhandled rejection can't crash us.
+      void this.bus.emit({ kind: "costWarn", ...args }).catch(() => {});
+    });
   }
 
   /**
@@ -167,9 +199,9 @@ export class Orchestrator {
    */
   private combinedAbortSignal(): AbortSignal {
     const user = this.opts.abortSignal;
-    if (!user) return this.costAbort.signal;
+    if (!user) return this.cost.signal;
     if (user.aborted) return user;
-    return AbortSignal.any([user, this.costAbort.signal]);
+    return AbortSignal.any([user, this.cost.signal]);
   }
 
   on(listener: (e: OrchestratorEvent) => void | Promise<void>): () => void {
@@ -199,12 +231,17 @@ export class Orchestrator {
         );
       } else if (excludeSet.has(p.id)) {
         skipReasons.set(p.id, "excluded by --mode refresh fresh-fallback policy");
+      } else if (p.requires_knowledge_base && this.opts.knowledgeBase === undefined) {
+        skipReasons.set(p.id, "no knowledge-base flag or knowledge-base directory was resolved");
       }
     }
     const runnable = ordered.filter((p) => !skipReasons.has(p.id));
     const skipped = ordered.filter((p) => skipReasons.has(p.id));
 
     const auditId = await this.resolveAuditId(command, runnable);
+    if (this.opts.knowledgeBase !== undefined) {
+      await stageKnowledgeBaseInput(resultsDir, this.opts.knowledgeBase);
+    }
 
     const stopFindingsWatch = this.startFindingsWatcher(resultsDir, auditId);
     let watchStopped = false;
@@ -268,7 +305,7 @@ export class Orchestrator {
     let i = 0;
     const total = runnable.length;
     for (const batch of batches) {
-      if (this.opts.abortSignal?.aborted || this.costAbort.signal.aborted) {
+      if (this.opts.abortSignal?.aborted || this.cost.signal.aborted) {
         aborted = true;
         break;
       }
@@ -281,13 +318,31 @@ export class Orchestrator {
       const toRun: PhaseDef[] = [];
       for (const phase of batch) {
         const phaseStatus = auditBefore?.phases[phase.id]?.status;
-        if (phaseStatus === "complete" || phaseStatus === "skipped") continue;
+        if (phaseStatus === "skipped") continue;
+        if (phaseStatus === "complete") {
+          const gate = await evaluatePhaseArtifacts(phase, resultsDir, this.artifactGateOptions());
+          if (gate.ok || phase.completion?.enforcement === "advisory") continue;
+          const missing = formatArtifactFailures(gate).join("; ");
+          await this.bus.emit({
+            kind: "phaseAdapterEvent",
+            auditId,
+            phase,
+            event: {
+              kind: "textDelta",
+              text: `[artifact-gate] completed phase no longer satisfies its contract; rerunning: ${missing}\n`,
+            },
+          });
+          await this.state.updatePhase(auditId, phase.id, {
+            status: "pending",
+            error: `artifact contract failed during resume: ${missing}`,
+          });
+        }
         if (phaseStatus === "in_progress") {
           const checkpoint = await this.checkpoints.load(auditId, phase.id);
           if (checkpoint) {
-            this.totalUsd += checkpoint.usd;
-            this.totalIn += checkpoint.tokens.input;
-            this.totalOut += checkpoint.tokens.output;
+            // Roll the prior attempt's spend in silently — it was already
+            // reported, so it must not re-trip warnings or the cap here.
+            this.cost.addSilently(checkpoint.usd, checkpoint.tokens);
             await this.bus.emit({
               kind: "phaseAdapterEvent",
               auditId,
@@ -340,7 +395,7 @@ export class Orchestrator {
           if (this.opts.failurePolicy === "strict") aborted = true;
         }
       }
-      if (this.opts.maxCost !== undefined && this.totalUsd >= this.opts.maxCost) {
+      if (this.cost.overCap) {
         aborted = true;
       }
       if (aborted) break;
@@ -351,24 +406,35 @@ export class Orchestrator {
       : failedPhases.length === 0
         ? "complete"
         : "failed";
+    const currentAudit = (await this.state.load()).audits.find(
+      (audit) => audit.audit_id === auditId,
+    );
+    const completedKnowledgeBaseSnapshotClean =
+      this.opts.mode === "knowledge-base" && status === "complete"
+        ? currentAudit?.source_snapshot_clean === true &&
+          isGitWorktreeCleanForKnowledgeBaseReuse(this.opts.targetDir) === true
+        : undefined;
     await this.state.updateAudit(auditId, {
       status,
       completed_at: new Date().toISOString(),
+      ...(completedKnowledgeBaseSnapshotClean !== undefined
+        ? { source_snapshot_clean: completedKnowledgeBaseSnapshotClean }
+        : {}),
       usage: {
-        input_tokens: this.totalIn,
-        output_tokens: this.totalOut,
-        cost_usd: round2(this.totalUsd),
+        input_tokens: this.cost.tokens.input,
+        output_tokens: this.cost.tokens.output,
+        cost_usd: round2(this.cost.usd),
       },
     });
 
     const findings = await summarizeFindings(resultsDir);
-    const tokens = { input: this.totalIn, output: this.totalOut };
+    const tokens = this.cost.tokens;
 
     await this.bus.emit({
       kind: "auditEnd",
       auditId,
       status,
-      usd: round2(this.totalUsd),
+      usd: round2(this.cost.usd),
       tokens,
       findings,
     });
@@ -389,6 +455,9 @@ export class Orchestrator {
             files,
             auditId,
             completedPhaseIds,
+            // `files` is the full tracked set, so entries missing from it are
+            // deletions rather than an incomplete list.
+            prune: true,
           });
         }
       } catch {
@@ -400,19 +469,22 @@ export class Orchestrator {
     // the audit-state.json write, the findings summary, or the auditEnd event.
     // Skipped on failed/aborted runs so users can resume or debug raw output.
     if (status === "complete" && this.opts.stripRaw) {
-      await stripRawArtifacts(resultsDir, {
+      await finalizeOutput(resultsDir, {
         // Lite's historical --strip-raw behavior promotes raw drafts because
         // lite may never materialize full finding directories. Deep/balanced
         // drafts are intermediate debate artifacts and must not be promoted.
         promoteDrafts: this.opts.mode === "lite",
         keepConfirmWorkspace: this.opts.mode === "confirm",
+        // Sweep scanner scratch and (unless opted out) redact confirm-workspace
+        // secrets as part of the same final pass.
+        ...(this.opts.keepSecrets ? { keepSecrets: true } : {}),
       });
     }
 
     return {
       auditId,
       status,
-      totalUsd: round2(this.totalUsd),
+      totalUsd: round2(this.cost.usd),
       totalTokens: tokens,
       findings,
       failedPhases,
@@ -423,19 +495,16 @@ export class Orchestrator {
   private async resolveAuditId(command: CommandDef, runnable: PhaseDef[]): Promise<string> {
     const state = await this.state.load();
     if (this.opts.resume) {
-      // Pick the latest audit for this mode that didn't reach `complete`.
-      // `in_progress` covers process-killed-mid-phase; `failed`/`aborted`
-      // cover orderly terminal states (cost cap, strict failure, SIGINT).
-      // Each is resumable: completed phases are skipped, pending re-runs,
-      // stale in_progress phases get quarantined in runPhase prep.
-      const existing = [...state.audits].reverse().find(
-        (a) =>
-          a.mode === command.mode &&
-          (a.status === "in_progress" ||
-            a.status === "failed" ||
-            a.status === "aborted"),
-      );
+      const existing = this.opts.resumeAuditId !== undefined
+        ? findResumableAuditById(
+            state.audits,
+            this.opts.resumeAuditId,
+            command.mode as AuditMode,
+          )
+        : findResumableAudit(state.audits, command.mode as AuditMode);
       if (existing) {
+        const startedAtMs = Date.parse(existing.started_at);
+        this.activeAuditStartedAtMs = Number.isFinite(startedAtMs) ? startedAtMs : undefined;
         if (existing.status !== "in_progress") {
           await this.state.updateAudit(existing.audit_id, {
             status: "in_progress",
@@ -444,8 +513,17 @@ export class Orchestrator {
         }
         return existing.audit_id;
       }
+      if (this.opts.resumeAuditId !== undefined) {
+        throw new Error(
+          `cannot resume audit ${this.opts.resumeAuditId}: no matching non-complete ${command.mode} audit was found`,
+        );
+      }
     }
     const auditId = buildAuditId();
+    if (state.audits.length > 0 && isCoreAuditMode(command.mode as AuditMode)) {
+      const resultsDir = this.opts.resultsDir ?? join(this.opts.targetDir, "vigolium-results");
+      await archivePriorCoreArtifacts(resultsDir, auditId);
+    }
     const phaseIds = runnable.map((p) => p.id);
     const git = this.opts.noGit
       ? { available: false, branch: null, commit: null, repository: null }
@@ -459,9 +537,17 @@ export class Orchestrator {
       commit: git.commit,
       branch: git.branch,
       repository: git.repository,
+      historyAvailable: git.available,
+      ...(command.mode === "knowledge-base" && git.available
+        ? {
+            sourceSnapshotClean:
+              isGitWorktreeCleanForKnowledgeBaseReuse(this.opts.targetDir) === true,
+          }
+        : {}),
       phaseIds,
       ...compact({ context, triggeredVia: this.opts.triggeredVia }),
     });
+    this.activeAuditStartedAtMs = Date.parse(record.started_at);
     await this.state.appendAudit(record);
     return auditId;
   }
@@ -474,7 +560,12 @@ export class Orchestrator {
     if (typeof this.opts.expectedBehaviors === "string" && this.opts.expectedBehaviors.length > 0) {
       ctx.expected_behaviors = this.opts.expectedBehaviors;
     }
-    return ctx.focus === undefined && ctx.expected_behaviors === undefined ? undefined : ctx;
+    if (this.opts.knowledgeBase !== undefined) {
+      ctx.knowledge_base = knowledgeBaseReference(this.opts.knowledgeBase);
+    }
+    return ctx.focus === undefined && ctx.expected_behaviors === undefined && ctx.knowledge_base === undefined
+      ? undefined
+      : ctx;
   }
 
   private async runPhase(
@@ -482,15 +573,20 @@ export class Orchestrator {
     phase: PhaseDef,
     command: CommandDef,
   ): Promise<{ ok: boolean; usd: number; tokens: { input: number; output: number }; durationMs: number; error?: string }> {
+    const resultsDir = this.opts.resultsDir ?? join(this.opts.targetDir, "vigolium-results");
     const startedAt = new Date().toISOString();
     await this.state.updatePhase(auditId, phase.id, { status: "in_progress", started_at: startedAt });
 
     const { systemPrompt, userPrompt, tools } = await this.buildPrompts(phase, command, auditId);
-    const transientRetries = this.opts.transientRetries ?? 3;
-    const transientBaseDelayMs = 1000;
-    const quotaMaxRetries = this.opts.quotaMaxRetries ?? parseIntEnv(process.env.VIGOLIUM_AUDIT_QUOTA_MAX_RETRIES, 5);
-    const quotaDelayMs = this.opts.quotaBackoffMs ?? parseIntEnv(process.env.VIGOLIUM_AUDIT_QUOTA_BACKOFF_MS, 60 * 60 * 1000);
-    const maxAttempts = Math.max(transientRetries, quotaMaxRetries);
+    const retryConfig = resolveRetryConfig({
+      ...(this.opts.quotaMaxRetries !== undefined ? { quotaMaxRetries: this.opts.quotaMaxRetries } : {}),
+      ...(this.opts.quotaBackoffMs !== undefined ? { quotaBackoffMs: this.opts.quotaBackoffMs } : {}),
+      ...(this.opts.transientRetries !== undefined ? { transientMaxRetries: this.opts.transientRetries } : {}),
+      // The orchestrator drives one adapter call per phase, so a transient retry
+      // after progress would replay events — skip it. Quota retries still apply.
+      skipTransientAfterProgress: true,
+      defaults: { quotaMaxRetries: 5, transientMaxRetries: 3, transientBaseDelayMs: 1000 },
+    });
 
     let usd = 0;
     let tokens = { input: 0, output: 0 };
@@ -498,67 +594,119 @@ export class Orchestrator {
     let ok = false;
     let error: string | undefined;
 
-    for (let attempt = 0; attempt <= maxAttempts; attempt++) {
-      const result = await this.driveAdapterOnce({
-        systemPrompt,
-        userPrompt,
-        tools,
-        auditId,
-        phase,
-        command,
-      });
-      usd = result.usd;
-      tokens = result.tokens;
-      durationMs = result.durationMs;
-      ok = result.ok;
-      error = result.error;
+    await runWithRetry(retryConfig, {
+      abortSignal: this.combinedAbortSignal(),
+      attempt: async () => {
+        const result = await this.driveAdapterOnce({ systemPrompt, userPrompt, tools, auditId, phase, command });
+        usd += result.usd;
+        tokens = {
+          input: tokens.input + result.tokens.input,
+          output: tokens.output + result.tokens.output,
+        };
+        durationMs += result.durationMs;
+        // Record every attempt immediately so failed retries count toward the
+        // budget and can prevent another costly attempt from starting.
+        this.cost.record(auditId, result.usd, result.tokens);
+        ok = result.ok;
+        error = result.error;
+        return {
+          ok: result.ok,
+          quotaLimit: result.quotaLimit,
+          transient: result.transient,
+          sawProgress: result.sawProgress,
+          parsedQuotaDelayMs: result.parsedQuotaDelayMs,
+          error: result.error,
+        };
+      },
+      note: async (text) => {
+        await this.bus.emit({ kind: "phaseAdapterEvent", auditId, phase, event: { kind: "textDelta", text } });
+      },
+      probe: () => this.opts.adapter.probe(),
+    });
 
-      if (ok) break;
+    let adapterFailed = !ok;
 
-      // Quota-limit retries: long wall-clock sleep (default 1h × 5), bypass the
-      // sawProgress short-circuit since the user explicitly wants us to wait
-      // out the quota reset rather than fail the audit.
-      if (result.quotaLimit) {
-        if (attempt >= quotaMaxRetries) break;
-        const minutes = Math.round(quotaDelayMs / 60000);
+    if (ok && phase.completion) {
+      let gate = await evaluatePhaseArtifacts(phase, resultsDir, this.artifactGateOptions());
+      const repairAttempts = phase.completion.repair_attempts;
+      for (
+        let attempt = 1;
+        !gate.ok && attempt <= repairAttempts && !this.cost.signal.aborted;
+        attempt++
+      ) {
+        const failures = formatArtifactFailures(gate);
         await this.bus.emit({
           kind: "phaseAdapterEvent",
           auditId,
           phase,
           event: {
             kind: "textDelta",
-            text: `[quota limit hit — sleeping ${minutes}m before retry ${attempt + 1}/${quotaMaxRetries} — ${error ?? "usage limit reached"}]\n`,
+            text:
+              `[artifact-gate] repair ${attempt}/${repairAttempts}: ` +
+              `${failures.join("; ")}\n`,
           },
         });
-        await sleepInterruptible(quotaDelayMs, this.combinedAbortSignal());
-        if (this.combinedAbortSignal().aborted) break;
-        continue;
+
+        const repair = await this.driveAdapterOnce({
+          systemPrompt,
+          userPrompt: this.buildArtifactRepairPrompt(phase, failures),
+          tools,
+          auditId,
+          phase,
+          command,
+          labelSuffix: `repair-${attempt}`,
+        });
+        usd += repair.usd;
+        tokens = {
+          input: tokens.input + repair.tokens.input,
+          output: tokens.output + repair.tokens.output,
+        };
+        durationMs += repair.durationMs;
+        this.cost.record(auditId, repair.usd, repair.tokens);
+
+        if (!repair.ok) {
+          if (phase.completion.enforcement === "required") {
+            ok = false;
+            adapterFailed = true;
+            error = repair.error ?? `artifact repair ${attempt} failed`;
+          } else {
+            await this.bus.emit({
+              kind: "phaseAdapterEvent",
+              auditId,
+              phase,
+              event: {
+                kind: "textDelta",
+                text: `[artifact-gate] advisory repair failed; continuing: ${repair.error ?? "unknown adapter error"}\n`,
+              },
+            });
+          }
+          break;
+        }
+        gate = await evaluatePhaseArtifacts(phase, resultsDir, this.artifactGateOptions());
       }
 
-      // Ordinary transient retry: short exponential backoff, only if no
-      // progress events were emitted (mid-stream retry would replay events).
-      if (!result.transient || result.sawProgress || attempt >= transientRetries) break;
-      const delay = transientBaseDelayMs * Math.pow(2, attempt);
-      await this.bus.emit({
-        kind: "phaseAdapterEvent",
-        auditId,
-        phase,
-        event: { kind: "textDelta", text: `[retry ${attempt + 1}/${transientRetries} after ${delay}ms — ${error ?? "transient error"}]\n` },
-      });
-      await new Promise((r) => setTimeout(r, delay));
+      if (ok && !gate.ok) {
+        const detail = formatArtifactFailures(gate).join("; ");
+        if (phase.completion.enforcement === "required") {
+          ok = false;
+          error = `artifact contract failed: ${detail}`;
+        } else {
+          await this.bus.emit({
+            kind: "phaseAdapterEvent",
+            auditId,
+            phase,
+            event: { kind: "textDelta", text: `[artifact-gate] advisory artifacts missing: ${detail}\n` },
+          });
+        }
+      }
     }
-
-    this.totalUsd += usd;
-    this.totalIn += tokens.input;
-    this.totalOut += tokens.output;
-    this.maybeWarnCost(auditId);
 
     if (!ok && !error) {
       ok = false;
       error = "phase finished without a success event";
     }
 
-    if (!ok) {
+    if (!ok && adapterFailed) {
       await this.quarantinePartialOutput(auditId, phase);
     }
 
@@ -585,6 +733,12 @@ export class Orchestrator {
     return { ok, usd, tokens, durationMs, ...(error !== undefined ? { error } : {}) };
   }
 
+  private artifactGateOptions(): { notBeforeMs?: number } {
+    return !isCoreAuditMode(this.opts.mode) || this.activeAuditStartedAtMs === undefined
+      ? {}
+      : { notBeforeMs: this.activeAuditStartedAtMs };
+  }
+
   private async buildPrompts(
     phase: PhaseDef,
     command: CommandDef,
@@ -600,7 +754,8 @@ export class Orchestrator {
       // Inline phase: derive tools from the command-def's allowed-tools field.
       systemPrompt =
         `You are an inline executor for the "${command.mode}" audit pipeline. ` +
-        `Run phase "${phase.id}: ${phase.title}" exactly as specified in the command-def below.\n\n` +
+        `Run phase "${phase.id}: ${phase.title}" exactly as specified in the command-def below. ` +
+        `The engine exclusively owns vigolium-results/audit-state.json; never edit phase state yourself.\n\n` +
         command.body;
       tools = parseToolsField(command.allowed_tools_raw);
     }
@@ -611,6 +766,10 @@ export class Orchestrator {
     const userPrompt = composeUserPrompt(phase, command, auditId, this.opts.targetDir, compact({
       focus: this.opts.focus,
       expectedBehaviors: this.opts.expectedBehaviors,
+      knowledgeBase:
+        this.opts.knowledgeBase !== undefined
+          ? knowledgeBaseReference(this.opts.knowledgeBase)
+          : undefined,
       liveTarget: this.opts.liveTarget,
     }));
     return { systemPrompt, userPrompt, tools };
@@ -627,6 +786,7 @@ export class Orchestrator {
     auditId: string;
     phase: PhaseDef;
     command: CommandDef;
+    labelSuffix?: string;
   }): Promise<{
     ok: boolean;
     usd: number;
@@ -636,6 +796,7 @@ export class Orchestrator {
     transient: boolean;
     quotaLimit: boolean;
     sawProgress: boolean;
+    parsedQuotaDelayMs: number | null;
   }> {
     let usd = 0;
     let tokens = { input: 0, output: 0 };
@@ -646,6 +807,7 @@ export class Orchestrator {
     let transient = false;
     let quotaLimit = false;
     let sawProgress = false;
+    let parsedQuotaDelayMs: number | null = null;
 
     const startedAt = Date.now();
     let toolCalls = 0;
@@ -658,7 +820,6 @@ export class Orchestrator {
         ...(lastTool !== undefined ? { lastTool } : {}),
         usd,
         tokens,
-        sawProgress,
       });
     };
 
@@ -671,7 +832,7 @@ export class Orchestrator {
         ...(this.opts.defaultModel ? { model: this.opts.defaultModel } : {}),
         abortSignal: this.combinedAbortSignal(),
         ...(this.opts.debug ? { debug: true } : {}),
-        label: `${args.command.mode}:${args.phase.id}`,
+        label: `${args.command.mode}:${args.phase.id}${args.labelSuffix ? `:${args.labelSuffix}` : ""}`,
       })) {
         await this.bus.emit({ kind: "phaseAdapterEvent", auditId: args.auditId, phase: args.phase, event });
         if (event.kind === "rateLimits") {
@@ -680,8 +841,14 @@ export class Orchestrator {
         if (event.kind === "textDelta" || event.kind === "toolCall") {
           sawProgress = true;
         }
-        if (!quotaLimit && adapterEventHasQuotaLimit(event)) {
+        if (adapterEventHasQuotaLimit(event)) {
           quotaLimit = true;
+          // Prefer the soonest streamed "resets at" delay so the retry sleeps
+          // exactly until the quota clears rather than a fixed fallback.
+          const delay = quotaResetDelayMs(event);
+          if (delay !== null && (parsedQuotaDelayMs === null || delay < parsedQuotaDelayMs)) {
+            parsedQuotaDelayMs = delay;
+          }
         }
         if (!transient && adapterEventHasRetryableError(event)) {
           transient = true;
@@ -734,7 +901,18 @@ export class Orchestrator {
       transient,
       quotaLimit,
       sawProgress,
+      parsedQuotaDelayMs,
     };
+  }
+
+  private buildArtifactRepairPrompt(phase: PhaseDef, failures: string[]): string {
+    return [
+      `Artifact repair for phase ${phase.id} — ${phase.title}.`,
+      `Write only the missing or invalid phase-owned artifacts listed below.`,
+      `Do not rerun completed analysis, modify unrelated artifacts, or edit vigolium-results/audit-state.json.`,
+      ...failures.map((failure) => `- ${failure}`),
+      `Finish after the artifacts are repaired; the engine will validate them deterministically.`,
+    ].join("\n");
   }
 
   private async quarantinePartialOutput(auditId: string, phase: PhaseDef): Promise<void> {
@@ -768,25 +946,6 @@ export class Orchestrator {
         /* best-effort */
       }
     }
-  }
-
-  private maybeWarnCost(auditId: string): void {
-    if (this.opts.maxCost === undefined) return;
-    const cap = this.opts.maxCost;
-    const thresholds = [0.5, 0.75, 0.9, 1.0];
-    for (const t of thresholds) {
-      const at = cap * t;
-      if (this.totalUsd >= at && this.warnedAtUsd < at) {
-        this.warnedAtUsd = at;
-        // Fire-and-forget: a cost-warning listener must never abort the audit.
-        // Swallow listener failures so an unhandled rejection can't crash us.
-        void this.bus.emit({ kind: "costWarn", auditId, usd: round2(this.totalUsd), cap }).catch(() => {});
-      }
-    }
-    // At-or-over the cap: fire the internal abort signal so any pending /
-    // next adapter call terminates immediately rather than waiting for the
-    // between-phase check. AbortController.abort() is idempotent.
-    if (this.totalUsd >= cap) this.costAbort.abort();
   }
 
   private startFindingsWatcher(resultsDir: string, auditId: string): () => void {

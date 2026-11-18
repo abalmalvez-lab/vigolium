@@ -9,42 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Broken Object Level Authorization (BOLA) and Insecure Direct Object Reference
-(IDOR) by replaying the same request with different authenticated sessions and comparing
-responses.
+	ModuleDesc = `**What it means:** The application fails to enforce object-level authorization: a request returning one user's data also returns data to a second authenticated session that lacks access. This is Broken Object Level Authorization (BOLA/IDOR).
 
-When multiple sessions are configured (via --session or --auth-config), this module
-replays each request observed by the primary session using the compare sessions. It then
-analyzes the response differences to detect missing authorization enforcement.
+**How it's exploited:** An attacker logged in as another user replays a victim's request referencing an account or document ID and receives the victim's identity-bearing object instead of a 401, 403, or the attacker's own personalized object.
 
-## Detection Logic
-For each request from the primary session:
-1. Skip static assets, media files, and non-authenticated endpoints
-2. Replay the request with each compare session's credentials
-3. Compare primary vs compare responses:
-   - Primary 200, Compare 401/403 → properly enforced (skip)
-   - Primary 200, Compare 302→login → properly enforced (skip)
-   - Primary 200, Compare 200 (same content) → public data (skip)
-   - Primary 200, Compare 200 (different content) → IDOR/BOLA finding
-   - Primary non-200 → skip (primary can't access either)
+**Fix:** Enforce per-object ownership checks server-side on every request, verifying the principal is authorized for the specific object rather than relying on unguessable IDs.`
 
-## Requirements
-- At least 2 sessions must be configured: one primary and one or more compare sessions
-- Sessions are configured via ` + "`--session`" + `, ` + "`--auth-config`" + `, or ` + "`--session-file`" + ` CLI flags
-
-## Notes
-- This module is automatically skipped when no compare sessions are configured
-- Covers OWASP API1:2023 (Broken Object Level Authorization)
-- Complements the idor-detection module which tests neighbor IDs within a single session
-- Uses structural response comparison from authzutil for robust matching
-
-## References
-- https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
-- https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/
-- https://cwe.mitre.org/data/definitions/639.html`
-
-	ModuleConfirmation = "Indicated when two different authenticated sessions receive structurally similar 200 responses with different content at the same endpoint, suggesting missing authorization enforcement"
+	ModuleConfirmation = "Indicated when a compare session receives a successful response that retains the primary session's owner/account/user identity values for a self-scoped or object-referenced request"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"idor", "bola", "auth-bypass", "access-control", "api-security", "moderate"}

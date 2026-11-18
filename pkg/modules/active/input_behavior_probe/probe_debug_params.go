@@ -29,13 +29,10 @@ func probeDebugParams(
 				continue
 			}
 
-			req, err := httpmsg.ParseRawRequest(string(raw))
-			if err != nil {
-				continue
-			}
-			req = req.WithService(ctx.Service())
+			// raw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+			req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 
-			resp, _, err := httpClient.Execute(req, http.Options{})
+			resp, _, err := httpClient.Execute(req, probeOptions(false))
 			if err != nil {
 				if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 					return results
@@ -44,7 +41,7 @@ func probeDebugParams(
 			}
 
 			change := detectChange(baseline, resp.Body().String(), resp.Response().StatusCode)
-			if change.IsInteresting {
+			if confirmChange(ctx, httpClient, baseline, raw, change) {
 				results = append(results, buildProbeResult(
 					urlStr, raw, resp.FullResponseString(),
 					name, "debug_param", name+"="+value, change,

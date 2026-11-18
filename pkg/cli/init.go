@@ -6,12 +6,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/internal/paths"
+	oliumresources "github.com/vigolium/vigolium/internal/resources/olium"
+	"github.com/vigolium/vigolium/pkg/apicontract"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/diagnostics"
+	"github.com/vigolium/vigolium/pkg/olium/skill"
+	"github.com/vigolium/vigolium/pkg/spitolas"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/public"
 	"go.uber.org/zap"
@@ -23,11 +30,15 @@ const (
 )
 
 // writeInitMarker stamps ~/.vigolium/initialized with the binary version and
-// current timestamp. The marker means "first-run dependency setup is
-// complete" — written by ensureCoreDeps after the core native-scan tooling
-// (chromium + nuclei templates) is confirmed present. Once stamped, scan
+// current timestamp. The marker means "the core native-scan tooling (chromium +
+// nuclei templates) was seen present" — written by ensureCoreDeps, doctor and
+// init only when both are, or by --skip-dependency-check. Once stamped, scan
 // commands fast-path past the dep check on every invocation.
 func writeInitMarker(vigoliumDir string) error {
+	// A stateless (-S) scan writes no state to $HOME (internal/paths).
+	if paths.Stateless() {
+		return nil
+	}
 	path := filepath.Join(vigoliumDir, initMarkerFileName)
 	payload := fmt.Sprintf(`{"version":%q,"initialized_at":%q}`+"\n",
 		Version,
@@ -35,9 +46,18 @@ func writeInitMarker(vigoliumDir string) error {
 	return os.WriteFile(path, []byte(payload), 0644)
 }
 
-// initializeVigolium initializes Vigolium on first run
-// Creates default settings file and initializes database
-func initializeVigolium() error {
+// initializeVigolium initializes Vigolium on first run: it writes the default
+// config, profiles, extensions, prompts and skills into ~/.vigolium.
+//
+// createDefaultDB decides whether ~/.vigolium/database-vgnm.sqlite is created
+// too. It is false when the invocation has pinned a different store with --db
+// (or VIGOLIUM_DB_PATH, which applyDBPathEnv has already folded into globalDB
+// by the time ensureInitialized runs): creating the default database there
+// produces a seeded, schema-migrated file the run will never open, in the one
+// directory a user is most likely to inspect to find out where their data went.
+// The pinned store is created and seeded by whichever path first opens it,
+// exactly as it already is on a warm $HOME.
+func initializeVigolium(createDefaultDB bool) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("failed to get home directory: %w", err)
@@ -83,7 +103,7 @@ func initializeVigolium() error {
 		zap.String("path", settingsPath))
 
 	// Initialize database
-	if settings.Database.Enabled {
+	if createDefaultDB && settings.Database.Enabled {
 		fmt.Fprintf(os.Stderr, "  %s Creating database schema...\n", terminal.InfoSymbol())
 		zap.L().Info("Initializing database...")
 
@@ -94,7 +114,7 @@ func initializeVigolium() error {
 		defer func() { _ = db.Close() }()
 
 		ctx := context.Background()
-		if err := db.CreateSchema(ctx); err != nil {
+		if err := db.EnsureSchemaReady(ctx); err != nil {
 			return fmt.Errorf("failed to create database schema: %w", err)
 		}
 
@@ -108,7 +128,7 @@ func initializeVigolium() error {
 			zap.String("path", settings.Database.SQLite.Path))
 	}
 
-	fmt.Fprintf(os.Stderr, "  %s Installing default profiles, extensions, and prompts...\n", terminal.InfoSymbol())
+	fmt.Fprintf(os.Stderr, "  %s Installing default profiles, extensions, prompts, and the built-in AI agent's skills (~/.vigolium/skills; coding-agent skills are `vigolium skills`)...\n", terminal.InfoSymbol())
 
 	// Bootstrap default profiles
 	bootstrapDefaultProfiles(vigoliumDir)
@@ -119,6 +139,9 @@ func initializeVigolium() error {
 	// Bootstrap prompt templates
 	bootstrapPrompts(vigoliumDir)
 
+	// Bootstrap agentic-scan skills (~/.vigolium/skills or VIGOLIUM_SKILLS_DIR)
+	bootstrapSkills()
+
 	// Note: the ~/.vigolium/initialized marker is intentionally NOT written
 	// here. The marker tracks core dep installation (chromium + nuclei
 	// templates), which is handled by ensureCoreDeps. Config bootstrap by
@@ -127,51 +150,58 @@ func initializeVigolium() error {
 	// Print success message
 	fmt.Fprintf(os.Stderr, "%s %s\n", terminal.SuccessSymbol(), terminal.BoldGreen("Mandatory configuration initialized."))
 	fmt.Fprintf(os.Stderr, "  %s Config: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(settingsPath)))
-	fmt.Fprintf(os.Stderr, "  %s Database: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(config.ExpandPath(settings.Database.SQLite.Path))))
+	// Only name the default database when this run actually created it. Naming
+	// a file that is not there, on a run that is deliberately using a different
+	// store, is the opposite of informative.
+	if createDefaultDB {
+		fmt.Fprintf(os.Stderr, "  %s Database: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(config.ExpandPath(settings.Database.SQLite.Path))))
+	} else {
+		fmt.Fprintf(os.Stderr, "  %s Database: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(config.ExpandPath(globalDB))))
+	}
 	fmt.Fprintf(os.Stderr, "  %s Docs & guides: %s\n", terminal.InfoSymbol(), terminal.Cyan("https://docs.vigolium.com"))
-	fmt.Fprintf(os.Stderr, "  %s Run %s for a full setup (browser, templates, and agentic-scan runtimes).\n",
-		terminal.TipSymbol(), terminal.BoldCyan("vigolium doctor --fix"))
+	fmt.Fprintf(os.Stderr, "  %s Run %s to install the browser and templates (add --yes for agentic-scan runtimes).\n",
+		terminal.TipSymbol(), terminal.BoldCyan("vigolium doctor --fix --only chrome,nuclei"))
+	if line := skillInstallNotice(os.Getenv, skillInstalled); line != "" && !globalJSON && !globalSilent {
+		fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.TipSymbol(), line)
+	}
 
 	return nil
 }
 
-// bootstrapDefaultProfiles copies embedded profile YAMLs to the profiles directory
-// if the directory does not exist yet. This runs during first-time initialization.
-func bootstrapDefaultProfiles(vigoliumDir string) {
-	profilesDir := filepath.Join(vigoliumDir, "profiles")
-
-	// Only bootstrap if the profiles directory does not exist
-	if _, err := os.Stat(profilesDir); err == nil {
-		return
+// skillInstallNotice is the first-run line for a coding agent that has no
+// vigolium skill yet: the one command that teaches it the CLI. "" when no
+// coding-agent variable is set or a skill is already installed.
+func skillInstallNotice(getenv func(string) string, installed func() bool) string {
+	name, agent := detectCodingAgent(getenv)
+	if name == "" || installed() {
+		return ""
 	}
+	return fmt.Sprintf("%s is set: run %s so your coding agent knows how to drive vigolium.",
+		name, terminal.BoldCyan("vigolium skills install --agent "+agent))
+}
 
-	if err := os.MkdirAll(profilesDir, 0755); err != nil {
-		zap.L().Debug("Failed to create profiles directory", zap.Error(err))
-		return
-	}
-
-	entries, err := public.StaticFS.ReadDir("presets/profiles")
+// skillInstalled reports whether any of the skill install locations holds a
+// bundled skill, current or not.
+func skillInstalled() bool {
+	skills, err := loadBundledSkills()
 	if err != nil {
-		zap.L().Debug("Failed to read embedded profiles", zap.Error(err))
-		return
+		return true // cannot tell; say nothing
 	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		data, readErr := public.StaticFS.ReadFile("presets/profiles/" + entry.Name())
-		if readErr != nil {
-			continue
-		}
-		dest := filepath.Join(profilesDir, entry.Name())
-		if err := os.WriteFile(dest, data, 0644); err != nil {
-			zap.L().Debug("Failed to write default profile", zap.String("dest", dest), zap.Error(err))
+	for _, v := range scanInstalledSkills(skills) {
+		if v.Status != skillStatusMissing {
+			return true
 		}
 	}
+	return false
+}
 
-	zap.L().Info("Bootstrapped default scanning profiles",
-		zap.String("dir", profilesDir))
+// bootstrapDefaultProfiles copies embedded profile YAMLs into the profiles
+// directory, write-if-missing per file: a profile the operator deleted comes
+// back, one they edited is left alone, and a directory that exists but is
+// missing some built-ins (a mounted config volume, a half-finished init) is
+// completed rather than skipped.
+func bootstrapDefaultProfiles(vigoliumDir string) {
+	bootstrapEmbeddedDir(vigoliumDir, "profiles", "presets/profiles", "default scanning profiles")
 }
 
 // bootstrapPrompts copies embedded prompt templates to the prompts directory.
@@ -184,32 +214,52 @@ func bootstrapExtensions(vigoliumDir string) {
 	bootstrapEmbeddedDir(vigoliumDir, "extensions", "presets/extensions", "preset extensions")
 }
 
-// bootstrapEmbeddedDir copies files from an embedded FS path into a subdirectory
-// of vigoliumDir, preserving directory structure. It only runs if the target
-// directory does not exist yet.
-func bootstrapEmbeddedDir(vigoliumDir, subDir, embedPath, label string) {
-	targetDir := filepath.Join(vigoliumDir, subDir)
-
-	if _, err := os.Stat(targetDir); err == nil {
+// bootstrapSkills materializes the embedded built-in olium skills into the
+// user-scope skills directory (~/.vigolium/skills, or VIGOLIUM_SKILLS_DIR) so
+// operators get editable copies that the autopilot/swarm loader prefers over
+// the embedded fallback. Write-if-missing — re-runs and operator edits are
+// preserved. Best-effort: skills still load from the embed if this fails.
+func bootstrapSkills() {
+	dir := skill.UserSkillsDir()
+	if dir == "" {
 		return
 	}
-
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		zap.L().Debug("Failed to create "+subDir+" directory", zap.Error(err))
+	n, err := oliumresources.EnsureOnDisk(dir)
+	if err != nil {
+		zap.L().Debug("Failed to materialize skills", zap.String("dir", dir), zap.Error(err))
 		return
 	}
-
-	copyEmbeddedDir(targetDir, embedPath)
-
-	zap.L().Info("Bootstrapped "+label, zap.String("dir", targetDir))
+	if n > 0 {
+		zap.L().Info("Bootstrapped skills", zap.String("dir", dir), zap.Int("written", n))
+	}
 }
 
-// copyEmbeddedDir recursively copies files from the embedded FS into targetDir.
-func copyEmbeddedDir(targetDir, embedPath string) {
+// bootstrapEmbeddedDir copies files from an embedded FS path into a subdirectory
+// of vigoliumDir, preserving directory structure, write-if-missing per file
+// (existing files, edited or not, are never overwritten). Returns how many
+// files it wrote.
+func bootstrapEmbeddedDir(vigoliumDir, subDir, embedPath, label string) int {
+	targetDir := filepath.Join(vigoliumDir, subDir)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		zap.L().Debug("Failed to create "+subDir+" directory", zap.Error(err))
+		return 0
+	}
+	n := copyEmbeddedDir(targetDir, embedPath)
+	if n > 0 {
+		zap.L().Info("Bootstrapped "+label, zap.String("dir", targetDir), zap.Int("written", n))
+	}
+	return n
+}
+
+// copyEmbeddedDir recursively copies files from the embedded FS into
+// targetDir, skipping any destination that already exists. Returns the number
+// of files written.
+func copyEmbeddedDir(targetDir, embedPath string) int {
 	entries, err := public.StaticFS.ReadDir(embedPath)
 	if err != nil {
-		return
+		return 0
 	}
+	written := 0
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -218,64 +268,94 @@ func copyEmbeddedDir(targetDir, embedPath string) {
 				zap.L().Debug("Failed to create bootstrap subdir", zap.String("dir", subTarget), zap.Error(err))
 				continue
 			}
-			copyEmbeddedDir(subTarget, embedPath+"/"+entry.Name())
+			written += copyEmbeddedDir(subTarget, embedPath+"/"+entry.Name())
+			continue
+		}
+		dest := filepath.Join(targetDir, entry.Name())
+		if _, err := os.Lstat(dest); err == nil {
 			continue
 		}
 		data, readErr := public.StaticFS.ReadFile(embedPath + "/" + entry.Name())
 		if readErr != nil {
 			continue
 		}
-		dest := filepath.Join(targetDir, entry.Name())
 		if err := os.WriteFile(dest, data, 0644); err != nil {
 			zap.L().Debug("Failed to write bootstrapped file", zap.String("dest", dest), zap.Error(err))
+			continue
 		}
+		written++
+	}
+	return written
+}
+
+// needsCoreDeps reports whether the given command should run the first-run
+// chromium + nuclei-templates check.
+func needsCoreDeps(cmd *cobra.Command) bool {
+	t, _ := traitOf(cmd)
+	return t.Runtime.has(rtCoreDeps)
+}
+
+// coreDepState is what the first-run check found missing.
+type coreDepState struct {
+	chromeMissing bool // spidering would have to download Chrome for Testing
+	nucleiMissing bool // known-issue-scan would have to clone nuclei-templates
+}
+
+func (s coreDepState) missing() bool { return s.chromeMissing || s.nucleiMissing }
+
+// notice is the single stderr line ensureCoreDeps prints when something is
+// missing: what will happen lazily, and how to do it now instead.
+func (s coreDepState) notice() string {
+	const fix = "check with 'vigolium doctor --for scan'; run 'vigolium doctor --fix --only chrome,nuclei' to pre-install"
+	switch {
+	case s.chromeMissing && s.nucleiMissing:
+		return "chromium and nuclei-templates not found — chromium is downloaded on first --spider (~150 MB), templates are cloned on first known-issue scan; " + fix
+	case s.chromeMissing:
+		return "chromium not found — will be downloaded on first --spider (~150 MB); " + fix
+	default:
+		return "nuclei-templates not found — will be cloned on first known-issue scan; " + fix
 	}
 }
 
-// coreDepCommands lists the leaf cobra command names (cmd.Name()) that drive
-// a native scan and therefore need chromium + nuclei templates available
-// before they run. The set deliberately excludes:
-//   - informational commands (version, doctor, config, help, examples, license, log)
-//   - data-management commands (project, scope, source, traffic, finding, db, …)
-//   - the olium TUI and the agent query/olium/audit subcommands (LLM-only, no native scan)
-//
-// Adding a new scan command? List its leaf name here.
-var coreDepCommands = map[string]bool{
-	"scan":         true,
-	"scan-url":     true,
-	"scan-request": true,
-	"run":          true,
-	"autopilot":    true, // `vigolium agent autopilot` — uses chromium for spidering
-	"swarm":        true, // `vigolium agent swarm`     — drives the native scan pipeline
-	"server":       true, // long-running API server that hosts scan endpoints
-	"ingest":       true, // populates the queue feeding scan workers
+// checkCoreDeps reports which core native-scan dependencies are missing. No
+// network, no install: "chromium" is missing exactly when a crawl would have to
+// download Chrome for Testing (no configured, embedded, system or cached
+// browser), and templates are missing when their directory does not exist. A
+// var so tests can stage either state.
+var checkCoreDeps = func(settings *config.Settings) coreDepState {
+	var st coreDepState
+	st.chromeMissing = spitolas.BrowserNeedsDownload(settings.Spidering.BrowserEngine, settings.Spidering.BrowserPath)
+	info, err := os.Stat(diagnostics.NucleiTemplatesDir(settings))
+	st.nucleiMissing = err != nil || !info.IsDir()
+	return st
 }
 
-// needsCoreDeps reports whether the given command should trigger the
-// first-run chromium + nuclei-templates install.
-func needsCoreDeps(cmd *cobra.Command) bool {
-	return coreDepCommands[cmd.Name()]
+// runCoreDepFixes installs the core dependencies. Only `vigolium init` (an
+// explicit setup command) calls it; the scan bootstrap never does. A var so
+// tests can prove that.
+var runCoreDepFixes = diagnostics.RunFixes
+
+// coreDepNoticeQuiet reports whether the first-run notice must stay off stderr:
+// a machine reader (-j, --events) or nobody at a terminal. Those callers learn
+// about a lazy install from the scan.setup event instead.
+func coreDepNoticeQuiet(cmd *cobra.Command) bool {
+	if globalJSON || globalSilent || !terminal.StderrIsTerminal() {
+		return true
+	}
+	if f := cmd.Flags().Lookup("events"); f != nil && f.Value.String() != "" {
+		return true
+	}
+	return false
 }
 
-// coreDepInstallTimeout caps the per-invocation budget for the chromium +
-// nuclei-templates installation step. Both are network-bound (template git
-// clone, Chrome for Testing download) so we allow generous headroom; the
-// marker write happens regardless of fix success so a flaky first run does
-// not block every subsequent scan.
-const coreDepInstallTimeout = 10 * time.Minute
-
-// ensureCoreDeps guarantees the two native-scan dependencies — chromium and
-// nuclei templates — are present before a scan-touching command runs. On the
-// first invocation it shells out to the doctor's `--fix --only nuclei,chrome`
-// path and stamps ~/.vigolium/initialized; on subsequent invocations the
-// marker short-circuits the diagnostic to a single os.Stat.
-//
-// The marker is written even when one of the two installs fails — re-running
-// the dep check on every command would punish users behind flaky networks or
-// on hosts without internet access. The doctor's "Initialized" row + a
-// printed warning here make the partial state visible, and the user can
-// re-run `vigolium doctor --fix --only nuclei,chrome` to retry explicitly.
-func ensureCoreDeps() error {
+// ensureCoreDeps is the scan bootstrap's first-run check. It is check-only: it
+// never installs and never blocks. When chromium and nuclei-templates are both
+// present it stamps ~/.vigolium/initialized so later runs skip the check with
+// one os.Stat. When either is missing it leaves the marker unwritten (the next
+// run checks again), prints one stderr line unless quiet, and returns: the
+// spidering and known-issue-scan phases provision what they need lazily,
+// outside their time budgets, and announce it with scan.setup events.
+func ensureCoreDeps(quiet bool) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil // Silently fail; downstream command will surface the real issue.
@@ -286,45 +366,66 @@ func ensureCoreDeps() error {
 		return nil
 	}
 
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Debug("Core dep check: failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
-	// DB intentionally omitted — neither the chromium nor nuclei-templates
-	// check touches the database, and opening it here would either trigger
-	// a redundant connection or surface a misleading "db unavailable" tip
-	// inside the dep flow.
-	//
-	// diagnostics.Run sweeps the PATH for chromium/nuclei and friends, which
-	// can take a couple of seconds on a cold first run — announce it so the
-	// terminal doesn't look frozen while the sweep runs.
-	fmt.Fprintf(os.Stderr, "%s %s\n",
-		terminal.InfoSymbol(),
-		terminal.BoldCyan("First-time scan detected — checking mandatory dependencies first..."))
-	report := diagnostics.Run(diagnostics.Deps{Settings: settings})
-
-	chromiumMissing := report.Tools["chromium"] == nil || report.Tools["chromium"].Status != diagnostics.StatusOK
-	nucleiMissing := report.NucleiTemplates == nil || report.NucleiTemplates.Status != diagnostics.StatusOK
-
-	if !chromiumMissing && !nucleiMissing {
-		// Both already present — backfill the marker so subsequent runs
-		// skip the diagnostic entirely. No need to invoke RunFixes.
-		fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.SuccessSymbol(), terminal.Green("All mandatory dependencies present"))
-		if err := writeInitMarker(vigoliumDir); err != nil {
-			zap.L().Debug("Failed to write init marker", zap.Error(err))
+	st := checkCoreDeps(settings)
+	if st.missing() {
+		if !quiet {
+			fmt.Fprintf(os.Stderr, "%s %s\n", terminal.InfoSymbol(), st.notice())
 		}
+		return nil
+	}
+	stampInitMarker(vigoliumDir)
+	return nil
+}
+
+// installCoreDeps is `vigolium init`'s explicit setup: it installs chromium and
+// nuclei-templates when missing (doctor's `--fix --only nuclei,chrome`) and
+// stamps the marker once both are present. The scan bootstrap does not call it.
+//
+// It fails with not_ready when a dependency is still missing after the
+// install: an init that reported success while both downloads failed sent the
+// operator to a scan that then crawled nothing. Under --offline nothing is
+// downloaded; a missing dependency is reported, not failed on.
+func installCoreDeps() error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	vigoliumDir := filepath.Join(homeDir, ".vigolium")
+	if _, err := os.Stat(filepath.Join(vigoliumDir, initMarkerFileName)); err == nil {
+		return nil
+	}
+
+	settings, err := clicommon.LoadSettings(globalConfig)
+	if err != nil {
+		return err
+	}
+	if !checkCoreDeps(settings).missing() {
+		stampInitMarker(vigoliumDir)
+		return nil
+	}
+
+	if globalOffline {
+		st := checkCoreDeps(settings)
+		fmt.Fprintf(os.Stderr, "%s --offline: not downloading %s; install later with %s\n",
+			terminal.WarnPrefix(), st.missingNames(), terminal.Cyan("vigolium doctor --fix --only chrome,nuclei"))
 		return nil
 	}
 
 	fmt.Fprintf(os.Stderr, "%s %s\n",
 		terminal.InfoSymbol(),
-		terminal.BoldCyan("First-run setup: installing core scan dependencies (chromium, nuclei-templates)..."))
+		terminal.BoldCyan("Installing core scan dependencies (chromium, nuclei-templates)..."))
 
+	// DB intentionally omitted — neither the chromium nor nuclei-templates
+	// check touches the database.
+	report := diagnostics.Run(diagnostics.Deps{Settings: settings, ProbeBrowserLaunch: true})
 	ctx, cancel := context.WithTimeout(context.Background(), coreDepInstallTimeout)
 	defer cancel()
-	results := diagnostics.RunFixes(ctx, report, settings, []string{"nuclei", "chrome"})
+	results := runCoreDepFixes(ctx, report, settings, []string{"nuclei", "chrome"})
 
 	for _, r := range results {
 		if r.Success {
@@ -334,10 +435,45 @@ func ensureCoreDeps() error {
 		}
 	}
 
-	if err := writeInitMarker(vigoliumDir); err != nil {
-		zap.L().Debug("Failed to write init marker after dep install", zap.Error(err))
+	if st := checkCoreDeps(settings); st.missing() {
+		return clicommon.CodedErrorf(apicontract.CodeNotReady,
+			"%s still missing after install; retry with `vigolium doctor --fix --only chrome,nuclei` or pass --offline to skip downloads",
+			st.missingNames())
 	}
+	stampInitMarker(vigoliumDir)
 	return nil
+}
+
+// missingNames names the missing dependencies for a message.
+func (s coreDepState) missingNames() string {
+	switch {
+	case s.chromeMissing && s.nucleiMissing:
+		return "chromium and nuclei-templates"
+	case s.chromeMissing:
+		return "chromium"
+	case s.nucleiMissing:
+		return "nuclei-templates"
+	}
+	return "nothing"
+}
+
+// coreDepInstallTimeout caps `vigolium init`'s chromium + nuclei-templates
+// install. Both are network-bound (template git clone, Chrome for Testing
+// download), so the headroom is generous.
+const coreDepInstallTimeout = 10 * time.Minute
+
+// stampInitMarker writes the marker (best-effort, dir created if needed).
+func stampInitMarker(vigoliumDir string) {
+	if paths.Stateless() {
+		return
+	}
+	if err := os.MkdirAll(vigoliumDir, 0755); err != nil {
+		zap.L().Debug("Failed to create .vigolium dir for init marker", zap.Error(err))
+		return
+	}
+	if err := writeInitMarker(vigoliumDir); err != nil {
+		zap.L().Debug("Failed to write init marker", zap.Error(err))
+	}
 }
 
 // ensureInitMarkerIfDepsPresent stamps ~/.vigolium/initialized (best-effort,
@@ -349,8 +485,9 @@ func ensureCoreDeps() error {
 //
 // The deps-present gate is the whole point: a read-only `vigolium doctor` on a
 // machine that is MISSING chromium/nuclei must NOT stamp the marker, otherwise
-// it would suppress the first-run auto-install that the next scan relies on. The
-// existence guard preserves the original timestamp on repeat doctor runs.
+// it would silence the first-run notice that tells the operator the next
+// --spider or known-issue scan will download them. The existence guard
+// preserves the original timestamp on repeat doctor runs.
 func ensureInitMarkerIfDepsPresent(report *diagnostics.Report) {
 	if report == nil {
 		return
@@ -382,7 +519,8 @@ func ensureInitMarkerIfDepsPresent(report *diagnostics.Report) {
 // skipCoreDepCheck honors the --skip-dependency-check flag: it stamps
 // ~/.vigolium/initialized immediately without probing for chromium or nuclei
 // templates, so this run and every future scan fast-path past the first-run
-// dependency check. Best-effort — a failed mkdir/write just means the check may
+// dependency check. Since the check no longer installs anything, the flag only
+// silences the one-line notice; kept for compatibility. Best-effort — a failed mkdir/write just means the check may
 // run on a later invocation. Returns true when it actually wrote the marker.
 func skipCoreDepCheck() bool {
 	homeDir, err := os.UserHomeDir()
@@ -406,7 +544,7 @@ func skipCoreDepCheck() bool {
 }
 
 // ensureInitialized checks if Vigolium is initialized and initializes if needed
-// This is called before any command runs
+// This is called before any command runs that shouldBootstrap admits.
 func ensureInitialized() error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -420,6 +558,76 @@ func ensureInitialized() error {
 		return nil
 	}
 
-	// Not initialized - run initialization
-	return initializeVigolium()
+	// Not initialized - run initialization. The default database is created
+	// only when it is the store this invocation will use: a pinned --db (or a
+	// VIGOLIUM_DB_PATH that applyDBPathEnv has already folded into globalDB)
+	// means the default file would be created, seeded and never opened.
+	//
+	// --read-only deliberately does NOT suppress it. The spec called for that,
+	// but with no --db the default file IS the store the read is about to open,
+	// and openSQLiteReadOnly refuses a path that does not exist — so skipping
+	// here would turn a cold-$HOME `vigolium --read-only finding` from "0
+	// findings, exit 0" into "database file not readable". Creating an empty
+	// store the read then reports as empty modifies nothing that existed.
+	return initializeVigolium(strings.TrimSpace(globalDB) == "")
+}
+
+// bootstrapExemptCommands are the leaf command names that must not materialize
+// ~/.vigolium as a side effect of running.
+//
+// Bootstrap writes a config, a database, and four directories of presets. That
+// is the right thing to do before a scan and the wrong thing to do when the
+// user asked what version this is, asked for help, or — worst of all — pressed
+// tab. `__complete` runs on every shell completion, so a user who had never run
+// vigolium could create a seeded database by typing `vigolium ` and hitting tab
+// twice; `completion bash` is routinely run from a shell rc file, which made it
+// happen at login.
+//
+// `init` is exempt because it does the initialization itself, with its own
+// flags and its own reporting.
+var bootstrapExemptCommands = map[string]bool{
+	"init":                          true,
+	"version":                       true,
+	"help":                          true,
+	cobra.ShellCompRequestCmd:       true, // __complete
+	cobra.ShellCompNoDescRequestCmd: true, // __completeNoDesc
+}
+
+// shouldBootstrap reports whether this command may create ~/.vigolium.
+//
+// The root command with no subcommand only prints usage, and the `completion`
+// subtree only writes a shell script to stdout — neither touches a database or
+// a profile, and both are reached by users who have not yet decided to use
+// vigolium at all. The `schema` subtree prints compiled-in schemas, the same.
+func shouldBootstrap(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.Root() == cmd {
+		return false
+	}
+	if bootstrapExemptCommands[cmd.Name()] {
+		return false
+	}
+	for c := cmd; c != nil; c = c.Parent() {
+		if c.Name() == "completion" || (c.Name() == "schema" && c.Parent() == cmd.Root()) {
+			return false
+		}
+	}
+	return true
+}
+
+// noteCoreDepsSkipped tells an init that left the downloads out which are
+// still missing and the command that fetches them.
+func noteCoreDepsSkipped(reason string) {
+	settings, err := clicommon.LoadSettings(globalConfig)
+	if err != nil {
+		return
+	}
+	st := checkCoreDeps(settings)
+	if !st.missing() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s %s: not downloading %s (chromium ~150 MB, nuclei-templates ~100 MB); fetch them with %s\n",
+		terminal.WarnPrefix(), reason, st.missingNames(), terminal.Cyan("vigolium doctor --fix --only chrome,nuclei"))
 }

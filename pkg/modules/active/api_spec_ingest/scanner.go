@@ -141,8 +141,7 @@ func (m *Module) ScanPerRequest(
 
 	// Host-level dedup: only probe once per host
 	hostKey := urlx.Scheme + "|" + urlx.Host
-	hostDS := m.hostDS.Get(scanCtx.DedupMgr())
-	if hostDS != nil && hostDS.IsSeen(hostKey) {
+	if !modkit.BeginHostProbeKey(scanCtx, httpClient, &m.hostDS, hostKey) {
 		return nil, nil
 	}
 
@@ -170,11 +169,9 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-		if err != nil {
-			continue
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
+		// SetPath produces well-formed raw, so wrap directly instead of
+		// re-parsing on this hot path.
+		fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 		if err != nil {

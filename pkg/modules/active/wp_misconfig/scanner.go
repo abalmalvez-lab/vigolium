@@ -63,24 +63,70 @@ func (m *Module) ScanPerRequest(
 	}
 
 	host := service.Host()
+
+	urlx, err := ctx.URL()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Walk the web root plus any context-path prefixes of the observed URL so a
+	// sub-directory WordPress install (e.g. /blog/wp-login.php) is reached, not
+	// just the root. Claim each (host, base) pair up front so a fully-deduped
+	// request issues no traffic — including the soft-404 fingerprint.
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
 		return nil, nil
 	}
 
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
-	for _, probe := range wpProbes {
-		if result := m.probeFile(ctx, httpClient, probe, fp); result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, probe := range wpProbes {
+			if result := m.probeFile(ctx, httpClient, scanCtx, probe, base+probe.path, fp); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 	return results, nil
 }
 
+// wpCronEmptyIsSpecific reports whether a 200-with-empty-body response is
+// specific to wp-cron.php rather than a blanket behaviour the host exhibits for
+// any .php path (PHP disabled, a catch-all returning a blank 200, etc.). It
+// fetches a random nonexistent .php path; if that ALSO returns a 200 with an
+// empty/whitespace body, the empty-200 signal is meaningless and wp-cron must
+// not be reported. Fails OPEN on an inconclusive transient error.
+func (m *Module) wpCronEmptyIsSpecific(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) bool {
+	randomPath := "/vigolium-wpcron-" + utils.RandomString(8) + ".php"
+	raw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
+	if err != nil {
+		return true
+	}
+	raw, err = httpmsg.SetPath(raw, randomPath)
+	if err != nil {
+		return true
+	}
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
+	resp, _, err := httpClient.Execute(req, http.Options{NoClustering: true})
+	if err != nil {
+		return true
+	}
+	defer resp.Close()
+	if resp.Response() == nil {
+		return true
+	}
+	if resp.Response().StatusCode == 200 && len(strings.TrimSpace(resp.Body().String())) == 0 {
+		return false // blanket empty-200 for any .php path → not specific to wp-cron
+	}
+	return true
+}
+
 func (m *Module) fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) *notFoundFingerprint {
-	randomPath := "/vgm-wp-404-" + utils.RandomString(8)
+	randomPath := "/vigolium-wp-404-" + utils.RandomString(8)
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
@@ -89,11 +135,9 @@ func (m *Module) fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 	if err != nil {
 		return nil
 	}
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -111,22 +155,22 @@ func (m *Module) fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *ht
 func (m *Module) probeFile(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	probe wpProbe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probe.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -165,6 +209,13 @@ func (m *Module) probeFile(
 		}
 	}
 
+	// Catch-all / shell guard: a body textually equivalent to the originally
+	// observed page means the app served its standard shell for this path —
+	// "the same body with or without the probe".
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	// Check anti-markers
 	for _, anti := range probe.antiMarkers {
 		if strings.Contains(body, anti) {
@@ -176,15 +227,22 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	// Special case: wp-cron.php returns 200 with empty body when functional
+	// Special case: wp-cron.php returns 200 with empty body when functional.
+	// Strict drop-on-fail: only report when the empty-200 is SPECIFIC to
+	// wp-cron.php (a random .php path does not also return an empty 200), so a
+	// host that blanket-returns blank 200s for any .php path is not flagged.
 	if probe.path == "/wp-cron.php" {
-		if len(strings.TrimSpace(body)) == 0 {
+		if len(strings.TrimSpace(body)) == 0 && m.wpCronEmptyIsSpecific(ctx, httpClient) {
 			urlx, _ := ctx.URL()
-			targetURL := urlx.Scheme + "://" + urlx.Host + probe.path
+			targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 			return &output.ResultEvent{
 				URL:     targetURL,
 				Matched: targetURL,
 				Request: string(modifiedRaw),
+				// The empty-200 response IS the proof (specific to wp-cron.php).
+				// resp is still open here (deferred Close), so capture the real
+				// response rather than letting the executor backfill a baseline.
+				Response: resp.FullResponseString(),
 				Info: output.Info{
 					Name:        probe.name,
 					Description: probe.desc,
@@ -212,8 +270,35 @@ func (m *Module) probeFile(
 		return nil
 	}
 
+	// Soft-404 / SPA-shell gate: reject a marker match that is just the host's
+	// wildcard shell (same 200 body served for a random path).
+	location := resp.Response().Header.Get("Location")
+	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), location) {
+		return nil
+	}
+
+	// Sub-directory catch-all guard: ConfirmNotSoft404 above compares against a
+	// host-wide random path, which cannot see a catch-all scoped to a sub-directory
+	// prefix (now that we probe under context paths). Drop the finding if a
+	// nonexistent sibling under the same parent returns the same markers.
+	if modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, probePath, probe.markers) {
+		return nil
+	}
+
+	// Endpoint-determinism gate. Both catch-all guards above compare this probe
+	// against a SINGLE control fetch, so they are decided by a coin flip on a host
+	// that round-robins between mismatched backends: the control lands on the other
+	// backend, the bodies differ, and the wildcard shell is declared "not a soft
+	// 404" even though every path on the host returns one of the same two pages.
+	// That is how a parked pool earned a Critical WordPress-installer finding off a
+	// marker in an Apache default page. Memoized per record, so the probe sweep
+	// above is unaffected.
+	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+		return nil
+	}
+
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + probe.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
 		URL:              targetURL,

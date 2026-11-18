@@ -1,0 +1,567 @@
+package ratelimit
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/url"
+	"strings"
+	"syscall"
+	"time"
+
+	"go.uber.org/zap"
+)
+
+// AIMD tuning for adaptive per-host concurrency. These are deliberately gentle:
+// the limiter only diverges from the static MaxPerHost when a host shows distress,
+// and recovers slowly so a single error doesn't whipsaw the limit.
+const (
+	// decreaseCooldown collapses a burst of distress signals into one back-off, so
+	// N concurrent failures halve the limit once, not N times.
+	decreaseCooldown = 1 * time.Second
+	// increaseAfterHealthy is the run of healthy completions that earns a +1
+	// ramp toward the ceiling. Scaling it by the current limit keeps the ramp rate
+	// roughly proportional (a +1 step is cheaper to earn when the limit is small).
+	increaseAfterHealthy = 4
+)
+
+// usesAdaptiveEntries reports whether hosts get resizable token pools rather than
+// fixed semaphores — true under plain Adaptive mode and under WafAutoArm (where the
+// pool sits pinned at MaxPerHost until a WAF block arms it).
+func (h *HostRateLimiter) usesAdaptiveEntries() bool {
+	return h.adaptive || h.wafAutoArm
+}
+
+// CeilingPerHost is the highest per-host concurrency this limiter can ever reach:
+// the AIMD ramp ceiling in adaptive mode, and MaxPerHost otherwise.
+//
+// It exists so the HTTP transport can size its idle-connection pool to the
+// concurrency the limiter can actually reach rather than the value it starts at.
+// A pool sized to the start would close every connection above it on return and
+// pay a fresh TCP+TLS handshake — manufacturing connection churn at exactly the
+// concurrency a ramp unlocked. Read it from the limiter instead of re-deriving
+// it: two independent derivations drift silently, as churn rather than an error.
+func (h *HostRateLimiter) CeilingPerHost() int {
+	return h.ceilingPerHost
+}
+
+// CurrentLimit reports the concurrency currently allowed for host, and the
+// ceiling it is measured against. Both are 0 when the host is untracked or the
+// limiter runs in static mode, where there is no per-host verdict to read.
+//
+// It exists for a consumer that dispatches its own traffic and cannot page
+// through Acquire/Release — known-issue-scan, whose nuclei engine owns its HTTP
+// stack. Such a consumer can at least SIZE itself to the verdict the limiter has
+// already reached, so a host the scan proactively paced does not get opened wide
+// again by the one phase that does not go through the limiter.
+//
+// Read-only and lock-free: it never creates an entry, because asking about a
+// host must not be the thing that starts tracking it.
+func (h *HostRateLimiter) CurrentLimit(host string) (limit int, ceiling int) {
+	if h == nil || host == "" || !h.usesAdaptiveEntries() {
+		return 0, 0
+	}
+	entry := h.existing(host)
+	if entry == nil {
+		return 0, 0
+	}
+	return int(entry.limit.Load()), h.ceilingPerHost
+}
+
+// PreArmable reports whether PreArm can throttle a host — true only when hosts use
+// adaptive token pools (plain Adaptive or WafAutoArm) AND proactive pacing has not
+// been disabled (--no-waf-pacing). It lets a caller skip the per-response edge
+// fingerprint entirely when pre-arming would be a no-op (static mode or disabled).
+func (h *HostRateLimiter) PreArmable() bool {
+	return h.usesAdaptiveEntries() && !h.preArmDisabled
+}
+
+// preArmStart is the reduced concurrency a host is dropped to when proactively
+// pre-armed for a CDN/WAF edge (before any block). A firm quarter of MaxPerHost
+// (floored at MinPerHost, never below 1): low enough that the active phase's opening
+// burst does not arm a rate-based WAF, high enough that a healthy (non-WAF) edge
+// ramps back toward the ceiling on clean completions. Deliberately more decisive
+// than Feedback's reactive halving so the proactive drop meaningfully cuts the burst.
+func (h *HostRateLimiter) preArmStart() int {
+	// Floor at minPerHost (the constructor guarantees it is >= 1). Not redundant with
+	// setLimit's own min-clamp: this value is also reported in PreArmNotice/logged, so
+	// it must equal what setLimit will actually apply.
+	return max(h.maxPerHost/4, h.minPerHost)
+}
+
+// PreArm proactively arms a host's AIMD back-off and drops it to preArmStart before
+// any distress is observed — the proactive counterpart to the reactive WAF-block
+// arming in Feedback. A caller invokes it when a host is fingerprinted behind a
+// CDN/WAF edge (which commonly arms a rate-based WAF once a scan bursts it), so the
+// next phase paces that host from its first request instead of bursting into the edge
+// and tripping it. vendor is the fingerprinted edge (for the operator notice; may be
+// ""). It pre-arms exactly once per entry (CompareAndSwap on the dedicated preArmed
+// flag — NOT armed, so a birth-armed adaptive host still gets the proactive drop and a
+// fresh entry created after eviction re-arms). A host already backed off at or below
+// the proactive start (by a real block) keeps its lower limit, so a later fingerprint
+// never bumps a host that has since backed off further. No-op in static mode and for
+// an empty host.
+func (h *HostRateLimiter) PreArm(host, vendor string) {
+	if !h.PreArmable() || host == "" {
+		return
+	}
+	shard := h.shardFor(host)
+	entry := h.getOrCreateEntry(shard, host)
+	if entry.tokens == nil {
+		return
+	}
+	if !entry.preArmed.CompareAndSwap(false, true) {
+		return // already pre-armed for this entry lifetime
+	}
+	from := int(entry.limit.Load())
+	// Engage AIMD for this host (idempotent if a block already armed it) and mark the
+	// run as having at least one armed host so Feedback stops short-circuiting.
+	entry.armed.Store(true)
+	h.anyArmed.Store(true)
+	start := h.preArmStart()
+	if from <= start {
+		return // already at/below the proactive start — don't raise it, and no notice
+	}
+	h.setLimit(entry, start)
+	zap.L().Debug("HostRateLimiter: CDN/WAF edge fingerprinted — pre-arming pacing",
+		zap.String("host", host), zap.String("vendor", vendor),
+		zap.Int("from", from), zap.Int("start", start), zap.Int("ceiling", h.ceilingPerHost))
+	if fn := h.preArmSink.Load(); fn != nil {
+		(*fn)(PreArmNotice{Host: host, Vendor: vendor, From: from, Start: start, Ceiling: h.ceilingPerHost})
+	}
+}
+
+// newEntry builds a hostEntry for the limiter's current mode. Static mode gets a
+// fixed-cap channel semaphore (the unchanged hot path); adaptive (or WAF-auto-arm)
+// mode gets a resizable token pool sized to the ramp ceiling and pre-filled to the
+// start limit (MaxPerHost) — under WafAutoArm it stays pinned there until armed.
+func (h *HostRateLimiter) newEntry() *hostEntry {
+	if !h.usesAdaptiveEntries() {
+		return &hostEntry{sem: make(chan struct{}, h.maxPerHost), reserved: make(chan struct{}, reservedPriorityHeadroom)}
+	}
+	start := min(max(h.maxPerHost, h.minPerHost), h.ceilingPerHost)
+	e := &hostEntry{tokens: make(chan struct{}, h.ceilingPerHost), reserved: make(chan struct{}, reservedPriorityHeadroom)}
+	e.limit.Store(int64(start))
+	// Adaptive hosts are armed from birth (adjust from the first request); WAF-auto-arm
+	// hosts start unarmed and stay pinned at MaxPerHost until a WAF block arms them.
+	e.armed.Store(h.adaptive)
+	for i := 0; i < start; i++ {
+		e.tokens <- struct{}{}
+	}
+	return e
+}
+
+// FeedbackOutcome is one request's outcome for Feedback.
+type FeedbackOutcome struct {
+	Status     int
+	Err        error
+	WAFBlocked bool
+	// RetryAfter is the server's Retry-After, parsed (0 when absent).
+	RetryAfter time.Duration
+	// ExpectedThrottle marks a 429 the sender provoked on purpose (a
+	// rate-limit bypass probe exhausting a bucket): it is ordinary distress,
+	// not a pause instruction.
+	ExpectedThrottle bool
+}
+
+// Throttled reports whether the outcome is the server asking us to slow
+// down: a 429, or a 503 that names a Retry-After.
+func (o FeedbackOutcome) Throttled() bool {
+	if o.ExpectedThrottle {
+		return false
+	}
+	return o.Status == 429 || (o.Status == 503 && o.RetryAfter > 0)
+}
+
+// Throttle pause bounds.
+const (
+	minThrottlePause = 1 * time.Second
+	maxThrottlePause = 60 * time.Second
+	// maxPausedThrottles is how many consecutive Retry-After-less throttles
+	// pause the host before it is treated as persistently throttling.
+	maxPausedThrottles = 4
+)
+
+// ThrottleStreak is the number of consecutive throttles host has answered
+// since its last healthy response.
+func (h *HostRateLimiter) ThrottleStreak(host string) int {
+	if h == nil || host == "" || !h.anyPaused.Load() {
+		return 0
+	}
+	entry := h.existing(host)
+	if entry == nil {
+		return 0
+	}
+	return int(entry.throttles.Load())
+}
+
+// Feedback reports the outcome of one request to the host so adaptive mode can
+// adjust its concurrency limit. A distress signal (429/503/502/504, connection
+// error, timeout, or a confirmed WAF/CDN block) backs the limit off; a healthy
+// completion counts toward the next ramp-up. Status may be 0 when Err != nil
+// (transport-level failure). WAFBlocked marks a classified WAF/CDN block: it
+// always counts as distress, and in WAF-auto-arm mode it is the signal that
+// arms this host's AIMD control (before which the host stays pinned at
+// MaxPerHost, unaffected by ordinary 5xx so a non-WAF scan is never throttled
+// by this path).
+//
+// A throttle (429, or 503 + Retry-After) pauses the host in every mode — new
+// acquires wait until now+clamp(RetryAfter or 1s·2^n, 1s, 60s) — and, where
+// hosts use adaptive pools, arms AIMD like a WAF block and halves the limit,
+// so modules do not read an application rate limiter's 429s as negatives.
+// Everything but the pause is a no-op in static mode and for an evicted host.
+func (h *HostRateLimiter) Feedback(host string, o FeedbackOutcome) {
+	if h == nil || host == "" {
+		return
+	}
+	throttled := o.Throttled()
+	var entry *hostEntry
+	if throttled {
+		entry = h.pauseHost(host, o.RetryAfter)
+	} else if h.anyPaused.Load() && o.Err == nil && o.Status > 0 && o.Status < 500 {
+		// A healthy answer ends the host's throttle streak.
+		if entry = h.existing(host); entry != nil && entry.throttles.Load() != 0 {
+			entry.throttles.Store(0)
+		}
+	}
+	statusCode, err, wafBlocked := o.Status, o.Err, o.WAFBlocked || throttled
+	if !h.usesAdaptiveEntries() {
+		return
+	}
+	// A run of connection resets is a server shedding load (a small dev
+	// server's accept queue overflowing), not a WAF; it arms the host's AIMD so
+	// its concurrency halves before the resets count toward quarantine.
+	resetStorm := false
+	if err != nil && isConnReset(err) {
+		resetStorm = h.noteReset(host)
+	} else if err == nil && statusCode > 0 && h.anyReset.Load() {
+		if entry == nil {
+			entry = h.existing(host)
+		}
+		if entry != nil && entry.resets.Load() != 0 {
+			entry.resets.Store(0)
+		}
+	}
+	if resetStorm && !wafBlocked {
+		wafBlocked = true
+		if e := h.existing(host); e != nil && !e.armed.Load() {
+			zap.L().Info("HostRateLimiter: connection-reset storm — arming adaptive back-off",
+				zap.String("host", host))
+		}
+	}
+	// WAF-auto-arm mode stays dormant until some host trips a WAF block: until then no
+	// non-block response can change any limit, so skip the per-host shard lookup and
+	// keep Feedback ~free on the common non-WAF hot path. (wafAutoArm implies
+	// !adaptive; plain Adaptive arms every host at birth, so anyArmed is moot there.)
+	if h.wafAutoArm && !wafBlocked && !h.anyArmed.Load() {
+		return
+	}
+	if entry == nil {
+		entry = h.existing(host)
+	}
+	if entry == nil || entry.tokens == nil {
+		return
+	}
+
+	// A confirmed WAF block (or a server throttle) arms this host's AIMD control
+	// (adaptive hosts are armed at birth in newEntry). Until armed, the host stays
+	// pinned at MaxPerHost.
+	if wafBlocked && entry.armed.CompareAndSwap(false, true) {
+		h.anyArmed.Store(true)
+		zap.L().Info("HostRateLimiter: WAF/CDN block or throttle detected — arming adaptive back-off",
+			zap.String("host", host), zap.Int("status", statusCode))
+	}
+	if !entry.armed.Load() {
+		return
+	}
+
+	// A failure that is not distress (the caller cancelled) says nothing about
+	// the host: it must not count toward the healthy ramp either.
+	if err != nil && !wafBlocked && !isDistress(statusCode, err) {
+		return
+	}
+
+	if wafBlocked || isDistress(statusCode, err) {
+		entry.healthy.Store(0)
+		// One back-off per cooldown window — coalesce concurrent failures.
+		now := time.Now().UnixNano()
+		last := entry.lastDecr.Load()
+		if now-last < int64(decreaseCooldown) {
+			return
+		}
+		if !entry.lastDecr.CompareAndSwap(last, now) {
+			return // another goroutine just backed off
+		}
+		cur := int(entry.limit.Load())
+		target := max(cur/2, h.minPerHost)
+		if target < cur {
+			h.setLimit(entry, target)
+			zap.L().Debug("HostRateLimiter: adaptive back-off",
+				zap.String("host", host), zap.Int("from", cur), zap.Int("to", target),
+				zap.Int("status", statusCode))
+		}
+		return
+	}
+
+	// Healthy: ramp +1 toward the ceiling once enough clean completions accrue.
+	cur := int(entry.limit.Load())
+	threshold := int64(increaseAfterHealthy + cur)
+	if entry.healthy.Add(1) < threshold {
+		return
+	}
+	entry.healthy.Store(0)
+	if cur < h.ceilingPerHost {
+		h.setLimit(entry, cur+1)
+		zap.L().Debug("HostRateLimiter: adaptive ramp-up",
+			zap.String("host", host), zap.Int("from", cur), zap.Int("to", cur+1))
+	}
+}
+
+// setLimit resizes an adaptive entry's token pool to newLimit (clamped to
+// [minPerHost, ceilingPerHost]), maintaining the invariant available+inflight ==
+// limit. Growing pushes tokens into the pool; shrinking pulls available tokens
+// non-blockingly and records the remainder as debt that Release retires. Held
+// under the entry mutex so concurrent feedback events don't race the resize; the
+// acquire/release hot paths never take this lock.
+func (h *HostRateLimiter) setLimit(entry *hostEntry, newLimit int) {
+	newLimit = min(max(newLimit, h.minPerHost), h.ceilingPerHost)
+
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	old := int(entry.limit.Load())
+	delta := newLimit - old
+	if delta == 0 {
+		return
+	}
+	entry.limit.Store(int64(newLimit))
+
+	if delta > 0 {
+		// Grow: make delta more tokens available. Non-blocking — the pool channel
+		// is sized to the ceiling and total tokens never exceed newLimit <= cap.
+		// First cancel any outstanding shrink debt, then add the rest.
+		for delta > 0 {
+			if d := entry.debt.Load(); d > 0 && entry.debt.CompareAndSwap(d, d-1) {
+				delta--
+				continue
+			}
+			select {
+			case entry.tokens <- struct{}{}:
+				delta--
+			default:
+				return // pool full; should not happen under the invariant
+			}
+		}
+		return
+	}
+
+	// Shrink: remove -delta tokens. Pull available ones now; defer the rest to
+	// Release via debt so we never block waiting for checked-out tokens.
+	remove := -delta
+	for remove > 0 {
+		select {
+		case <-entry.tokens:
+			remove--
+		default:
+			entry.debt.Add(int64(remove))
+			return
+		}
+	}
+}
+
+// isDistress classifies a request outcome as host distress worth backing off for:
+// an explicit rate-limit/overload status, or a transport error (timeout, reset,
+// refused). A nil error with a normal status is healthy.
+func isDistress(statusCode int, err error) bool {
+	if err != nil && !isContextCanceled(err) {
+		return true
+	}
+	switch statusCode {
+	case 429, 502, 503, 504:
+		return true
+	}
+	return false
+}
+
+// resetStormThreshold is how many consecutive connection resets arm a host.
+const resetStormThreshold = 3
+
+// noteReset counts a connection reset against host and reports whether the
+// run of them has reached resetStormThreshold.
+func (h *HostRateLimiter) noteReset(host string) bool {
+	h.anyReset.Store(true)
+	entry := h.getOrCreateEntry(h.shardFor(host), host)
+	return entry.resets.Add(1) >= resetStormThreshold
+}
+
+// isConnReset reports whether err is the peer resetting or dropping the
+// connection: ECONNRESET, EPIPE, or an EOF before any response.
+func isConnReset(err error) bool {
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") ||
+		strings.HasSuffix(msg, ": eof") || msg == "eof"
+}
+
+// isContextCanceled reports whether err is a caller cancellation, which
+// reflects scan shutdown or an abandoned call rather than host distress and
+// must not trigger back-off. A deadline is NOT a cancellation: a
+// client timeout surfaces as context.DeadlineExceeded / a net.Error whose
+// Timeout() is true, and a host that stops answering is exactly the distress
+// back-off exists for. Callers that know their own context expired (a phase
+// deadline) do not report at all.
+func isContextCanceled(err error) bool {
+	return errors.Is(err, context.Canceled)
+}
+
+// pauseHost holds host's new acquires for clamp(retryAfter or 1s·2^n, 1s,
+// 60s) from now, never shortening a pause already in force.
+// It returns host's entry.
+func (h *HostRateLimiter) pauseHost(host string, retryAfter time.Duration) *hostEntry {
+	entry := h.getOrCreateEntry(h.shardFor(host), host)
+	n := entry.throttles.Add(1) - 1
+	if h.throttlePauseDisabled {
+		// The streak is still counted (ThrottleStreak stops transparent
+		// retries on a persistently throttling host); only the wait is off.
+		h.anyPaused.Store(true)
+		return entry
+	}
+	d := retryAfter
+	if d <= 0 {
+		// A host that throttles every request with no Retry-After is not
+		// asking for a specific wait: back off 1s, 2s, 4s, 4s, then stop
+		// stalling the scan on it — its concurrency is already at the floor
+		// and callers see the 429 marked as throttled (CallStats).
+		if n >= maxPausedThrottles {
+			return entry
+		}
+		d = min(minThrottlePause<<min(n, 2), 4*time.Second)
+	}
+	d = min(max(d, minThrottlePause), maxThrottlePause)
+	until := time.Now().Add(d).UnixNano()
+	for {
+		cur := entry.pauseUntil.Load()
+		if cur >= until || entry.pauseUntil.CompareAndSwap(cur, until) {
+			break
+		}
+	}
+	h.anyPaused.Store(true)
+	zap.L().Debug("HostRateLimiter: server throttle — pausing host",
+		zap.String("host", host), zap.Duration("pause", d))
+	return entry
+}
+
+// PausedUntil reports when host's throttle pause ends (zero time when none
+// is in force).
+func (h *HostRateLimiter) PausedUntil(host string) time.Time {
+	if h == nil || host == "" || !h.anyPaused.Load() {
+		return time.Time{}
+	}
+	if until := h.pauseDeadline(h.existing(host)); until != 0 {
+		return time.Unix(0, until)
+	}
+	return time.Time{}
+}
+
+// pauseDeadline is entry's throttle pause end in unix nanos, 0 when none is in
+// force. Free while no host was ever throttled.
+func (h *HostRateLimiter) pauseDeadline(entry *hostEntry) int64 {
+	if entry == nil || !h.anyPaused.Load() {
+		return 0
+	}
+	until := entry.pauseUntil.Load()
+	if until <= time.Now().UnixNano() {
+		return 0
+	}
+	return until
+}
+
+// entryAfterPause returns host's entry (created if needed) once its throttle
+// pause has passed, waiting ctx-aware. The unpaused path is one lookup; after
+// an actual wait the entry is fetched again, since the host may have been
+// evicted meanwhile.
+func (h *HostRateLimiter) entryAfterPause(ctx context.Context, host string) (*hostEntry, error) {
+	shard := h.shardFor(host)
+	for {
+		entry := h.getOrCreateEntry(shard, host)
+		until := h.pauseDeadline(entry)
+		if until == 0 {
+			return entry, nil
+		}
+		timer := time.NewTimer(time.Until(time.Unix(0, until)))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// existing returns host's entry without creating one (nil when untracked).
+func (h *HostRateLimiter) existing(host string) *hostEntry {
+	shard := h.shardFor(host)
+	shard.mu.RLock()
+	entry := shard.hosts[host]
+	shard.mu.RUnlock()
+	return entry
+}
+
+// PreArmVendorLocal is the PreArm vendor for a single loopback or
+// private-address target: a development server, not an edge.
+const PreArmVendorLocal = "local"
+
+// PreArmLocalTarget pre-arms the one host of a scan whose targets all name a
+// single loopback or private-address host (localhost, 127.0.0.1, 10.x, …),
+// so a small development server is paced from its first request and ramps
+// up on clean answers instead of taking the full per-host burst. It returns
+// the host it armed, or "" when the targets span several hosts or a public one.
+func (h *HostRateLimiter) PreArmLocalTarget(targets []string) string {
+	if h == nil || !h.PreArmable() {
+		return ""
+	}
+	host := singleLocalHost(targets)
+	if host != "" {
+		h.PreArm(host, PreArmVendorLocal)
+	}
+	return host
+}
+
+// singleLocalHost is the one hostname every target names, when it is local.
+func singleLocalHost(targets []string) string {
+	host := ""
+	for _, t := range targets {
+		raw := strings.TrimSpace(t)
+		if raw == "" {
+			continue
+		}
+		if !strings.Contains(raw, "://") {
+			raw = "http://" + raw
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" {
+			return ""
+		}
+		h := strings.ToLower(u.Hostname())
+		if host != "" && h != host {
+			return ""
+		}
+		host = h
+	}
+	if host == "" || !isLocalHost(host) {
+		return ""
+	}
+	return host
+}
+
+// isLocalHost reports whether host is loopback, private or link-local.
+func isLocalHost(host string) bool {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast())
+}

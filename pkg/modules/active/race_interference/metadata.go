@@ -9,20 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects race condition vulnerabilities through parallel request analysis, looking for
-input storage races, cross-request contamination, and request interference patterns.
+	ModuleDesc = `**What it means:** Parallel tagged GET requests showed repeatable input storage, same-session cross-contamination, or response divergence. Divergence is an observation; repeatable wrong-ID behavior is a candidate until cross-user or durable impact is proven.
 
-## Notes
-- Sends concurrent requests with different payloads and analyzes response variations
-- Tests for TOCTOU and state mutation races
-- Requires careful timing analysis
+**How it's exploited:** Concurrent requests may receive another operation's data or corrupt shared state, potentially crossing an authorization boundary.
 
-## References
-- https://portswigger.net/research/smashing-the-state-machine`
+**Fix:** Isolate per-request state and serialize access to shared mutable resources.`
 
-	ModuleConfirmation = "Confirmed when parallel requests with different payloads produce cross-contaminated responses, indicating shared mutable state"
-	ModuleSeverity     = severity.High
+	ModuleConfirmation = "Candidate when wrong-id behavior repeats with a fresh canary in one session; confirmed impact requires cross-user or durable state proof"
+	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"race-condition", "heavy"}
 )

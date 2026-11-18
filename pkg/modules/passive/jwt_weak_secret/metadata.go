@@ -9,28 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects JWT tokens signed with weak HMAC secrets by performing offline
-brute-force against an embedded wordlist of ~104K known weak secrets.
+	ModuleDesc = `**What it means:** A JWT signature matches a known weak HMAC secret or is printable non-cryptographic text. Server-issued tokens form findings; client tokens and arbitrary body text remain candidates.
 
-When an asymmetric-algorithm JWT (RS256, ES256, etc.) is found but no HMAC secret
-matches, emits a low-severity informational finding noting the potential for
-algorithm confusion (CVE-2015-9235). Active testing is recommended to confirm.
+**How it's exploited:** An attacker who knows the signing secret forges claims such as an elevated role. Asymmetric algorithm-confusion patterns remain candidates until verifier acceptance is proven.
 
-## Notes
-- Extracts JWTs from Authorization Bearer headers and cookies
-- Tests HMAC-based algorithms (HS256, HS384, HS512)
-- Detects non-cryptographic (plaintext ASCII) signatures indicating trivially forgeable tokens
-- Tests algorithm confusion (CVE-2015-9235): tries HS256/HS384/HS512 brute-force on asymmetric tokens (RS256, ES256, etc.)
-- Emits informational finding for asymmetric JWTs even when no weak secret is found
-- Computes HMAC signatures offline without sending additional requests
-- Uses embedded jwt.secrets.list wordlist
+**Fix:** Use a high-entropy secret or managed asymmetric key and pin the accepted algorithm server-side.`
 
-## References
-- https://portswigger.net/web-security/jwt
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/06-Session_Management_Testing/10-Testing_JSON_Web_Tokens`
-
-	ModuleConfirmation = "Confirmed when a JWT HMAC signature matches a known weak secret"
+	ModuleConfirmation = "Confirmed only when an offline signature match or non-cryptographic signature is tied to response Authorization or Set-Cookie issuance; other locations remain candidates"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"authentication", "cryptography", "session", "moderate"}

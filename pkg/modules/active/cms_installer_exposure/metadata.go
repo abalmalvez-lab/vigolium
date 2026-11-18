@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed CMS installation and setup wizards that should not be
-accessible in production deployments. Covers WordPress, Drupal, and Joomla
-installer endpoints. An accessible installer can allow an attacker to
-re-install or reconfigure the CMS.
+	ModuleDesc = `**What it means:** The CMS installation wizard (WordPress, Drupal 7/8+, or Joomla) is reachable on a live production host instead of being removed after install - a critical misconfiguration, since anyone can run setup against a live site.
 
-## Notes
-- Runs once per host
-- Checks WordPress /wp-admin/install.php, Drupal /install.php and /core/install.php, Joomla /installation/index.php
-- Validates responses with CMS-specific content markers
-- Fingerprints 404 to avoid false positives
+**How it's exploited:** An attacker who reaches the installer re-runs setup to point the CMS at a database they control, hijacks the admin account, and reconfigures the site, leading to full takeover. It also leaks version details.
 
-## References
-- https://developer.wordpress.org/advanced-administration/before-install/howto-install/
-- https://www.drupal.org/docs/getting-started/installing-drupal
-- https://docs.joomla.org/Installing_Joomla`
+**Fix:** Delete or block the installer endpoints (such as /wp-admin/install.php, /install.php, /core/install.php, /installation/index.php) once setup is done, and restrict by IP or auth if needed.`
 
 	ModuleConfirmation = "Confirmed when installer endpoints return 200 with installation wizard content markers"
 	ModuleSeverity     = severity.Critical

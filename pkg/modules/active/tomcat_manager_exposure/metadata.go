@@ -9,24 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed Apache Tomcat Manager and Host Manager web interfaces. These
-administrative interfaces allow deploying WAR files, managing virtual hosts,
-and viewing server status. Default or weak credentials on these interfaces
-can lead to complete server compromise through malicious WAR deployment.
+	ModuleDesc = `**What it means:** Credential-free probes identified a Tomcat administrative or default surface using grouped framework markers and path controls. An authentication challenge or docs/examples page is an observation; an open manager UI is a candidate.
 
-## Notes
-- Runs once per host
-- Checks manager, host-manager, and status pages
-- Detects both login challenges (401 with WWW-Authenticate) and accessible pages
-- Also detects Tomcat default pages and example servlets
-- Fingerprints 404 responses to reduce false positives
+**How it's exploited:** Separate weak credentials may let attackers deploy a WAR. A direct 401 proves access was denied, while a successful path-normalization probe demonstrates an actual proxy ACL bypass and is promoted to a finding.
 
-## References
-- https://tomcat.apache.org/tomcat-10.1-doc/manager-howto.html
-- https://tomcat.apache.org/tomcat-10.1-doc/security-howto.html`
+**Fix:** Remove or restrict these apps, and require strong credentials over TLS plus network controls for any admin interface that must remain.`
 
-	ModuleConfirmation = "Confirmed when Tomcat Manager or Host Manager interface is accessible or prompts for authentication"
+	ModuleConfirmation = "Observation for Tomcat auth challenge/default apps; candidate for anonymous manager controls; finding only when a blocked direct path is reached through a normalization bypass"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"tomcat", "java", "misconfiguration", "authentication", "light"}

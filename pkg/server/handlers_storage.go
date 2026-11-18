@@ -1,8 +1,8 @@
 package server
 
 import (
+	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,36 +16,24 @@ import (
 // Accepts multipart file upload and stores it in <bucket>/<project-uuid>/ugc/<filename>.
 func (h *Handlers) HandleStorageUploadSource(c fiber.Ctx) error {
 	if h.settings == nil || !h.settings.Storage.IsEnabled() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: "cloud storage is not enabled",
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return respondErrorMsg(c, fiber.StatusServiceUnavailable, "cloud storage is not enabled")
 	}
 
 	projectUUID := c.Locals("project_uuid").(string)
 
 	file, err := c.FormFile("file")
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "file field is required",
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "file field is required")
 	}
 
 	sc, err := storage.NewClient(&h.settings.Storage)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to create storage client",
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondErrorMsg(c, fiber.StatusInternalServerError, "failed to create storage client")
 	}
 
 	f, err := file.Open()
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to open uploaded file",
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondErrorMsg(c, fiber.StatusInternalServerError, "failed to open uploaded file")
 	}
 	defer func() { _ = f.Close() }()
 
@@ -54,10 +42,7 @@ func (h *Handlers) HandleStorageUploadSource(c fiber.Ctx) error {
 
 	if err := sc.Upload(c.Context(), projectUUID, key, f, file.Size, file.Header.Get("Content-Type")); err != nil {
 		zap.L().Error("Failed to upload source to storage", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to upload file to storage",
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondErrorMsg(c, fiber.StatusInternalServerError, "failed to upload file to storage")
 	}
 
 	storageURL := storage.StorageURL(projectUUID, key)
@@ -74,84 +59,88 @@ func (h *Handlers) HandleStorageUploadSource(c fiber.Ctx) error {
 // Downloads a source file from <bucket>/<project-uuid>/ugc/:key.
 func (h *Handlers) HandleStorageDownloadSource(c fiber.Ctx) error {
 	if h.settings == nil || !h.settings.Storage.IsEnabled() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: "cloud storage is not enabled",
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return respondErrorMsg(c, fiber.StatusServiceUnavailable, "cloud storage is not enabled")
 	}
 
 	projectUUID := c.Locals("project_uuid").(string)
 	key := c.Params("key")
 	if key == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "key parameter is required",
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "key parameter is required")
 	}
 
 	cleanKey, validateErr := storage.ValidateKey(key)
 	if validateErr != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "invalid key: " + validateErr.Error(),
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid key: %w", validateErr))
 	}
 	fullKey := storage.UGCKey(cleanKey)
 
 	sc, err := storage.NewClient(&h.settings.Storage)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to create storage client",
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondErrorMsg(c, fiber.StatusInternalServerError, "failed to create storage client")
+	}
+
+	// Stat before committing headers: it resolves existence (so a miss is still a
+	// clean JSON 404 rather than a truncated stream) and yields the size we need
+	// for Content-Length, in the same round trip Exists would have cost.
+	info, err := sc.Stat(c.Context(), projectUUID, fullKey)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotFound) {
+			return respondErrorMsg(c, fiber.StatusNotFound, "file not found in storage")
+		}
+		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to check storage: %w", err))
 	}
 
 	reader, err := sc.Download(c.Context(), projectUUID, fullKey)
 	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(ErrorResponse{
-			Error: "file not found in storage",
-			Code:  fiber.StatusNotFound,
-		})
+		return respondErrorMsg(c, fiber.StatusNotFound, "file not found in storage")
 	}
-	defer func() { _ = reader.Close() }()
 
 	c.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", key))
 	c.Set("Content-Type", "application/octet-stream")
-	_, err = io.Copy(c.Response().BodyWriter(), reader)
-	return err
+	return c.SendStream(reader, objectStreamSize(info.Size))
+}
+
+// objectStreamSize narrows a bucket object's size to the int c.SendStream
+// takes, falling back to -1 (chunked) rather than a wrong Content-Length when
+// the value doesn't survive the conversion.
+//
+// The point of streaming here at all: the obvious spelling — io.Copy into
+// c.Response().BodyWriter() — is not a stream. BodyWriter appends into the
+// response's in-memory body buffer, so the whole object is retained before a
+// single byte is transmitted and RSS scales with object size times
+// concurrency. SendStream copies during response write instead, so a slow
+// client backpressures the bucket read rather than the server racing ahead
+// into memory. Two consequences: fasthttp closes the reader (it is an
+// io.Closer) on every completion path, so callers must not also defer a Close;
+// and headers are committed before the body is read, so an upstream failure
+// partway through is a short read on an otherwise-200 response, not a JSON
+// error.
+func objectStreamSize(size int64) int {
+	if size >= 0 && int64(int(size)) == size {
+		return int(size)
+	}
+	return -1
 }
 
 // HandleStorageDownloadResults handles GET /api/storage/results/:scan_uuid.
 // Downloads the result bundle for a native scan or agentic scan.
 func (h *Handlers) HandleStorageDownloadResults(c fiber.Ctx) error {
 	if h.settings == nil || !h.settings.Storage.IsEnabled() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: "cloud storage is not enabled",
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return respondErrorMsg(c, fiber.StatusServiceUnavailable, "cloud storage is not enabled")
 	}
 
 	projectUUID := c.Locals("project_uuid").(string)
 	scanUUID := c.Params("scan_uuid")
 	if scanUUID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "scan_uuid parameter is required",
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "scan_uuid parameter is required")
 	}
 	if _, err := storage.ValidateKey(scanUUID); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "invalid scan UUID: " + err.Error(),
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid scan UUID: %w", err))
 	}
 
 	sc, err := storage.NewClient(&h.settings.Storage)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to create storage client",
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondErrorMsg(c, fiber.StatusInternalServerError, "failed to create storage client")
 	}
 
 	keys := []string{
@@ -159,83 +148,57 @@ func (h *Handlers) HandleStorageDownloadResults(c fiber.Ctx) error {
 		storage.AgenticScanResultKey(scanUUID),
 	}
 
-	// Probe for existence first — minio's GetObject is lazy, so a non-existent
-	// key only surfaces an error inside io.Copy, by which point we've already
-	// committed to that key and can't fall back to the next one.
+	// Stat for existence first — minio's GetObject is lazy, so a non-existent
+	// key only surfaces an error once the body is read, by which point we've
+	// already committed to that key and can't fall back to the next one.
 	for _, key := range keys {
-		exists, err := sc.Exists(c.Context(), projectUUID, key)
+		info, err := sc.Stat(c.Context(), projectUUID, key)
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-				Error: "failed to check storage: " + err.Error(),
-				Code:  fiber.StatusInternalServerError,
-			})
-		}
-		if !exists {
-			continue
+			if errors.Is(err, storage.ErrObjectNotFound) {
+				continue
+			}
+			return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to check storage: %w", err))
 		}
 
 		reader, err := sc.Download(c.Context(), projectUUID, key)
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-				Error: "failed to open storage object: " + err.Error(),
-				Code:  fiber.StatusInternalServerError,
-			})
+			return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to open storage object: %w", err))
 		}
-		defer func() { _ = reader.Close() }()
 
 		c.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(key)))
 		c.Set("Content-Type", "application/gzip")
-		_, err = io.Copy(c.Response().BodyWriter(), reader)
-		return err
+		return c.SendStream(reader, objectStreamSize(info.Size))
 	}
 
-	return c.Status(fiber.StatusNotFound).JSON(ErrorResponse{
-		Error: "no results found for this scan UUID",
-		Code:  fiber.StatusNotFound,
-	})
+	return respondErrorMsg(c, fiber.StatusNotFound, "no results found for this scan UUID")
 }
 
 // HandleStoragePresign handles POST /api/storage/presign.
 // Generates presigned URLs for direct upload/download.
 func (h *Handlers) HandleStoragePresign(c fiber.Ctx) error {
 	if h.settings == nil || !h.settings.Storage.IsEnabled() {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: "cloud storage is not enabled",
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return respondErrorMsg(c, fiber.StatusServiceUnavailable, "cloud storage is not enabled")
 	}
 
 	projectUUID := c.Locals("project_uuid").(string)
 
 	var req StoragePresignRequest
 	if err := c.Bind().JSON(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "invalid request body",
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "invalid request body")
 	}
 
 	if req.Key == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "key is required",
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "key is required")
 	}
 	cleanKey, validateErr := storage.ValidateKey(req.Key)
 	if validateErr != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "invalid key: " + validateErr.Error(),
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid key: %w", validateErr))
 	}
 	req.Key = cleanKey
 
 	sc, err := storage.NewClient(&h.settings.Storage)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to create storage client",
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondErrorMsg(c, fiber.StatusInternalServerError, "failed to create storage client")
 	}
 
 	expiry := 1 * time.Hour
@@ -252,10 +215,7 @@ func (h *Handlers) HandleStoragePresign(c fiber.Ctx) error {
 	}
 
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to generate presigned URL",
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondErrorMsg(c, fiber.StatusInternalServerError, "failed to generate presigned URL")
 	}
 
 	return c.JSON(StoragePresignResponse{

@@ -9,19 +9,17 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects Facebook OAuth redirect parameters in requests, flagging potential
-OAuth misconfiguration or open redirect vectors in the authentication flow.
+	ModuleDesc = `**What it means:** A request to www.facebook.com carries a redirect-control parameter (redirect_uri or next) in a Facebook OAuth login flow, marking the return URL trusted after authentication. Informational recon, not a confirmed flaw.
 
-## Notes
-- Scans URL parameters for Facebook OAuth redirect_uri and related parameters
-- Helps identify OAuth flows that may be vulnerable to redirect manipulation
+**How it's exploited:** The detection pinpoints the OAuth return-URL parameter so a reviewer can test whether an attacker value is accepted. If it is not strictly allowlisted, a crafted login link can send the victim or their authorization code to an attacker site.
 
-## References
-- https://developers.facebook.com/docs/facebook-login/security/`
+**Fix:** Strictly validate redirect_uri against an exact allowlist of registered callback URLs (full path, no wildcard host).`
 
 	ModuleConfirmation = "Confirmed when request URL contains Facebook OAuth parameters (client_id, redirect_uri) matching known OAuth flow patterns"
-	ModuleSeverity     = severity.Medium
-	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"authentication", "session", "light"}
+	// The module text says "Informational recon, not a confirmed flaw" — noting a
+	// redirect_uri/next parameter on a Facebook OAuth request is inventory, not a
+	// vulnerability. Reporting it at Medium over-severed a recon signal.
+	ModuleSeverity   = severity.Info
+	ModuleConfidence = severity.Firm
+	ModuleTags       = []string{"authentication", "session", "light"}
 )

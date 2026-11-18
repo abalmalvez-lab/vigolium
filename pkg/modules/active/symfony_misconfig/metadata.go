@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Symfony framework-specific misconfigurations: web profiler/debug toolbar
-accessible in production, dev front controller (app_dev.php) exposed, debug logs,
-and exposed configuration files.
+	ModuleDesc = `**What it means:** A Symfony app exposes development resources that should never be reachable in production - the web profiler or debug toolbar, the app_dev.php front controller, log files, or framework/Doctrine config files served as readable content.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Checks for X-Debug-Token and X-Debug-Token-Link response headers
-- Fingerprints 404 responses to detect custom error pages
+**How it's exploited:** An attacker browses the profiler for request data, routes, and settings. Config is highest impact: framework.yaml can reveal the secret key and doctrine.yaml can disclose database credentials.
 
-## References
-- https://symfony.com/doc/current/reference/configuration/framework.html
-- https://symfony.com/doc/current/profiler.html
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Disable the profiler, debug toolbar, and dev front controller in production, set the environment to prod with debug off, and never serve config or log files from the web root.`
 
 	ModuleConfirmation = "Confirmed when probed Symfony endpoints return 200 with expected framework-specific markers"
 	ModuleSeverity     = severity.High

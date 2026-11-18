@@ -67,13 +67,38 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 	baseline := newDetectionBaseline(entry)
+	// A baseline that is itself a WAF/CDN edge block (a CloudFront "Request blocked"
+	// 403, a Cloudflare challenge served at 200 or 403, a 429) is not the
+	// application's response. A probe that rewrites the offending path segment dodges
+	// the edge rule and returns the real 200 page — which the 403→200 status leg
+	// misreads as an access-control flip and the tag-diff leg misreads as an
+	// input-driven structural change. Neither leg has a usable reference, so drop the
+	// endpoint. IsEdgeBlockedResponse flags only vendor blocks, so a genuine app 403
+	// baseline (the real access-control-flip signal) is preserved.
+	if baseline.edgeBlocked {
+		return nil, nil
+	}
+	calibrateTagJitter(ctx, httpClient, baseline, scanCtx)
 
 	var results []*output.ResultEvent
 	results = append(results, probeHeaders(ctx, httpClient, baseline)...)
 	results = append(results, probePaths(ctx, httpClient, baseline)...)
 	results = append(results, probeDebugParams(ctx, httpClient, baseline)...)
 
-	return results, nil
+	// Every probe verdict is a diff against that one baseline, so none of them mean
+	// anything on an endpoint that answers the SAME unmodified request two
+	// different ways — a host round-robining between mismatched backends (a parked
+	// pool serving either a 5.9 KB or an 11.3 KB Apache default page) makes every
+	// probe "diverge". Checked only once a probe has diverged, and memoized per
+	// record, so the probing above is unaffected.
+	if len(results) > 0 && modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+		return nil, nil
+	}
+
+	// Collapse every probe that diverged for this endpoint into ONE finding so the
+	// run writes a single http_record instead of one per probe (the rest ride along
+	// as inline AdditionalEvidence) — keeps probe traffic from flooding the table.
+	return collapseProbeFindings(results), nil
 }
 
 // ScanPerInsertionPoint tests a single insertion point for HTML structure
@@ -105,6 +130,12 @@ func (m *Module) ScanPerInsertionPoint(
 		return nil, nil
 	}
 	baseline := newDetectionBaseline(entry)
+	// Drop an edge-blocked baseline (see ScanPerRequest): a WAF/CDN block page is not
+	// a usable reference for the status or tag-structure differential.
+	if baseline.edgeBlocked {
+		return nil, nil
+	}
+	calibrateTagJitter(ctx, httpClient, baseline, scanCtx)
 
 	var results []*output.ResultEvent
 
@@ -114,7 +145,15 @@ func (m *Module) ScanPerInsertionPoint(
 	// Per-char param fuzzing
 	results = append(results, probeParamFuzz(ctx, ip, httpClient, baseline)...)
 
-	return results, nil
+	// Same endpoint-determinism gate as ScanPerRequest: a diff-only verdict is not
+	// evidence on a non-deterministic endpoint.
+	if len(results) > 0 && modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+		return nil, nil
+	}
+
+	// Collapse to a single finding (one http_record) per insertion point; the other
+	// diverging char/polyglot probes become inline AdditionalEvidence.
+	return collapseProbeFindings(results), nil
 }
 
 // probePolyglot sends a polyglot payload to detect HTML tag structure changes.
@@ -126,13 +165,10 @@ func (m *Module) probePolyglot(
 ) []*output.ResultEvent {
 	fuzzedRaw := ip.BuildRequest([]byte(fuzzPayload))
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// fuzzedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
-	fuzzedResp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
+	fuzzedResp, _, err := httpClient.Execute(fuzzedReq, probeOptions(false))
 	if err != nil {
 		if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 			return nil
@@ -142,7 +178,7 @@ func (m *Module) probePolyglot(
 	defer fuzzedResp.Close()
 
 	change := detectChange(baseline, fuzzedResp.Body().String(), fuzzedResp.Response().StatusCode)
-	if change.IsInteresting {
+	if confirmChange(ctx, httpClient, baseline, fuzzedRaw, change) {
 		urlx, _ := ctx.URL()
 		urlStr := ""
 		if urlx != nil {

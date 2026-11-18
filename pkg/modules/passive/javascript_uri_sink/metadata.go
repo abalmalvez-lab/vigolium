@@ -9,28 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects javascript: protocol URIs in HTML attributes that act as XSS sinks.
-When user-controlled data flows into href, src, or other URL-based attributes
-without protocol validation, an attacker can inject javascript: URIs to achieve
-script execution on user interaction (e.g., clicking a link).
+	ModuleDesc = `**What it means:** A javascript: URI was found in a URL-based HTML attribute (href, src, action, formaction) - a potential XSS sink, exploitable only when built from unvalidated input. Reported Medium/Firm when a request parameter is reflected into the URI; a static URI is Info/Tentative, and browser no-ops (javascript:void(0)) and framework postback helpers (__doPostBack, form.submit()) are not reported.
 
-This is a distinct vector from general DOM XSS — React's default data binding
-does not protect against javascript: URIs in href attributes.
+**How it's exploited:** An attacker crafts a link or form whose URL attribute begins with javascript: (including encoded variants) from reflected input; clicking or submitting runs the script in the victim's session.
 
-## Notes
-- Scans HTML responses for javascript: URIs in href, src, action, formaction attributes
-- Correlates with request parameters to identify reflection from user input
-- Flags both direct javascript: URIs and obfuscated variants (url-encoded, mixed case)
-- Deduplicates by host+path
+**Fix:** Reject non-http schemes and allow-list safe protocols (http/https/mailto).`
 
-## References
-- https://owasp.org/www-community/attacks/xss/
-- https://snyk.io/blog/10-react-security-best-practices/
-- https://cwe.mitre.org/data/definitions/79.html`
-
-	ModuleConfirmation = "Confirmed when javascript: URI is found in a URL-based HTML attribute, especially when correlated with request input"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Confirmed when a request parameter value is reflected into a javascript: URI in a URL-based HTML attribute (Medium/Firm); a static javascript: URI with no reflected input is an Info observation"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"xss", "javascript", "light"}
 )

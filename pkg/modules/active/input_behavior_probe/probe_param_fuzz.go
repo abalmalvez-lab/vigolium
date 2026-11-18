@@ -25,15 +25,14 @@ func probeParamFuzz(
 
 	for _, char := range paramFuzzChars {
 		payload := ip.BaseValue() + char
-		fuzzedRaw := ip.BuildRequest([]byte(payload))
+		// paramFuzzChars are written as they must arrive ("%00", "..%2f"):
+		// pre-encoded, so their own %-encoding is not double-encoded.
+		fuzzedRaw := httpmsg.BuildPreEncoded(ip, []byte(payload))
 
-		req, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-		if err != nil {
-			continue
-		}
-		req = req.WithService(ctx.Service())
+		// fuzzedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+		req := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
-		resp, _, err := httpClient.Execute(req, http.Options{})
+		resp, _, err := httpClient.Execute(req, probeOptions(false))
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return results
@@ -42,7 +41,7 @@ func probeParamFuzz(
 		}
 
 		change := detectChange(baseline, resp.Body().String(), resp.Response().StatusCode)
-		if change.IsInteresting {
+		if confirmChange(ctx, httpClient, baseline, fuzzedRaw, change) {
 			results = append(results, buildProbeResult(
 				urlStr, fuzzedRaw, resp.FullResponseString(),
 				ip.Name(), "param_char_fuzz", payload, change,

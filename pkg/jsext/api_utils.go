@@ -66,6 +66,7 @@ func utilsFuncDefs() []JSFuncDef {
 	defs := []JSFuncDef{
 		{
 			Namespace: NsUtils, Name: "base64Encode",
+			Effect:   EffectPure,
 			Category: CatEncoding, Signature: ".base64Encode(s: string)", Returns: "string",
 			Description: "Encode a string to base64.", Example: exBase64Encode,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -77,6 +78,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "base64Decode",
+			Effect:   EffectPure,
 			Category: CatEncoding, Signature: ".base64Decode(s: string)", Returns: "string",
 			Description: "Decode a base64 string. Returns empty string on error.", Example: exBase64Decode,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -92,6 +94,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "urlEncode",
+			Effect:   EffectPure,
 			Category: CatEncoding, Signature: ".urlEncode(s: string)", Returns: "string",
 			Description: "URL-encode (percent-encode) a string.", Example: exURLEncode,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -103,6 +106,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "urlDecode",
+			Effect:   EffectPure,
 			Category: CatEncoding, Signature: ".urlDecode(s: string)", Returns: "string",
 			Description: "Decode a URL-encoded string.", Example: exURLDecode,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -118,6 +122,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "htmlEncode",
+			Effect:   EffectPure,
 			Category: CatEncoding, Signature: ".htmlEncode(s: string)", Returns: "string",
 			Description: "HTML-escape a string.", Example: exHTMLEncode,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -129,6 +134,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "htmlDecode",
+			Effect:   EffectPure,
 			Category: CatEncoding, Signature: ".htmlDecode(s: string)", Returns: "string",
 			Description: "Unescape HTML entities.", Example: exHTMLDecode,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -140,6 +146,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "sha1",
+			Effect:   EffectPure,
 			Category: CatHashing, Signature: ".sha1(s: string)", Returns: "string",
 			Description: "Compute SHA-1 hex digest.", Example: exSHA1,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -152,6 +159,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "sha256",
+			Effect:   EffectPure,
 			Category: CatHashing, Signature: ".sha256(s: string)", Returns: "string",
 			Description: "Compute SHA-256 hex digest.", Example: exSHA256,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -164,6 +172,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "md5",
+			Effect:   EffectPure,
 			Category: CatHashing, Signature: ".md5(s: string)", Returns: "string",
 			Description: "Compute MD5 hex digest.", Example: exMD5,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -176,6 +185,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "randomString",
+			Effect:   EffectPure,
 			Category: CatStrings, Signature: ".randomString(len: number)", Returns: "string",
 			Description: "Generate a random alphanumeric string.", Example: exRandomString,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -195,6 +205,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "sleep",
+			Effect:   EffectSleep,
 			Category: CatSystem, Signature: ".sleep(ms: number)", Returns: "void",
 			Description: "Sleep for the given number of milliseconds (max 30000).", Example: exSleep,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -209,6 +220,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "exec",
+			Effect:   EffectExec,
 			Category: CatSystem, Signature: ".exec(cmd: string)", Returns: "{stdout, stderr, exitCode}",
 			Description: "Execute a shell command.", Example: exExec,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -235,7 +247,11 @@ func utilsFuncDefs() []JSFuncDef {
 					ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 					defer cancel()
 
-					c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+					// /bin/sh off Windows (present on minimal containers where bash
+					// is not); an installed POSIX bash or PowerShell on Windows,
+					// which has neither.
+					shellName, shellArgs := procutil.ShellArgv("/bin/sh", "-c")
+					c := exec.CommandContext(ctx, shellName, append(append([]string{}, shellArgs...), cmd)...)
 					procutil.SetupProcessGroup(c) // kill the whole group on timeout, not just /bin/sh
 					c.WaitDelay = 2 * time.Second
 					stdout := &cappedWriter{max: maxExecCapture}
@@ -270,6 +286,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "getEnv",
+			Effect:   EffectPure,
 			Category: CatSystem, Signature: ".getEnv(name: string)", Returns: "string",
 			Description: "Read an environment variable.", Example: exGetEnv,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -281,6 +298,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "setEnv",
+			Effect:   EffectExec,
 			Category: CatSystem, Signature: ".setEnv(name: string, val: string)", Returns: "bool",
 			Description: "Set an environment variable.", Example: exSetEnv,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -301,6 +319,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "glob",
+			Effect:   EffectFS,
 			Category: CatFileIO, Signature: ".glob(pattern: string)", Returns: "string[]",
 			Description: "Find files matching a glob pattern.", Example: exGlob,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -324,6 +343,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "readFile",
+			Effect:   EffectFS,
 			Category: CatFileIO, Signature: ".readFile(path: string)", Returns: "string",
 			Description: "Read a file's contents.", Example: exReadFile,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -343,6 +363,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "readLines",
+			Effect:   EffectFS,
 			Category: CatFileIO, Signature: ".readLines(path: string)", Returns: "string[]",
 			Description: "Read a file as an array of lines.", Example: exReadLines,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -359,7 +380,12 @@ func utilsFuncDefs() []JSFuncDef {
 					lines := strings.Split(string(data), "\n")
 					jsArr := make([]interface{}, len(lines))
 					for i, l := range lines {
-						jsArr[i] = l
+						// Strip only the CR of a CRLF terminator. A wordlist or
+						// payload file authored on Windows would otherwise hand
+						// every entry back with a trailing \r, which an extension
+						// then injects verbatim. Trailing spaces are left intact —
+						// they can be significant in a payload.
+						jsArr[i] = strings.TrimSuffix(l, "\r")
 					}
 					return vm.ToValue(jsArr)
 				}
@@ -367,6 +393,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "writeFile",
+			Effect:   EffectFS,
 			Category: CatFileIO, Signature: ".writeFile(path: string, data: string)", Returns: "bool",
 			Description: "Write data to a file.", Example: exWriteFile,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -386,6 +413,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "mkdir",
+			Effect:   EffectFS,
 			Category: CatFileIO, Signature: ".mkdir(path: string)", Returns: "bool",
 			Description: "Create a directory.", Example: exMkdir,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -404,6 +432,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "jsonExtract",
+			Effect:   EffectPure,
 			Category: CatExtract, Signature: ".jsonExtract(json: string, path: string)", Returns: "any",
 			Description: "Extract a value from JSON.", Example: exJSONExtract,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -426,6 +455,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "regexMatch",
+			Effect:   EffectPure,
 			Category: CatExtract, Signature: ".regexMatch(str: string, pattern: string)", Returns: "bool",
 			Description: "Test regex match.", Example: exRegexMatch,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -442,6 +472,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "regexExtract",
+			Effect:   EffectPure,
 			Category: CatExtract, Signature: ".regexExtract(str: string, pattern: string)", Returns: "string | string[] | null",
 			Description: "Extract regex match.", Example: exRegexExtract,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -474,6 +505,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "regexFindAll",
+			Effect:   EffectPure,
 			Category: CatExtract, Signature: ".regexFindAll(str: string, pattern: string)", Returns: "string[] | null",
 			Description: "Return all non-overlapping matches of pattern in str.", Example: exRegexFindAll,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -498,6 +530,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "parse_url",
+			Effect:   EffectPure,
 			Category: CatExtract, Signature: ".parse_url(url: string, format: string)", Returns: "string",
 			Description: "Parse a URL.", Example: exParseURL,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -510,6 +543,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "parse_url_file",
+			Effect:   EffectFS,
 			Category: CatExtract, Signature: ".parse_url_file(input: string, format: string, output: string)", Returns: "bool",
 			Description: "Parse URLs from file.", Example: exParseURLFile,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -555,6 +589,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "pathToTemplate",
+			Effect:   EffectPure,
 			Category: "Utils", Signature: ".pathToTemplate(path: string)", Returns: "string",
 			Description: "Convert a URL path to a template with dynamic segments replaced.", Example: "",
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -566,6 +601,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "hasDynamicSegment",
+			Effect:   EffectPure,
 			Category: "Utils", Signature: ".hasDynamicSegment(path: string)", Returns: "bool",
 			Description: "Check if a URL path contains dynamic segments.", Example: "",
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -577,6 +613,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "toSet",
+			Effect:   EffectPure,
 			Category: "Utils", Signature: ".toSet(csv: string)", Returns: "object",
 			Description: "Convert a comma-separated string to a set object.", Example: "",
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -595,6 +632,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "extractParamNames",
+			Effect:   EffectPure,
 			Category: "Utils", Signature: ".extractParamNames(str: string)", Returns: "string[]",
 			Description: "Extract parameter names from a query string.", Example: "",
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -623,6 +661,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "detectAnomaly",
+			Effect:   EffectPure,
 			Category: CatDetection, Signature: ".detectAnomaly(responses: object[])", Returns: "{index, score}[]",
 			Description: "Rank responses by anomaly.", Example: exDetectAnomaly,
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -695,6 +734,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "diff",
+			Effect:   EffectPure,
 			Category: "Utils", Signature: ".diff(a: string, b: string)", Returns: "{added: string[], removed: string[], similarity: number}",
 			Description: "Compute line-level diff between two strings.", Example: "",
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -763,6 +803,7 @@ func utilsFuncDefs() []JSFuncDef {
 		},
 		{
 			Namespace: NsUtils, Name: "similarity",
+			Effect:   EffectPure,
 			Category: "Utils", Signature: ".similarity(a: string, b: string)", Returns: "number",
 			Description: "Compute Jaccard similarity on word-level tokens (0.0 to 1.0).", Example: "",
 			MakeHandler: func(vm *sobek.Runtime, opts APIOptions) func(sobek.FunctionCall) sobek.Value {
@@ -818,8 +859,14 @@ func resolveSandboxPath(path, sandboxDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// An empty sandbox_dir means the working directory, as documented — it
+	// used to mean "anywhere".
 	if sandboxDir == "" {
-		return abs, nil
+		wd, werr := os.Getwd()
+		if werr != nil {
+			return "", werr
+		}
+		sandboxDir = wd
 	}
 	sandboxAbs, err := filepath.Abs(sandboxDir)
 	if err != nil {

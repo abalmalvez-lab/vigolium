@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/input/formats"
 	"github.com/vigolium/vigolium/pkg/work"
+	"go.uber.org/zap"
 )
 
 // InputSource provides a stream of work items for scanning.
@@ -55,9 +57,15 @@ type SourceConfig struct {
 	// Direct targets (from -u flag)
 	Targets []string
 
-	// File-based input
-	FilePath string
-	Format   string // "urls", "nuclei", "openapi", etc.
+	// File-based input. FilePath is a single input file (e.g. -i/--input).
+	// FilePaths carries additional files (e.g. repeated -T/--target-file); every
+	// listed file is read and its items merged into the stream.
+	FilePath  string
+	FilePaths []string
+	Format    string // "urls", "nuclei", "openapi", etc.
+	// FormatExplicit: Format was chosen by the user, so a "urls" Format is not
+	// content-detected (see FileSourceConfig.FormatExplicit).
+	FormatExplicit bool
 
 	// Stdin
 	UseStdin bool
@@ -84,17 +92,29 @@ func NewInputSource(cfg SourceConfig) (InputSource, error) {
 		sources = append(sources, NewTargetSource(cfg.Targets, cfg.EnableModules))
 	}
 
-	// Add file source if file path provided
+	// Add a file source per provided path. FilePath (single) and FilePaths
+	// (repeatable) are read in order and merged; an empty entry is skipped so a
+	// caller can pass either field without guarding.
+	filePaths := make([]string, 0, len(cfg.FilePaths)+1)
 	if cfg.FilePath != "" {
+		filePaths = append(filePaths, cfg.FilePath)
+	}
+	for _, fp := range cfg.FilePaths {
+		if fp != "" {
+			filePaths = append(filePaths, fp)
+		}
+	}
+	for _, fp := range filePaths {
 		bufSize := cfg.BufferSize
 		if bufSize <= 0 {
 			bufSize = 100
 		}
 		fs, err := NewFileSource(FileSourceConfig{
-			FilePath:      cfg.FilePath,
-			Format:        cfg.Format,
-			BufferSize:    bufSize,
-			EnableModules: cfg.EnableModules,
+			FilePath:       fp,
+			Format:         cfg.Format,
+			FormatExplicit: cfg.FormatExplicit,
+			BufferSize:     bufSize,
+			EnableModules:  cfg.EnableModules,
 			FormatOptions: formats.InputFormatOptions{
 				SkipFormatValidation: cfg.SkipFormatValidation,
 				RequiredOnly:         cfg.FormatUseRequiredOnly,
@@ -118,7 +138,7 @@ func NewInputSource(cfg SourceConfig) (InputSource, error) {
 	// Return appropriate source
 	switch len(sources) {
 	case 0:
-		return nil, fmt.Errorf("no input source configured: provide targets (-u), file (-l), or stdin")
+		return nil, fmt.Errorf("no input: pass -t, -T, -i or pipe URLs on stdin")
 	case 1:
 		return sources[0], nil
 	default:
@@ -126,9 +146,20 @@ func NewInputSource(cfg SourceConfig) (InputSource, error) {
 	}
 }
 
-// SupportedFormats returns comma-separated list of supported input formats.
+// SupportedFormats returns a comma-separated list of the canonical input-format
+// names, derived from the single formatRegistry source of truth so it can never
+// drift from the set resolveFormat actually accepts.
 func SupportedFormats() string {
-	return "urls, nuclei, openapi, swagger, deparos"
+	return strings.Join(SupportedFormatNames(), ", ")
+}
+
+// SupportedFormatNames returns the canonical input-format names in display order.
+func SupportedFormatNames() []string {
+	names := make([]string, len(formatRegistry))
+	for i, e := range formatRegistry {
+		names[i] = e.canonical
+	}
+	return names
 }
 
 // TargetSource provides input from direct URL targets (from -u flag).
@@ -163,18 +194,33 @@ func (t *TargetSource) Next(ctx context.Context) (*work.WorkItem, error) {
 	default:
 	}
 
-	if t.index >= len(t.targets) {
-		return nil, io.EOF
-	}
+	// Skip targets that don't parse rather than returning on the first bad one. A
+	// single hand-typed -t is not the only caller any more: a -T/--target-file
+	// list is promoted into Targets, and a recon export routinely carries a junk
+	// line. The executor does treat a Next error as continue, so this is not the
+	// difference between scanning and not — it is that the warning here names the
+	// target that was dropped, where the executor's generic "error reading from
+	// source" cannot, and that a run of bad lines no longer trips its
+	// consecutive-error spin guard. Matches the urls format parser, which logs
+	// the offending URL and continues.
+	for t.index < len(t.targets) {
+		target := t.targets[t.index]
+		t.index++
 
-	target := t.targets[t.index]
-	t.index++
-
-	rr, err := httpmsg.GetRawRequestFromURL(target)
-	if err != nil {
-		return nil, err
+		rr, err := httpmsg.GetRawRequestFromURL(target)
+		if err != nil {
+			zap.L().Warn("targets: could not build request from target",
+				zap.String("target", target), zap.Error(err))
+			continue
+		}
+		item := work.NewWithModules(rr, t.enableModules)
+		// The submitted line, so every record the item produces — including
+		// the hops of a chain that walks off this host — can name where it
+		// came from. See WorkItem.Target.
+		item.Target = target
+		return item, nil
 	}
-	return work.NewWithModules(rr, t.enableModules), nil
+	return nil, io.EOF
 }
 
 // Close marks the source as closed.

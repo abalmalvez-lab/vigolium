@@ -25,6 +25,14 @@ type DiskQueue struct {
 	baseDir          string
 	maxRecordsPerSeg int
 
+	// discardBefore drops (acks without delivering) any task created before
+	// it. Zero = deliver everything. Set from DiscardOlderThan at open, so it
+	// only ever catches tasks a previous run left behind.
+	discardBefore time.Time
+	// recovered is how many pending tasks were on disk at open.
+	recovered int64
+	discarded atomic.Int64
+
 	segments      []*Segment // Ordered by ID (oldest first)
 	activeSegment *Segment   // Current segment for writing
 	nextSegmentID uint64
@@ -33,6 +41,12 @@ type DiskQueue struct {
 	closeChan chan struct{}
 	cleanupWg conc.WaitGroup
 	notify    chan struct{} // Signals Dequeue when new tasks arrive
+
+	// taskSeg maps a dequeued task's ID → the segment it lives in, so Ack goes
+	// straight to that segment instead of scanning every segment (the previous
+	// O(segments) linear search). A stale mapping (segment reaped) falls back to
+	// the linear scan.
+	taskSeg sync.Map
 
 	// Metrics
 	totalEnqueued  atomic.Int64
@@ -53,6 +67,11 @@ type DiskQueueConfig struct {
 	// MaxRecordsPerSegment is the maximum tasks per segment before rotation.
 	// Default: 10000
 	MaxRecordsPerSegment int
+
+	// DiscardOlderThan, when > 0, drops recovered tasks older than this at
+	// dequeue instead of replaying them: a task a crashed server left behind
+	// days ago targets a world that has moved on.
+	DiscardOlderThan time.Duration
 }
 
 // DefaultDiskQueueConfig returns sensible defaults.
@@ -73,7 +92,8 @@ func NewDiskQueue(cfg DiskQueueConfig) (*DiskQueue, error) {
 	}
 
 	// Ensure base directory exists
-	if err := os.MkdirAll(cfg.BaseDir, 0755); err != nil {
+	// 0700: queued tasks carry raw requests (cookies, tokens, bodies).
+	if err := os.MkdirAll(cfg.BaseDir, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create base directory: %w", err)
 	}
 
@@ -83,10 +103,16 @@ func NewDiskQueue(cfg DiskQueueConfig) (*DiskQueue, error) {
 		closeChan:        make(chan struct{}),
 		notify:           make(chan struct{}, 1),
 	}
+	if cfg.DiscardOlderThan > 0 {
+		q.discardBefore = time.Now().Add(-cfg.DiscardOlderThan)
+	}
 
 	// Load existing segments or create first one
 	if err := q.loadOrCreateSegments(); err != nil {
 		return nil, err
+	}
+	for _, seg := range q.segments {
+		q.recovered += seg.PendingTasks()
 	}
 
 	// Start background cleanup goroutine
@@ -309,20 +335,34 @@ func (q *DiskQueue) EnqueueBatch(ctx context.Context, tasks []*ScanTask) error {
 		task.UpdatedAt = task.CreatedAt
 	}
 
-	// Check if rotation needed before batch write
-	if q.activeSegment.TotalTasks()+int64(len(tasks)) >= int64(q.maxRecordsPerSeg) {
-		q.activeSegment.Seal()
-		if err := q.createNewSegment(); err != nil {
-			return fmt.Errorf("failed to create new segment: %w", err)
+	// Write in chunks no larger than the per-segment cap so an oversized batch
+	// can't blow past maxRecordsPerSeg in a single segment. Each chunk runs the
+	// same rotate-if-full check a normal batch does.
+	chunkMax := q.maxRecordsPerSeg
+	if chunkMax <= 0 {
+		chunkMax = len(tasks)
+	}
+	for start := 0; start < len(tasks); start += chunkMax {
+		end := start + chunkMax
+		if end > len(tasks) {
+			end = len(tasks)
 		}
-	}
+		chunk := tasks[start:end]
 
-	if err := q.activeSegment.WriteTasks(tasks); err != nil {
-		q.enqueueErrors.Add(int64(len(tasks)))
-		return err
-	}
+		// Rotate before writing when this chunk would fill/overflow the segment.
+		if q.activeSegment.TotalTasks()+int64(len(chunk)) >= int64(q.maxRecordsPerSeg) {
+			q.activeSegment.Seal()
+			if err := q.createNewSegment(); err != nil {
+				return fmt.Errorf("failed to create new segment: %w", err)
+			}
+		}
 
-	q.totalEnqueued.Add(int64(len(tasks)))
+		if err := q.activeSegment.WriteTasks(chunk); err != nil {
+			q.enqueueErrors.Add(int64(len(chunk)))
+			return err
+		}
+		q.totalEnqueued.Add(int64(len(chunk)))
+	}
 
 	// Wake up blocked Dequeue callers
 	select {
@@ -399,8 +439,12 @@ func (q *DiskQueue) tryDequeue() (*ScanTask, error) {
 		return nil, ErrQueueClosed
 	}
 
+	// Copy the segment slice under the lock — q.segments[:] would alias the
+	// backing array, which createNewSegment (append) and cleanupCompletedSegments
+	// (reassign) mutate concurrently, racing this range.
 	q.mu.RLock()
-	segments := q.segments[:]
+	segments := make([]*Segment, len(q.segments))
+	copy(segments, q.segments)
 	q.mu.RUnlock()
 
 	// Iterate from oldest segment first
@@ -409,7 +453,7 @@ func (q *DiskQueue) tryDequeue() (*ScanTask, error) {
 		if seg.IsClosed() {
 			continue
 		}
-		task, err := seg.GetNextPending()
+		task, err := q.nextFreshPending(seg)
 		if err != nil {
 			zap.L().Warn("Error getting pending task from segment",
 				zap.Uint64("segment_id", seg.ID()),
@@ -417,6 +461,8 @@ func (q *DiskQueue) tryDequeue() (*ScanTask, error) {
 			continue
 		}
 		if task != nil {
+			// Remember which segment owns this task so Ack can reach it directly.
+			q.taskSeg.Store(task.ID, seg)
 			return task, nil
 		}
 	}
@@ -424,13 +470,58 @@ func (q *DiskQueue) tryDequeue() (*ScanTask, error) {
 	return nil, nil
 }
 
-// Ack marks a task as completed.
+// nextFreshPending returns seg's next pending task, acking (dropping) any that
+// are older than the discard cutoff on the way.
+func (q *DiskQueue) nextFreshPending(seg *Segment) (*ScanTask, error) {
+	for {
+		task, err := seg.GetNextPending()
+		if err != nil || task == nil {
+			return task, err
+		}
+		if q.discardBefore.IsZero() || !task.CreatedAt.Before(q.discardBefore) {
+			return task, nil
+		}
+		if err := seg.AckTask(task.ID); err != nil && !errors.Is(err, ErrTaskNotFound) {
+			return nil, err
+		}
+		if n := q.discarded.Add(1); n == 1 {
+			zap.L().Warn("Discarding stale queued tasks left by a previous run",
+				zap.Time("created_before", q.discardBefore))
+		}
+	}
+}
+
+// RecoveredTasks is how many pending tasks were on disk when the queue opened.
+func (q *DiskQueue) RecoveredTasks() int64 { return q.recovered }
+
+// DiscardedTasks is how many recovered tasks were dropped as stale so far.
+func (q *DiskQueue) DiscardedTasks() int64 { return q.discarded.Load() }
+
+// Ack marks a task as completed. It first tries the segment recorded for this
+// task at dequeue (O(1)); if that mapping is missing or stale, it falls back to
+// scanning every segment.
 func (q *DiskQueue) Ack(taskID string) error {
+	if v, ok := q.taskSeg.Load(taskID); ok {
+		seg := v.(*Segment)
+		err := seg.AckTask(taskID)
+		q.taskSeg.Delete(taskID)
+		if err == nil {
+			q.totalCompleted.Add(1)
+			return nil
+		}
+		if !errors.Is(err, ErrTaskNotFound) {
+			return err
+		}
+		// Stale mapping (segment reaped, or task moved) — fall through to the scan.
+	}
+
+	// Fallback linear scan. Copy under the lock (see tryDequeue) to avoid racing
+	// concurrent mutations of q.segments.
 	q.mu.RLock()
-	segments := q.segments[:]
+	segments := make([]*Segment, len(q.segments))
+	copy(segments, q.segments)
 	q.mu.RUnlock()
 
-	// Try to find and ack the task in any segment
 	for _, seg := range segments {
 		err := seg.AckTask(taskID)
 		if err == nil {

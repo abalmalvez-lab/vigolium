@@ -9,10 +9,16 @@ import (
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/modules/shared/authzutil"
 	"github.com/vigolium/vigolium/pkg/modules/shared/jsframework"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/utils"
 )
+
+// catchAllProbeSlug is an improbable path segment used to detect a data route
+// that answers EVERY path with a 200 pageProps body (a CDN/error-boundary
+// catch-all) rather than selectively serving the requested page's data.
+const catchAllProbeSlug = "vigolium-nonexistent-probe-9f3a2c7e"
 
 // Module implements the Next.js data route leakage active scanner.
 type Module struct {
@@ -50,9 +56,21 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	// Only check auth-protected responses
+	// Only check genuinely auth-protected responses. A 401/403 is an unambiguous
+	// authorization denial. A 302, however, is NOT necessarily auth: locale,
+	// trailing-slash, www/apex and canonical redirects are all 302, and EVERY
+	// public Next.js page's data route returns 200 JSON with pageProps by design.
+	// Treating a non-auth 302 as "protected" flags ordinary public pages as data
+	// leaks, so a 302 only counts when it redirects to a login/auth page.
 	statusCode := ctx.Response().StatusCode()
-	if statusCode != 302 && statusCode != 401 && statusCode != 403 {
+	switch statusCode {
+	case 401, 403:
+		// Unambiguous authorization denial — proceed.
+	case 302:
+		if !authzutil.IsLoginRedirect(statusCode, ctx.Response().Header("Location")) {
+			return nil, nil
+		}
+	default:
 		return nil, nil
 	}
 
@@ -105,11 +123,9 @@ func (m *Module) ScanPerRequest(
 	modifiedRaw, _ = httpmsg.RemoveHeader(modifiedRaw, "Cookie")
 	modifiedRaw, _ = httpmsg.RemoveHeader(modifiedRaw, "Authorization")
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil, nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 	if err != nil {
@@ -123,15 +139,24 @@ func (m *Module) ScanPerRequest(
 
 	respBody := resp.Body().String()
 
-	// Validate: must be JSON with pageProps, not a notFound response
+	// Validate: must be JSON carrying real protected-page data, not a notFound stub
+	// or a data-layer auth redirect (Next.js emits __N_REDIRECT when
+	// getServerSideProps returns a redirect — that means the data route enforces
+	// auth too, so nothing leaked).
 	respCT := resp.Response().Header.Get("Content-Type")
 	if !strings.Contains(respCT, "application/json") {
 		return nil, nil
 	}
-	if !strings.Contains(respBody, "pageProps") {
+	if !isLeakBody(respBody) {
 		return nil, nil
 	}
-	if strings.Contains(respBody, `"notFound":true`) || strings.Contains(respBody, `"notFound": true`) {
+
+	// Confirm the leak before reporting: it must REPRODUCE on a fresh unauth
+	// re-fetch (not a one-off 200 from a cache/edge flap), and the data route must
+	// not be a blind 200-everything catch-all (a CDN or error boundary that answers
+	// every path with the same pageProps body). Either gate failing means the route
+	// responds the same with or without a real path — not an auth leak.
+	if !m.confirmDataRouteLeak(ctx, httpClient, dataPath, buildID) {
 		return nil, nil
 	}
 
@@ -158,4 +183,84 @@ func (m *Module) ScanPerRequest(
 			},
 		},
 	}, nil
+}
+
+// isLeakBody reports whether a data-route body carries real protected-page data
+// worth flagging: it must contain pageProps and must NOT be a Next.js notFound
+// payload or a __N_REDIRECT (data-layer auth redirect) response.
+func isLeakBody(body string) bool {
+	if !strings.Contains(body, "pageProps") {
+		return false
+	}
+	if strings.Contains(body, `"notFound":true`) || strings.Contains(body, `"notFound": true`) {
+		return false
+	}
+	if strings.Contains(body, "__N_REDIRECT") {
+		return false
+	}
+	return true
+}
+
+// fetchUnauthDataRouteBody issues an unauthenticated GET (Cookie/Authorization
+// stripped, no redirects) for a data path and returns its body when the response
+// is a 200 application/json. NoClustering bypasses the response cache so each call
+// is a genuinely fresh observation. ok is false on any transport/parse error or a
+// non-200 / non-JSON response.
+func (m *Module) fetchUnauthDataRouteBody(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	dataPath string,
+) (string, bool) {
+	raw, err := httpmsg.SetPath(ctx.Request().Raw(), dataPath)
+	if err != nil {
+		return "", false
+	}
+	raw, _ = httpmsg.RemoveHeader(raw, "Cookie")
+	raw, _ = httpmsg.RemoveHeader(raw, "Authorization")
+
+	// raw is internally built (well-formed), so wrap directly instead of
+	// re-parsing on this hot path.
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
+
+	resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
+	if err != nil {
+		return "", false
+	}
+	defer resp.Close()
+	if resp.Response() == nil || resp.Response().StatusCode != 200 {
+		return "", false
+	}
+	if !strings.Contains(resp.Response().Header.Get("Content-Type"), "application/json") {
+		return "", false
+	}
+	return resp.Body().String(), true
+}
+
+// confirmDataRouteLeak validates a candidate leak with two fresh requests.
+//  1. Reproduce: the unauth data route must STILL return a 200 pageProps body — a
+//     transient/cached 200 that does not recur is dropped (fails closed).
+//  2. Catch-all guard: an improbable data path under the same buildId must NOT
+//     return a similar 200 pageProps body; a route that does answers every path the
+//     same way (CDN / error boundary), so the target's 200 is not an auth bypass.
+//     The catch-all probe fails OPEN — a transient error on it never suppresses a
+//     reproduced leak.
+func (m *Module) confirmDataRouteLeak(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	dataPath, buildID string,
+) bool {
+	body, ok := m.fetchUnauthDataRouteBody(ctx, httpClient, dataPath)
+	if !ok || !isLeakBody(body) {
+		return false
+	}
+
+	decoyPath := fmt.Sprintf("/_next/data/%s/%s.json", buildID, catchAllProbeSlug)
+	if decoy, ok := m.fetchUnauthDataRouteBody(ctx, httpClient, decoyPath); ok && isLeakBody(decoy) &&
+		modkit.RatioSimilar(
+			modkit.NewResponseSignature(200, body, ""),
+			modkit.NewResponseSignature(200, decoy, ""),
+		) {
+		return false
+	}
+	return true
 }

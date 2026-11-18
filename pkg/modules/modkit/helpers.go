@@ -1,13 +1,52 @@
 package modkit
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
 
-// Truncate shortens a string to maxLen, appending "..." if truncated.
+	"github.com/vigolium/vigolium/pkg/utils"
+	"github.com/vigolium/vigolium/pkg/utils/textutil"
+)
+
+// Truncate shortens a string to maxLen bytes, appending "..." if truncated.
+// The cut never splits a UTF-8 sequence. It is the shared evidence/description
+// cap for modules: do not add a private truncate helper to a module package
+// (pkg/modules/helper_dup_contract_test.go enforces this).
 func Truncate(s string, maxLen int) string {
+	return TruncateWith(s, maxLen, "...")
+}
+
+// TruncateWith is Truncate with a caller-chosen suffix (e.g. "…"). The suffix is
+// appended after the maxLen-byte prefix, so the result may be up to
+// maxLen+len(suffix) bytes; s is returned unchanged when it already fits.
+func TruncateWith(s string, maxLen int, suffix string) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return textutil.TruncateUTF8(s, maxLen) + suffix
+}
+
+// TruncateNoEllipsis caps s at maxLen bytes without any marker — for stored
+// response excerpts where an appended "..." would read as part of the body.
+func TruncateNoEllipsis(s string, maxLen int) string {
+	return TruncateWith(s, maxLen, "")
+}
+
+// TruncateRunes caps s at maxRunes characters (not bytes), appending suffix
+// when it had to cut. Use it for display budgets measured in characters.
+func TruncateRunes(s string, maxRunes int, suffix string) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	return textutil.TruncateRunes(s, maxRunes) + suffix
+}
+
+// RandomAlnum returns an n-character mixed-case alphanumeric token from the
+// lock-free math/rand/v2 source. Use it for markers, canaries and probe
+// values; it is not suitable for secrets.
+func RandomAlnum(n int) string {
+	return utils.RandomAlnum(n)
 }
 
 // IsJSOrTSContentType returns true if the content type indicates JavaScript or TypeScript.
@@ -16,6 +55,134 @@ func IsJSOrTSContentType(contentType string) bool {
 	return strings.Contains(ct, "javascript") ||
 		strings.Contains(ct, "typescript") ||
 		strings.Contains(ct, "ecmascript")
+}
+
+// IsNonHTMLReflectionContext reports whether a response Content-Type declares a
+// concrete non-HTML type, in which case an injected HTML/template marker is only
+// a data value (a JSON string, an XML text node), never rendered markup — so a
+// reflected-marker match is NOT evidence of HTML/CSTI/XSS injection. HTML-family
+// types (text/html, application/xhtml+xml) and an empty/unknown Content-Type
+// return false so genuine HTML reflections and header-less responses still
+// qualify. This is the canonical FastAPI/Pydantic 422 application/json
+// validation-error echo false positive: the bad parameter (markup intact) is
+// echoed back inside the JSON `input` field but never rendered as HTML.
+//
+// Use this to gate markup-REFLECTION oracles (a raw Contains(body, payload)).
+// Do NOT use it for evaluated-result oracles (SSTI/OGNL computed products, SQL
+// error strings, command-output needles) — those legitimately appear in JSON.
+func IsNonHTMLReflectionContext(contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if ct == "" {
+		return false
+	}
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	return !strings.Contains(ct, "html")
+}
+
+// staticAssetContentTypes are response Content-Type fragments served by static
+// assets and binary payloads — scripts, styles, fonts, images, media, archives.
+// App-level signals (error strings, secrets, tech fingerprints, JSON-RPC method
+// names, ...) found by substring/regex matching inside such bodies are almost
+// always incidental: a token baked into a minified bundle, not a live signal.
+// Body-matching detectors should skip these. This complements the URL-based
+// utils.IsMediaAndJSURL, which only inspects the path extension and therefore
+// misses assets served at extensionless or query-only routes — e.g. an SSO
+// gateway returning text/javascript for /assets/index-*, the canonical source
+// of false positives this gate exists to stop.
+var staticAssetContentTypes = []string{
+	"javascript",
+	"typescript",
+	"ecmascript",
+	"text/css",
+	"font/",
+	"application/font",
+	"image/",
+	"audio/",
+	"video/",
+	"application/wasm",
+	"application/octet-stream",
+	"application/pdf",
+	"application/zip",
+	"application/gzip",
+	"application/x-gzip",
+}
+
+// IsStaticAssetContentType reports whether the Content-Type header value belongs
+// to a static asset / binary payload (script, style, font, image, media,
+// archive) — content where a substring/regex match of an application-level
+// signal is not trustworthy evidence. An empty/unknown content type returns
+// false, so callers that depend on body inspection still run when the server
+// omits the header. Parameters (e.g. "; charset=utf-8") are ignored.
+func IsStaticAssetContentType(contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if ct == "" {
+		return false
+	}
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	for _, frag := range staticAssetContentTypes {
+		if strings.Contains(ct, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// staticAssetExtensions are file-extension suffixes that mark a static asset or
+// binary payload by URL path.
+var staticAssetExtensions = []string{
+	".js", ".mjs", ".cjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+	".woff", ".woff2", ".ttf", ".eot", ".otf", ".map",
+	".mp4", ".webm", ".mp3", ".ogg", ".wav",
+	".pdf", ".zip", ".gz", ".br",
+}
+
+// staticAssetDirSegments are path segments that mark a static-asset route even
+// when the URL carries no file extension (e.g. /css/images, /assets/app). A
+// suffix-only extension test misses these, so any path containing one of these
+// segments is treated as a static asset.
+var staticAssetDirSegments = map[string]bool{
+	"css": true, "js": true, "javascript": true, "scripts": true,
+	"styles": true, "stylesheets": true, "images": true, "image": true,
+	"img": true, "imgs": true, "assets": true, "asset": true,
+	"static": true, "fonts": true, "font": true, "media": true,
+	"dist": true, "build": true, "vendor": true, "public": true,
+	"_next": true, "_nuxt": true, "wp-content": true,
+}
+
+// IsStaticAssetPath reports whether a URL path is a static-asset route, by
+// file-extension suffix OR by containing a known static directory segment
+// (e.g. /css/images has no extension but both segments are static). The segment
+// check catches extensionless asset routes that a suffix-only test misses. This
+// is the URL-path companion to IsStaticAssetContentType (header-based).
+func IsStaticAssetPath(path string) bool {
+	if HasStaticAssetExtension(path) {
+		return true
+	}
+	for _, seg := range strings.Split(strings.ToLower(path), "/") {
+		if seg != "" && staticAssetDirSegments[seg] {
+			return true
+		}
+	}
+	return false
+}
+
+// HasStaticAssetExtension reports whether a URL path ends in a known static-asset
+// file extension (.js, .css, .map, fonts, images, archives, ...). Unlike
+// IsStaticAssetPath it does NOT match by directory segment, so it won't classify
+// an HTML document served from /assets/ or /public/ as static. Use it where
+// precision matters — e.g. deciding whether to truncate a stored response body.
+func HasStaticAssetExtension(path string) bool {
+	p := strings.ToLower(path)
+	for _, ext := range staticAssetExtensions {
+		if strings.HasSuffix(p, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // JSExtensions are file extensions for JavaScript/TypeScript source files.
@@ -32,4 +199,30 @@ func HasJSExtension(pathLower string) bool {
 		}
 	}
 	return false
+}
+
+// ElideRequestBody renders a raw request for evidence with all but the first
+// keep bytes of its bodyLen-byte body replaced by a marker.
+//
+// Modules whose probe body is measured in MiB (php2shell's multipart nesting,
+// node2shell's Brotli stream) must never store the body on a result: the
+// finding travels through the database, the JSON envelope and the report, and a
+// 22 MiB request dump would be carried through all three. The head is kept
+// because the framing — request line, headers, Content-Length — is the part a
+// reader needs to reproduce the probe; the rest is generated filler the module
+// rebuilds from a handful of constants.
+//
+// Like Truncate, this is the shared cap: do not add a private elideBody to a
+// module package (pkg/modules/helper_dup_contract_test.go enforces this).
+//
+// raw is returned unchanged when the body already fits in keep, or when bodyLen
+// does not describe a suffix of raw (a caller mismatch, not something to
+// silently truncate around).
+func ElideRequestBody(raw []byte, bodyLen, keep int) string {
+	if bodyLen <= keep || bodyLen > len(raw) {
+		return string(raw)
+	}
+	head := len(raw) - bodyLen
+	return string(raw[:head+keep]) +
+		fmt.Sprintf("\n[... %d more bytes of the probe body elided]", bodyLen-keep)
 }

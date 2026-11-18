@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"os"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/bulkhttp"
 )
 
 // Common validation errors.
@@ -41,7 +43,87 @@ func (c *Config) Validate() error {
 	if err := c.Engine.Validate(); err != nil {
 		return fmt.Errorf("engine config: %w", err)
 	}
+	if err := c.JSTangle.Validate(); err != nil {
+		return fmt.Errorf("jstangle config: %w", err)
+	}
+	if err := c.Sitemap.Validate(); err != nil {
+		return fmt.Errorf("sitemap config: %w", err)
+	}
 
+	return nil
+}
+
+// Validate rejects negative sitemap budgets; 0 means "use the default".
+func (c SitemapConfig) Validate() error {
+	if c.MaxURLs < 0 {
+		return fmt.Errorf("max_urls must be >= 0, got %d", c.MaxURLs)
+	}
+	if c.PerShape < 0 {
+		return fmt.Errorf("per_shape must be >= 0, got %d", c.PerShape)
+	}
+	return nil
+}
+
+// MinJSTangleMemoryBudgetMB is the floor for an enabled jstangle memory budget.
+// Below it the engine cannot construct. It is the single source of truth for the
+// rule: JSTangleConfig.Validate enforces it here, and the vigolium config layer
+// mirrors it (internal/config DiscoveryConfig.Validate) so an invalid budget is a
+// clear config error at scan start rather than a silent engine-construction failure.
+const MinJSTangleMemoryBudgetMB = 128
+
+// ValidJSTangleMemoryBudgetMB reports whether memory_budget_mb is usable: 0
+// selects the RAM-derived default (min(2048, max(768, RAM/8)) MiB), and an
+// explicit budget must reach MinJSTangleMemoryBudgetMB.
+func ValidJSTangleMemoryBudgetMB(budgetMB int) bool {
+	return budgetMB == 0 || budgetMB >= MinJSTangleMemoryBudgetMB
+}
+
+// ValidateJSTangleInputTiers checks the jstangle input size tiers, in MiB:
+// 1 <= normal <= max_ast <= max_unpack <= hard. Unpacking reads source and can
+// run above the AST ceiling, but never above the hard limit: an unpack ceiling
+// over it used to be clamped silently. A max_unpack of 0 follows the hard
+// limit. Shared with the vigolium config layer so a bad tier fails `config
+// validate` and scan start instead of disabling discovery.
+func ValidateJSTangleInputTiers(normalMB, maxASTMB, maxUnpackMB, hardMB int) error {
+	if normalMB < 1 || maxASTMB < normalMB || hardMB < maxASTMB {
+		return fmt.Errorf("input limits must satisfy 1 <= normal_input_mb (%d) <= max_ast_input_mb (%d) <= hard_input_mb (%d)",
+			normalMB, maxASTMB, hardMB)
+	}
+	if maxUnpackMB != 0 && (maxUnpackMB < maxASTMB || maxUnpackMB > hardMB) {
+		return fmt.Errorf("max_unpack_input_mb (%d) must be between max_ast_input_mb (%d) and hard_input_mb (%d); 0 follows hard_input_mb",
+			maxUnpackMB, maxASTMB, hardMB)
+	}
+	return nil
+}
+
+func (c *JSTangleConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	switch c.ReplayMode {
+	case "", "exact", "conservative", "off":
+	default:
+		return fmt.Errorf("replay_mode must be exact, conservative, or off")
+	}
+	switch c.ReplaySafety {
+	case "", "metadata-only", "read-only", "safe-baseline", "state-changing":
+	default:
+		return fmt.Errorf("replay_safety must be metadata-only, read-only, safe-baseline, or state-changing")
+	}
+	if c.WorkerCount < 0 || c.WorkerCount > 16 || !ValidJSTangleMemoryBudgetMB(c.MemoryBudgetMB) || c.CacheMB < 0 {
+		return fmt.Errorf("invalid worker_count/memory_budget_mb/cache_mb")
+	}
+	if c.JobTimeout < time.Second || c.JobTimeout > 5*time.Minute {
+		return fmt.Errorf("job_timeout must be 1s-5m")
+	}
+	if err := ValidateJSTangleInputTiers(c.NormalInputMB, c.MaxASTInputMB, c.MaxUnpackInputMB, c.HardInputMB); err != nil {
+		return err
+	}
+	if c.MaxRequestsPerFile < 1 || c.MaxASTNodes < 1_000 || c.MaxASTNodes > 5_000_000 ||
+		c.MaxAssetDepth < 1 || c.MaxAssetsPerParent < 1 || c.MaxAssetsPerHost < 1 || c.MaxAssetsTotal < 1 ||
+		c.MaxChunksPerRuntime < 0 {
+		return fmt.Errorf("request/asset limits must be positive and max_ast_nodes must be 1000-5000000")
+	}
 	return nil
 }
 
@@ -110,11 +192,22 @@ func (e *ExtensionConfig) Validate() error {
 	return nil
 }
 
+// MaxBruteForceThreads bounds EngineConfig.BruteForceThreads: past this the
+// engine's per-response work, not the transport, is the limit.
+const MaxBruteForceThreads = 1024
+
 // Validate validates engine configuration.
 func (e *EngineConfig) Validate() error {
 	// Discovery threads: 1-255 (uint8 max)
 	if e.DiscoveryThreads < 1 || e.DiscoveryThreads > 255 {
 		return fmt.Errorf("%w: discovery threads must be 1-255, got %d", ErrInvalidThreads, e.DiscoveryThreads)
+	}
+
+	if e.BruteForceThreads < 0 || e.BruteForceThreads > MaxBruteForceThreads {
+		return fmt.Errorf("%w: brute-force threads must be 0-%d, got %d", ErrInvalidThreads, MaxBruteForceThreads, e.BruteForceThreads)
+	}
+	if _, err := bulkhttp.ParseMode(e.Protocol); err != nil {
+		return fmt.Errorf("engine protocol: %w", err)
 	}
 
 	// Timeout: 1s-300s (reasonable range)

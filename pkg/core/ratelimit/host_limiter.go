@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sourcegraph/conc"
+	"github.com/vigolium/vigolium/pkg/types"
 	"go.uber.org/zap"
 )
 
@@ -46,9 +47,57 @@ func (h *hostHeap) Pop() any {
 const numShards = 32
 
 // hostEntry holds the semaphore and metadata for a single host.
+//
+// Two concurrency primitives, picked at creation by the limiter's mode:
+//   - Static mode uses sem, a fixed-capacity channel (acquire = send, release =
+//     receive). This is the original lock-free hot path and is unchanged.
+//   - Adaptive mode uses tokens, a resizable token pool (acquire = receive,
+//     release = send-back), whose effective limit AIMD-adjusts from request
+//     health. The pool channel is sized to the ramp ceiling; limit/inflight/debt
+//     and the AIMD bookkeeping fields below are used only in this mode.
 type hostEntry struct {
-	sem      chan struct{} // Semaphore for concurrency limiting
+	sem      chan struct{} // static mode: fixed-cap semaphore (acquire = send)
 	lastUsed atomic.Int64  // Unix nanos — updated atomically, no lock needed
+
+	// reserved is the priority lane's headroom (acquire = send), in both modes:
+	// reservedPriorityHeadroom extra slots only AcquirePriority may take. See
+	// AcquirePriority for why it exists.
+	reserved chan struct{}
+
+	// Adaptive-mode fields (zero/unused in static mode).
+	tokens   chan struct{} // resizable token pool (acquire = receive), cap = ceiling
+	limit    atomic.Int64  // current allowed concurrency (available + inflight)
+	inflight atomic.Int64  // checked-out tokens (for idle-eviction "active" check)
+	debt     atomic.Int64  // tokens to drop on release (pending shrink)
+	healthy  atomic.Int64  // consecutive healthy completions since last change
+	lastDecr atomic.Int64  // unix nanos of last decrease (back-off cooldown)
+	mu       sync.Mutex    // serializes setLimit; never held on the acquire hot path
+
+	// armed gates AIMD adjustment for this host. newEntry stores h.adaptive into it:
+	// plain Adaptive hosts start armed (adjust from the first request); WAF-auto-arm
+	// hosts start unarmed — pinned at MaxPerHost, behaving exactly like the static
+	// limiter — until a confirmed WAF block on this host flips it true (in Feedback),
+	// at which point AIMD back-off/recovery engages.
+	armed atomic.Bool
+
+	// preArmed records that PreArm has proactively paced this entry, exactly once per
+	// entry lifetime. It is distinct from armed so that (a) a birth-armed adaptive
+	// host (armed from the first request) still receives the one-time proactive drop,
+	// and (b) a fresh entry created after idle eviction re-arms rather than staying
+	// pinned at full rate.
+	preArmed atomic.Bool
+
+	// resets counts consecutive connection resets since the host's last
+	// answer; resetStormThreshold of them arm AIMD like a WAF block.
+	resets atomic.Int32
+
+	// pauseUntil (unix nanos) holds every new acquire for this host until the
+	// server's throttle window has passed: a 429, or a 503 with
+	// Retry-After. throttles counts consecutive throttles for the 1s·2^n
+	// back-off when the server named no Retry-After; a healthy response
+	// resets it.
+	pauseUntil atomic.Int64
+	throttles  atomic.Int64
 }
 
 func (e *hostEntry) touch() {
@@ -57,6 +106,19 @@ func (e *hostEntry) touch() {
 
 func (e *hostEntry) idleSince(d time.Duration) bool {
 	return time.Since(time.Unix(0, e.lastUsed.Load())) > d
+}
+
+// hasInflight reports whether the entry has in-flight (acquired-not-released)
+// requests, so the eviction loop won't reclaim a host mid-request. Static mode
+// reads the semaphore length; adaptive mode reads the inflight counter.
+func (e *hostEntry) hasInflight() bool {
+	if len(e.reserved) > 0 {
+		return true
+	}
+	if e.tokens != nil {
+		return e.inflight.Load() > 0
+	}
+	return len(e.sem) > 0
 }
 
 // hostShard is one bucket of the sharded host map.
@@ -77,23 +139,182 @@ type HostRateLimiter struct {
 	evictAfter     time.Duration // Evict hosts idle for this duration
 	acquireTimeout time.Duration // Max time to wait for a slot
 
+	// Adaptive mode (off by default). When enabled, each host starts at
+	// maxPerHost and AIMD-adjusts within [minPerHost, ceilingPerHost] from
+	// per-request health fed back via Feedback: a distress signal (429/503/502/504,
+	// connection error, timeout) halves the limit (bounded by a cooldown); a run of
+	// healthy completions additively grows it back toward the ceiling.
+	adaptive       bool
+	minPerHost     int
+	ceilingPerHost int
+
+	// preArmDisabled turns off the proactive edge-fingerprint pacing (PreArm) while
+	// leaving reactive WAF-block back-off (Feedback) untouched. Set from
+	// HostRateLimiterConfig.DisablePreArm (the --no-waf-pacing flag).
+	preArmDisabled bool
+
+	// throttlePauseDisabled turns off the 429/503 host pause while
+	// keeping the concurrency back-off. From
+	// HostRateLimiterConfig.DisableThrottlePause.
+	throttlePauseDisabled bool
+
+	// wafAutoArm enables targeted adaptive throttling that stays dormant until a
+	// confirmed WAF/CDN block. With it on (and adaptive off), every host uses the
+	// adaptive token pool pinned at MaxPerHost — identical concurrency to the static
+	// limiter — until a WAF block on that host arms it (via Feedback's wafBlocked
+	// flag), after which the host AIMD-backs-off like adaptive mode and recovers to
+	// MaxPerHost. A non-WAF scan therefore sees no change in behavior. Mutually
+	// exclusive with adaptive: NewHostRateLimiter normalizes it to
+	// cfg.WafAutoArm && !cfg.Adaptive, so plain Adaptive mode always wins.
+	wafAutoArm bool
+
+	// anyArmed is a global fast-path flag: false until the first host anywhere is
+	// armed by a WAF block. While false, Feedback skips the per-host shard lookup for
+	// every non-block response, keeping the common non-WAF hot path ~free even though
+	// wafAutoArm puts all hosts on the adaptive token pool. Monotonic (never reset):
+	// once any WAF block is seen the target is treated as WAF'd for the run.
+	anyArmed atomic.Bool
+
+	// anyPaused is a fast-path flag: false until some host was throttled, so
+	// the acquire hot path skips the pause lookup on a scan that never saw a
+	// 429.
+	anyPaused atomic.Bool
+	// anyReset is a fast-path flag: false until some host reset a connection,
+	// so a healthy answer skips the reset-counter lookup until then.
+	anyReset atomic.Bool
+
+	// preArmSink, when set, is invoked once per host the first time PreArm throttles
+	// it for a CDN/WAF edge, so a front-end can tell the operator that host's
+	// active-scan concurrency was reduced (the scan will pace it). It lives on the
+	// limiter — not a requester — because the limiter is the single shared object
+	// every requester feeds, so the notice fires exactly once per host no matter which
+	// requester tripped the pre-arm. Read on the request goroutine that arms the host;
+	// stored in an atomic pointer so a setup-time write can't race those reads.
+	preArmSink atomic.Pointer[func(PreArmNotice)]
+
+	// evictSinks are invoked with the hostname each time an idle host entry is
+	// evicted, letting each requester keep its once-per-host edge-pacing dedup in sync
+	// with the limiter's entry lifetime: after an evicted host's entry is recreated
+	// (fresh, at full rate), the requester re-fingerprints and re-arms it instead of
+	// treating it as permanently paced. Every requester that shares this limiter
+	// registers its own dedup, so this is a list (not a single field, which would
+	// keep only the last registrant). Subscriptions live for the limiter's lifetime.
+	// Guarded by evictMu. Each sink must be cheap and must NOT re-enter the limiter
+	// (it runs while a shard lock is held).
+	evictMu    sync.Mutex
+	evictSinks []func(string)
+
 	stopEvict chan struct{}
 	evictWg   conc.WaitGroup
+	// closed guards stopEvict against a double close. A shared limiter can have
+	// several closers (a phase borrowing it closes it on its own defer, as does
+	// the owner), and close() on an already-closed channel panics the process.
+	closed atomic.Bool
+}
+
+// PreArmNotice describes a proactive pacing adjustment. The first time a host is
+// fingerprinted behind a CDN/WAF edge, PreArm drops its per-host concurrency from
+// From to Start (ramping back toward Ceiling on healthy traffic). It is passed to the
+// sink registered via SetPreArmNotifier, once per host.
+type PreArmNotice struct {
+	Host    string // host being paced
+	Vendor  string // fingerprinted edge vendor (e.g. "cloudfront"); "" if unknown
+	From    int    // per-host concurrency before the pre-arm (the ceiling/MaxPerHost)
+	Start   int    // reduced per-host concurrency the host is dropped to
+	Ceiling int    // limit the host ramps back toward on healthy traffic
+}
+
+// SetPreArmNotifier installs a sink invoked once per host the first time PreArm
+// throttles it for a CDN/WAF edge. It lets a front-end warn the operator that the
+// scan will pace (run slower against) that host. The sink runs on the request
+// goroutine, so it must be cheap and non-blocking. Call once during setup, before
+// scanning concurrency starts; a nil sink is a no-op.
+func (h *HostRateLimiter) SetPreArmNotifier(sink func(PreArmNotice)) {
+	if sink == nil {
+		h.preArmSink.Store(nil)
+		return
+	}
+	h.preArmSink.Store(&sink)
+}
+
+// AddEvictNotifier registers a sink invoked with the hostname whenever an idle
+// host entry is evicted. Every requester that shares this limiter registers its
+// own edge-pacing dedup, so all of them are notified (the previous single-field
+// setter kept only the last). Subscriptions live for the limiter's lifetime. The
+// sink is invoked while a shard lock is held, so it must be cheap and must NOT call
+// back into the limiter. A nil sink is ignored.
+func (h *HostRateLimiter) AddEvictNotifier(sink func(string)) {
+	if sink == nil {
+		return
+	}
+	h.evictMu.Lock()
+	h.evictSinks = append(h.evictSinks, sink)
+	h.evictMu.Unlock()
+}
+
+// notifyEvict fires every registered evict sink for host. Sinks are snapshotted
+// under evictMu and then invoked without it (still under the caller's shard lock,
+// per the sink contract) so a sink can never deadlock by touching the registry.
+func (h *HostRateLimiter) notifyEvict(host string) {
+	h.evictMu.Lock()
+	if len(h.evictSinks) == 0 {
+		h.evictMu.Unlock()
+		return
+	}
+	sinks := make([]func(string), len(h.evictSinks))
+	copy(sinks, h.evictSinks)
+	h.evictMu.Unlock()
+	for _, s := range sinks {
+		s(host)
+	}
 }
 
 // HostRateLimiterConfig configures the HostRateLimiter.
 type HostRateLimiterConfig struct {
-	MaxPerHost     int           // Max concurrent requests per host (default: 20)
+	MaxPerHost     int           // Max concurrent requests per host (default: types.DefaultMaxPerHost)
 	MaxEntries     int           // Max tracked hosts (default: 1000)
 	EvictAfter     time.Duration // Evict idle hosts after (default: 30s)
 	EvictInterval  time.Duration // How often to run eviction (default: 10s)
 	AcquireTimeout time.Duration // Max time to wait for a slot (default: 30s)
+
+	// Adaptive enables per-host AIMD concurrency control (default: false — the
+	// static MaxPerHost semaphore). Each host still starts at MaxPerHost, so a
+	// healthy scan behaves exactly like the static limiter; it only diverges by
+	// backing off a host that returns distress signals and recovering afterwards.
+	Adaptive bool
+	// MinPerHost is the back-off floor in adaptive mode (default: max(1,
+	// MaxPerHost/10)). Ignored when Adaptive is false.
+	MinPerHost int
+	// CeilingPerHost is the ramp ceiling in adaptive mode. Unset (<= 0) it
+	// defaults by mode: Adaptive gets MaxPerHost * defaultAdaptiveCeilingFactor so
+	// a healthy host can actually ramp, WAF-auto-arm gets exactly MaxPerHost so a
+	// throttled host recovers to the configured concurrency and never past it.
+	// Always clamped to at least MaxPerHost. Ignored in static mode.
+	CeilingPerHost int
+
+	// WafAutoArm enables WAF-triggered adaptive throttling: hosts run at the static
+	// MaxPerHost until a confirmed WAF/CDN block arms per-host AIMD back-off. Safe to
+	// leave on for every scan — a host that never trips a WAF behaves exactly like the
+	// static limiter. Bounds reuse MinPerHost/CeilingPerHost. Redundant under Adaptive.
+	WafAutoArm bool
+
+	// DisablePreArm turns off only the PROACTIVE pacing (PreArm on a CDN/WAF-edge
+	// fingerprint) while leaving the reactive WAF-block back-off intact. Wired from the
+	// `--no-waf-pacing` CLI flag for operators who would rather keep full opening
+	// concurrency and let the reactive path throttle after the first block.
+	DisablePreArm bool
+
+	// DisableThrottlePause turns off the time-based pause a 429 (or 503 with
+	// Retry-After) puts on a host; the concurrency back-off still
+	// applies. For harnesses that send many requests at a deliberately
+	// throttling fixture and only care about what modules conclude from it.
+	DisableThrottlePause bool
 }
 
 // DefaultHostRateLimiterConfig returns sensible defaults.
 func DefaultHostRateLimiterConfig() HostRateLimiterConfig {
 	return HostRateLimiterConfig{
-		MaxPerHost:     20,
+		MaxPerHost:     types.DefaultMaxPerHost,
 		MaxEntries:     1000,
 		EvictAfter:     30 * time.Second,
 		EvictInterval:  10 * time.Second,
@@ -101,10 +322,46 @@ func DefaultHostRateLimiterConfig() HostRateLimiterConfig {
 	}
 }
 
+// defaultAdaptiveCeilingFactor is how far above MaxPerHost a healthy host may
+// ramp in Adaptive mode when no explicit ceiling is configured.
+//
+// A ceiling equal to MaxPerHost (the previous default) made Adaptive a one-way
+// ratchet: the AIMD controller could only ever back a host OFF, and nothing in
+// the system could discover that a host tolerates more than the configured
+// concurrency. On a high-RTT target that is the binding constraint on the whole
+// scan — the dynamic-assessment phase is ~99.7% idle wait, so throughput is
+// (in-flight / RTT) and a static in-flight cap sets the phase's wall clock
+// outright.
+//
+// 2x is deliberately modest: it is enough to close the ~1.6x deadline shortfall
+// measured on a real 1.8s-RTT target, while keeping the opening burst at the
+// operator's configured MaxPerHost — a host only reaches the ceiling by serving
+// a sustained run of clean responses, and any distress signal halves it back.
+const defaultAdaptiveCeilingFactor = 2
+
+// resolveCeilingPerHost returns the AIMD ramp ceiling for a limiter config.
+//
+// The default is mode-dependent on purpose. Adaptive is an explicit opt-in to
+// concurrency discovery, so it gets headroom to ramp into. WAF-auto-arm is a
+// throttle: it exists to back a host off once an edge starts blocking, and a
+// host recovering from that should return to the configured concurrency and
+// stop there — never use a WAF block as licence to exceed MaxPerHost.
+//
+// An explicit CeilingPerHost always wins, and the result is floored at
+// MaxPerHost so a ceiling below the start can't strand the pool below its
+// initial fill (which also makes the unset/non-adaptive case fall out for free).
+func resolveCeilingPerHost(cfg HostRateLimiterConfig) int {
+	ceiling := cfg.CeilingPerHost
+	if ceiling <= 0 && cfg.Adaptive {
+		ceiling = cfg.MaxPerHost * defaultAdaptiveCeilingFactor
+	}
+	return max(ceiling, cfg.MaxPerHost)
+}
+
 // NewHostRateLimiter creates a new HostRateLimiter with the given configuration.
 func NewHostRateLimiter(cfg HostRateLimiterConfig) *HostRateLimiter {
 	if cfg.MaxPerHost <= 0 {
-		cfg.MaxPerHost = 20
+		cfg.MaxPerHost = types.DefaultMaxPerHost
 	}
 	if cfg.MaxEntries <= 0 {
 		cfg.MaxEntries = 1000
@@ -120,12 +377,28 @@ func NewHostRateLimiter(cfg HostRateLimiterConfig) *HostRateLimiter {
 		cfg.AcquireTimeout = 30 * time.Second
 	}
 
+	// Adaptive bounds: floor defaults to a tenth of the start (min 1).
+	minPerHost := cfg.MinPerHost
+	if minPerHost <= 0 {
+		minPerHost = max(cfg.MaxPerHost/10, 1)
+	}
+	minPerHost = min(minPerHost, cfg.MaxPerHost)
+	ceilingPerHost := resolveCeilingPerHost(cfg)
+
 	h := &HostRateLimiter{
 		maxPerHost:     cfg.MaxPerHost,
 		maxEntries:     cfg.MaxEntries,
 		evictAfter:     cfg.EvictAfter,
 		acquireTimeout: cfg.AcquireTimeout,
-		stopEvict:      make(chan struct{}),
+		adaptive:       cfg.Adaptive,
+		minPerHost:     minPerHost,
+		ceilingPerHost: ceilingPerHost,
+		// Mutually exclusive with Adaptive — plain Adaptive already arms every host,
+		// so WAF-auto-arm is only meaningful when Adaptive is off.
+		wafAutoArm:            cfg.WafAutoArm && !cfg.Adaptive,
+		preArmDisabled:        cfg.DisablePreArm,
+		throttlePauseDisabled: cfg.DisableThrottlePause,
+		stopEvict:             make(chan struct{}),
 	}
 
 	for i := range h.shards {
@@ -160,23 +433,43 @@ func (h *HostRateLimiter) shardFor(host string) *hostShard {
 // Acquire blocks until a slot is available for the given host.
 // Returns context.Canceled/DeadlineExceeded if context is cancelled.
 func (h *HostRateLimiter) Acquire(ctx context.Context, host string) error {
-	shard := h.shardFor(host)
-	entry := h.getOrCreateEntry(shard, host)
+	entry, err := h.entryAfterPause(ctx, host)
+	if err != nil {
+		return err
+	}
+	return acquireEntry(ctx, entry)
+}
+
+// acquireEntry blocks until one of entry's slots is free or ctx ends.
+func acquireEntry(ctx context.Context, entry *hostEntry) error {
+	// Adaptive mode: acquire a token from the resizable pool (receive). Same
+	// lock-free hot path as the static send below, just the opposite channel
+	// direction; the pool's current size is the effective per-host limit.
+	if entry.tokens != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-entry.tokens:
+			entry.inflight.Add(1)
+			entry.touch()
+			return nil
+		}
+	}
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case entry.sem <- struct{}{}:
+		// Record use for idle-eviction ordering via the atomic timestamp only —
+		// no shard lock on the hot path. The eviction loop reconciles the heap
+		// lazily: it reloads this atomic and re-fixes stale entries itself
+		// (see evictIdle). Because touch() only ever moves lastUsed forward,
+		// each heap entry's stored value is a lower bound on the real value, so
+		// an up-to-date heap top is provably the globally-oldest host — eviction
+		// stays correct without per-acquire heap maintenance. This keeps Acquire
+		// lock-free in steady state, which matters most when a scan hammers a
+		// single host and every request hashes to the same shard.
 		entry.touch()
-
-		// Update heap entry under write lock to maintain eviction order
-		shard.mu.Lock()
-		if he, ok := shard.heapIndex[host]; ok {
-			he.lastUsed = entry.lastUsed.Load()
-			heap.Fix(&shard.evictionHeap, he.index)
-		}
-		shard.mu.Unlock()
-
 		return nil
 	}
 }
@@ -184,22 +477,166 @@ func (h *HostRateLimiter) Acquire(ctx context.Context, host string) error {
 // AcquireWithTimeout blocks until a slot is available or the configured timeout expires.
 // Returns context.DeadlineExceeded if the timeout is reached before a slot is available.
 func (h *HostRateLimiter) AcquireWithTimeout(host string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), h.acquireTimeout)
+	return h.AcquireWithTimeoutContext(context.Background(), host)
+}
+
+// AcquireWithTimeoutContext blocks until a slot is available, the configured
+// acquire timeout expires, or the caller's context is cancelled — whichever
+// comes first. Returns context.DeadlineExceeded on timeout, or the context's
+// error (e.g. context.Canceled) on cancellation. Deriving the acquire deadline
+// from ctx (rather than context.Background()) lets a scan shutdown or phase
+// deadline unblock a waiting acquire promptly, instead of stranding the
+// goroutine until acquireTimeout elapses.
+func (h *HostRateLimiter) AcquireWithTimeoutContext(ctx context.Context, host string) error {
+	// Fast path: an unsaturated host is by far the common case, and this is the
+	// single hottest path in the scanner (every outgoing request). Try a
+	// non-blocking acquire first so we avoid heap-allocating a timeout context
+	// and arming a runtime timer when a slot is immediately available.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// A throttled host's pause is waited out BEFORE the acquire timeout
+	// starts: the pause is the server's instruction, not our saturation.
+	entry, err := h.entryAfterPause(ctx, host)
+	if err != nil {
+		return err
+	}
+	if tryAcquireEntry(entry) {
+		return nil
+	}
+
+	// Slow path: the host is saturated — block up to acquireTimeout (derived
+	// from ctx so a scan shutdown can unblock the wait promptly).
+	acquireCtx, cancel := context.WithTimeout(ctx, h.acquireTimeout)
 	defer cancel()
-	return h.Acquire(ctx, host)
+	return acquireEntry(acquireCtx, entry)
+}
+
+// tryAcquireEntry takes one of entry's slots only if one is free right now,
+// and never blocks — callers use it to skip the timeout-context/timer setup on
+// the uncontended hot path. The blocking retry (with the same touch/inflight
+// bookkeeping) is acquireEntry.
+func tryAcquireEntry(entry *hostEntry) bool {
+	if entry.tokens != nil {
+		select {
+		case <-entry.tokens:
+			entry.inflight.Add(1)
+			entry.touch()
+			return true
+		default:
+			return false
+		}
+	}
+
+	select {
+	case entry.sem <- struct{}{}:
+		entry.touch()
+		return true
+	default:
+		return false
+	}
+}
+
+// reservedPriorityHeadroom is how many slots per host are held back for the
+// priority lane, on top of the host's normal limit.
+const reservedPriorityHeadroom = 1
+
+// AcquirePriority takes a slot for host on the priority lane: a normal slot when
+// one is free, otherwise one of the host's reservedPriorityHeadroom reserved
+// slots, otherwise whichever of the two frees first. It returns the matching
+// release, which must be called exactly once.
+//
+// The lane exists for requests the rest of the scan waits on — a login, a
+// re-login, a reachability preflight. Queued behind MaxPerHost module requests
+// that are themselves waiting for that login, such a request would deadlock the
+// host; the reserved slot means it never queues behind ordinary traffic. It
+// lets a host briefly run at limit+1, which is the whole point.
+//
+// Bounded by the limiter's acquire timeout and ctx, like AcquireWithTimeoutContext.
+func (h *HostRateLimiter) AcquirePriority(ctx context.Context, host string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	entry, err := h.entryAfterPause(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	normal := func() { h.Release(host) }
+	reserved := func() {
+		select {
+		case <-entry.reserved:
+		default:
+			zap.L().Warn("HostRateLimiter: priority release with no reserved slot held", zap.String("host", host))
+		}
+	}
+
+	if tryAcquireEntry(entry) {
+		return normal, nil
+	}
+	select {
+	case entry.reserved <- struct{}{}:
+		entry.touch()
+		return reserved, nil
+	default:
+	}
+
+	acquireCtx, cancel := context.WithTimeout(ctx, h.acquireTimeout)
+	defer cancel()
+	if entry.tokens != nil {
+		select {
+		case <-acquireCtx.Done():
+			return nil, acquireCtx.Err()
+		case <-entry.tokens:
+			entry.inflight.Add(1)
+			entry.touch()
+			return normal, nil
+		case entry.reserved <- struct{}{}:
+			entry.touch()
+			return reserved, nil
+		}
+	}
+	select {
+	case <-acquireCtx.Done():
+		return nil, acquireCtx.Err()
+	case entry.sem <- struct{}{}:
+		entry.touch()
+		return normal, nil
+	case entry.reserved <- struct{}{}:
+		entry.touch()
+		return reserved, nil
+	}
 }
 
 // Release releases a slot for the given host.
 // Must be called after Acquire to free the slot.
 func (h *HostRateLimiter) Release(host string) {
-	shard := h.shardFor(host)
-
-	shard.mu.RLock()
-	entry, exists := shard.hosts[host]
-	shard.mu.RUnlock()
-
-	if !exists {
+	entry := h.existing(host)
+	if entry == nil {
 		// Host was evicted while holding slot - this is fine
+		return
+	}
+
+	// Adaptive mode: return the token unless the pool is shrinking, in which case
+	// this token is retired against the outstanding debt (the limit decreased
+	// while it was checked out, so it must not come back into circulation).
+	if entry.tokens != nil {
+		entry.inflight.Add(-1)
+		for {
+			d := entry.debt.Load()
+			if d <= 0 {
+				break
+			}
+			if entry.debt.CompareAndSwap(d, d-1) {
+				return // token retired, not returned
+			}
+		}
+		select {
+		case entry.tokens <- struct{}{}:
+		default:
+			// Pool already at capacity — should not happen given the invariant
+			// available+inflight == limit <= cap, but never block a release.
+			zap.L().Warn("HostRateLimiter: adaptive token pool full on release", zap.String("host", host))
+		}
 		return
 	}
 
@@ -237,7 +674,7 @@ func (h *HostRateLimiter) getOrCreateEntry(shard *hostShard, host string) *hostE
 	// transient, immediately usable entry instead of panicking on a write to a
 	// nil map. The entry isn't tracked — there's nothing left to track into.
 	if shard.hosts == nil {
-		return &hostEntry{sem: make(chan struct{}, h.maxPerHost)}
+		return h.newEntry()
 	}
 
 	// Check if we need to evict (approximate: per-shard cap)
@@ -246,9 +683,7 @@ func (h *HostRateLimiter) getOrCreateEntry(shard *hostShard, host string) *hostE
 	}
 
 	now := time.Now().UnixNano()
-	entry = &hostEntry{
-		sem: make(chan struct{}, h.maxPerHost),
-	}
+	entry = h.newEntry()
 	entry.lastUsed.Store(now)
 	shard.hosts[host] = entry
 
@@ -260,17 +695,42 @@ func (h *HostRateLimiter) getOrCreateEntry(shard *hostShard, host string) *hostE
 	return entry
 }
 
-// evictOldestFromShard evicts the oldest entry from a single shard.
-// Must be called with shard.mu held for writing.
+// evictOldestFromShard evicts the oldest entry that has no in-flight requests
+// from a single shard. Must be called with shard.mu held for writing.
+//
+// It deliberately skips entries with acquired-but-not-released slots: evicting a
+// busy host would orphan its semaphore accounting — a later Release finds no
+// entry and silently no-ops, while a concurrent getOrCreateEntry makes a fresh
+// entry that has lost the in-flight count (mirrors the hasInflight() guard in
+// evictIdle). If every entry in the shard is busy, it evicts nothing and lets
+// the shard briefly exceed its soft cap rather than corrupt accounting.
 func (h *HostRateLimiter) evictOldestFromShard(shard *hostShard) {
 	if shard.evictionHeap.Len() == 0 {
 		return
 	}
 
-	he := heap.Pop(&shard.evictionHeap).(*heapEntry)
-	delete(shard.heapIndex, he.host)
-	delete(shard.hosts, he.host)
-	zap.L().Debug("HostRateLimiter: Evicted oldest entry", zap.String("host", he.host))
+	// Scan for the least-recently-used idle entry. The shard is small (~maxEntries
+	// /numShards), so the linear scan is cheap and only runs on the forced-cap
+	// path.
+	var victim *heapEntry
+	for _, he := range shard.evictionHeap {
+		entry, exists := shard.hosts[he.host]
+		if !exists || entry.hasInflight() {
+			continue
+		}
+		if victim == nil || he.lastUsed < victim.lastUsed {
+			victim = he
+		}
+	}
+	if victim == nil {
+		return // every entry is busy — don't evict an in-flight host
+	}
+
+	heap.Remove(&shard.evictionHeap, victim.index)
+	delete(shard.heapIndex, victim.host)
+	delete(shard.hosts, victim.host)
+	h.notifyEvict(victim.host)
+	zap.L().Debug("HostRateLimiter: Evicted oldest idle entry", zap.String("host", victim.host))
 }
 
 // evictionLoop periodically evicts idle hosts.
@@ -319,13 +779,14 @@ func (h *HostRateLimiter) evictIdle() {
 				continue
 			}
 
-			if !entry.idleSince(h.evictAfter) || len(entry.sem) > 0 {
+			if !entry.idleSince(h.evictAfter) || entry.hasInflight() {
 				break // Oldest isn't idle yet, nothing else will be
 			}
 
 			heap.Pop(&shard.evictionHeap)
 			delete(shard.heapIndex, he.host)
 			delete(shard.hosts, he.host)
+			h.notifyEvict(he.host)
 			totalEvicted++
 		}
 		totalRemaining += len(shard.hosts)
@@ -340,7 +801,15 @@ func (h *HostRateLimiter) evictIdle() {
 }
 
 // Close stops the eviction goroutine and releases resources.
+//
+// Idempotent and safe to call concurrently: the bare close(h.stopEvict) it used
+// to do panics the process with "close of closed channel" on a second call, and
+// a limiter can legitimately have more than one closer — a phase that BORROWS a
+// shared limiter closes it on its own defer, as does the owner.
 func (h *HostRateLimiter) Close() error {
+	if !h.closed.CompareAndSwap(false, true) {
+		return nil
+	}
 	close(h.stopEvict)
 	// conc re-panics on Wait() if the eviction goroutine panicked.
 	// Absorb it gracefully so Close() doesn't crash the process.

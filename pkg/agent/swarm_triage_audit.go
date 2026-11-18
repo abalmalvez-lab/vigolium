@@ -25,10 +25,16 @@ func (s *SwarmRunner) runTriageLoop(ctx context.Context, cfg SwarmConfig, agenti
 			zap.Int64("finding_floor", triageFindingFloor))
 	}
 
+	// Build the planner-filtered skill set the triage agent loads: the plan's
+	// recommended_skills ∪ the always-on set ∪ operator overrides (--skill /
+	// --skill-tag), or the full set under --no-skill-filter.
+	triageSkills := s.selectTriageSkills(cfg, result)
+
 	triageCfg := TriageLoopConfig{
 		Engine:                    s.engine,
 		Repository:                s.repo,
 		AgentName:                 cfg.AgentName,
+		Skills:                    triageSkills,
 		PromptTemplate:            SwarmPromptTriage,
 		TargetURL:                 agenticScan.TargetURL,
 		Hostname:                  hostnameFromURL(agenticScan.TargetURL),
@@ -43,6 +49,7 @@ func (s *SwarmRunner) runTriageLoop(ctx context.Context, cfg SwarmConfig, agenti
 		Verbose:                   cfg.Verbose,
 		MaxRounds:                 cfg.MaxIterations,
 		MaxFindingsPerTriageBatch: 25,
+		BatchConcurrency:          cfg.BatchConcurrency,
 		ResumeFromRound:           triageResumeRound,
 		ProgressCallback:          cfg.ProgressCallback,
 		ScanFunc:                  cfg.ScanFunc,
@@ -110,7 +117,8 @@ func (s *SwarmRunner) runCodeAudit(ctx context.Context, cfg SwarmConfig, targetU
 
 	// Query existing routes from DB to give the agent endpoint context
 	if hostname != "" {
-		dbRecords, recErr := s.repo.GetRecordsByHostname(ctx, cfg.ProjectUUID, hostname, 100)
+		// Only rec.Method/rec.URL are rendered below — skip the body BLOBs.
+		dbRecords, recErr := s.repo.GetRecordMetadataByHostname(ctx, cfg.ProjectUUID, hostname, 100)
 		if recErr == nil && len(dbRecords) > 0 {
 			var rs strings.Builder
 			for i, rec := range dbRecords {

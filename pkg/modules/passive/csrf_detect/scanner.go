@@ -14,14 +14,16 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
-// csrfParamPattern matches common CSRF token parameter names.
-var csrfParamPattern = regexp.MustCompile(`(?i)(csrf|xsrf|token|authenticity.token|__RequestVerificationToken|antiforgery|_token|nonce|csrfmiddlewaretoken)`)
+// csrfParamPattern matches common CSRF token parameter names. The bare token
+// alternative is anchored with word boundaries (\btoken\b) so it matches a field
+// literally named "token" but NOT camelCase application fields whose name merely
+// ends in "Token" (accessToken, siteToken, tokenCount, …) — those must not
+// suppress a genuine missing-token finding. Literal separators in dotted names
+// are escaped (authenticity[._-]?token) rather than left as wildcard dots.
+var csrfParamPattern = regexp.MustCompile(`(?i)(csrf|xsrf|\btoken\b|authenticity[._-]?token|__RequestVerificationToken|antiforgery|_token|nonce|csrfmiddlewaretoken)`)
 
 // csrfHeaderPattern matches custom headers used for CSRF protection.
 var csrfHeaderPattern = regexp.MustCompile(`(?i)^(x-csrf-token|x-xsrf-token|x-requested-with|x-csrftoken|anti-csrf-token)$`)
-
-// sameSitePattern matches SameSite cookie attribute with Strict or Lax.
-var sameSitePattern = regexp.MustCompile(`(?i)samesite=(strict|lax)`)
 
 // stateChangingMethods are HTTP methods that modify server state.
 var stateChangingMethods = map[string]bool{
@@ -57,6 +59,26 @@ func New() *Module {
 	return m
 }
 
+// isCSRFReachableContentType reports whether a cross-site HTML form / simple
+// fetch could produce a request with this Content-Type without triggering a CORS
+// preflight. Only the three CORS "simple" content types (and an absent header,
+// which a form defaults to form-urlencoded) qualify; anything else — notably
+// application/json — cannot be forged cross-site by classic CSRF.
+func isCSRFReachableContentType(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if ct == "" {
+		return true
+	}
+	if i := strings.IndexByte(ct, ';'); i >= 0 { // drop "; charset=…" / "; boundary=…"
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch ct {
+	case "application/x-www-form-urlencoded", "multipart/form-data", "text/plain":
+		return true
+	}
+	return false
+}
+
 // ScanPerRequest analyzes state-changing requests for missing CSRF protections.
 func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext) ([]*output.ResultEvent, error) {
 	urlx, err := ctx.URL()
@@ -70,10 +92,33 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		return nil, nil
 	}
 
-	// Skip JSON APIs with Origin header (CORS-protected)
-	ct := strings.ToLower(ctx.Request().Header("Content-Type"))
-	origin := ctx.Request().Header("Origin")
-	if strings.Contains(ct, "application/json") && origin != "" {
+	// CSRF preconditions: the attack only works against requests a browser will
+	// replay cross-site using AMBIENT credentials. A "missing token" on a request
+	// that fails any of these is not a vulnerability, so skip it rather than
+	// flagging it (the reported false positives: JSON APIs, Bearer-token APIs, and
+	// requests with no session cookie).
+	//
+	//  1. A non-simple content type (e.g. application/json) cannot be produced by a
+	//     cross-site HTML form and forces a CORS preflight — not classic CSRF.
+	//  2. Header-based auth (Authorization: Bearer/Basic …) is never attached
+	//     automatically cross-site, so the endpoint is not CSRF-able.
+	//  3. No ambient SESSION cookie means there is no session for an attacker to
+	//     ride, so a missing anti-CSRF token is moot. A request carrying only a
+	//     preference cookie (e.g. theme=dark) does not count.
+	if !isCSRFReachableContentType(ctx.Request().Header("Content-Type")) {
+		return nil, nil
+	}
+	if ctx.Request().Header("Authorization") != "" {
+		return nil, nil
+	}
+	hasSessionCookie := false
+	for _, name := range modkit.RequestCookieNames(ctx.Request().Header("Cookie")) {
+		if modkit.LikelySessionCookie(name) {
+			hasSessionCookie = true
+			break
+		}
+	}
+	if !hasSessionCookie {
 		return nil, nil
 	}
 
@@ -105,14 +150,19 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		}
 	}
 
-	// Check 3: SameSite cookie in response
-	if ctx.HasResponse() {
-		for _, hdr := range ctx.Response().Headers() {
-			if strings.EqualFold(hdr.Name, "Set-Cookie") {
-				if sameSitePattern.MatchString(hdr.Value) {
-					return nil, nil // has SameSite protection
-				}
-			}
+	// Check 3: SameSite protection on the SESSION cookie the request actually
+	// carries. The protective SameSite attribute is set on the login response and
+	// is normally NOT echoed on this state-changing response, so consult the
+	// recorded policy for the request's own session cookie rather than this
+	// response's Set-Cookie headers (which may carry only an unrelated preference
+	// cookie, producing both false positives and false negatives).
+	scanCtx.ObserveResponseCookies(ctx)
+	for _, policy := range scanCtx.RequestCookiePolicies(ctx) {
+		if !modkit.LikelySessionCookie(policy.Name) {
+			continue
+		}
+		if policy.SameSite == "strict" || policy.SameSite == "lax" {
+			return nil, nil // session cookie is SameSite-protected
 		}
 	}
 
@@ -127,7 +177,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 			Info: output.Info{
 				Name:        "Missing CSRF Protection",
 				Description: fmt.Sprintf("State-changing %s request to %s lacks anti-CSRF token, custom header, and SameSite cookie protection", method, urlx.Path),
-				Severity:    severity.Medium,
+				Severity:    severity.Suspect,
 				Confidence:  severity.Tentative,
 				Tags:        []string{"csrf", "session", "web-security"},
 				Reference:   []string{"https://owasp.org/www-community/attacks/csrf"},

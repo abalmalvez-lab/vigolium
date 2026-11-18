@@ -2,7 +2,7 @@
 
 Piolium is Vigolium's **Pi-native multi-phase whitebox security audit harness**. It runs through `vigolium agent audit --driver=piolium` (the piolium audit driver — there is no standalone `agent piolium` subcommand), driving a user-installed Pi extension via `pi --mode json -p "/piolium-<mode>"`. Findings are automatically ingested into the Vigolium database alongside native scanner results.
 
-> **Looking for the unified driver?** `vigolium agent audit` runs piolium and [audit](vigolium-audit.md) back-to-back under one AgenticScan, with per-driver child rows and a post-pass findings dedup. Use `--driver=piolium` (or `--driver=audit`) to force a single driver. This page describes piolium standalone; see the audit subcommand's `--help` for the unified shape.
+> **Looking for the unified driver?** `vigolium agent audit` defaults to `--driver=auto`: it runs [audit](vigolium-audit.md) when the selected `claude`/`codex` CLI is available, otherwise it falls back to Piolium before launching the audit binary. A mid-run audit failure is reported and does not silently switch drivers. Use `--driver=both` for unconditional sequential execution under one parent AgenticScan, or `--driver=piolium` / `--driver=audit` to force one driver. This page focuses on the Piolium leg.
 
 Piolium shares its on-disk schema (`audit-state.json`, finding markdown, frontmatter conventions) with [`vigolium-audit`](vigolium-audit.md) — the parser, importer, and reporting tooling are shared between the two. The differences are runtime (Pi instead of Claude Code / Codex), folder name (`piolium/` instead of `audit/`), env-var prefix (`PIOLIUM_*` instead of `ARCHON_*`), and database tagging (`mode=piolium` instead of `audit`).
 
@@ -47,9 +47,9 @@ Reach for `vigolium agent audit --driver=piolium` (piolium) when:
 Reach for [vigolium-audit](vigolium-audit.md) instead when:
 
 - You have Claude Opus access and want the best-possible audit fidelity.
-- You want to lock the swarm/autopilot audit to Claude/Codex regardless of what's installed locally — pass `--audit=<mode>` to opt out of the auto-pick.
+- You want the swarm/autopilot in-pipeline audit to drive Claude/Codex — pass `--audit=<mode>`.
 
-Both harnesses can run as the in-pipeline audit during `vigolium agent autopilot` and `vigolium agent swarm`. When you don't pass `--audit` or `--piolium`, the CLI auto-picks: piolium runs if `pi`+the piolium extension are installed locally, otherwise it falls back to audit. The two are interoperable: findings from either land in the same `findings` table tagged with their source and can be reported together.
+Both harnesses can run as the in-pipeline audit during `vigolium agent autopilot` and `vigolium agent swarm`. Each runs only when `--audit` or `--piolium` is passed (or, for a natural-language prompt, when the prompt asks for an audit); nothing is auto-picked. The two are interoperable: findings from either land in the same `findings` table tagged with their source and can be reported together.
 
 ---
 
@@ -222,7 +222,7 @@ vigolium agent audit --driver=piolium \
 | `--no-stream` | Don't echo to console. Stream is still persisted to `runtime.log` so `vigolium log <uuid>` works. |
 | `--upload-results` | Upload session bundle to cloud storage after completion (requires storage config). |
 | `--pi-provider` | Override pi's `defaultProvider` for this run (e.g. `vertex-anthropic`, `google-vertex`). Threaded through as `pi --provider <name>`. |
-| `--pi-model` | Override pi's `defaultModel` for this run (e.g. `claude-opus-4-6`, `gemini-3.1-pro`). Threaded through as `pi --model <id>`. |
+| `--pi-model` | Override pi's `defaultModel` for this run (e.g. `claude-opus-5`, `gemini-3.1-pro`). Threaded through as `pi --model <id>`. |
 | `--no-preflight` | Skip the pre-audit pi roundtrip (auth + model availability check). |
 | `--preflight-timeout` | Cap on the preflight call (default 30s). |
 | `--api-key` / `--oauth-token` / `--oauth-cred-file` | Per-run BYOK auth override. See [Audit BYOK](audit-byok.md). For piolium these become env vars on the `pi` subprocess (or, for codex cred files, a temporarily-staged `<pi-agent-dir>/auth.json`). |
@@ -269,7 +269,7 @@ vigolium --scan-uuid 019aa... agent audit --source ./backend
 # Override pi's provider/model for this single run
 vigolium agent audit --driver=piolium --source ./backend \
   --pi-provider vertex-anthropic \
-  --pi-model claude-opus-4-6
+  --pi-model claude-opus-5
 
 vigolium agent audit --driver=piolium --source ./backend \
   --pi-provider google-vertex \
@@ -281,23 +281,32 @@ vigolium agent audit --driver=piolium --source ./backend \
 `--driver=piolium` runs piolium only — no audit, no harness fallback. To score the same source tree with both harnesses (under one AgenticScan, with per-driver child rows and a post-pass project-wide findings dedup), use the other driver modes:
 
 ```bash
-# Default — runs audit then piolium sequentially
+# Default — run audit, falling back to piolium only if audit is unavailable
 vigolium agent audit --source ./backend
 
 # Just piolium — no audit, no fallback
 vigolium agent audit --driver piolium --source ./backend --mode lite
 
-# Just audit (equivalent to `vigolium agent audit`)
+# Just audit (no Piolium fallback)
 vigolium agent audit --driver audit --source ./backend
 ```
 
-Mode must be in the shared set (`lite`/`balanced`/`deep`/`revisit`/`confirm`/`merge`) when `--driver=both`. Driver-specific modes (`longshot` for piolium, `mock` for audit) require `--driver=piolium` or `--driver=audit`.
+A single `--mode` must be understood by every selected driver. Mode chains from
+`--modes` are filtered per driver, so a driver skips chain entries it does not
+support; a mode unknown to both drivers is rejected.
 
 ---
 
 ## REST API
 
-`POST /api/agent/run/audit` is the **unified driver endpoint** — it dispatches audit and/or piolium based on the `driver` field. To run only piolium, pass `driver: "piolium"`. To run only audit, use `driver: "audit"` (or hit `POST /api/agent/run/audit` directly). The default `driver: "both"` runs audit then piolium under one AgenticScan with per-driver child rows and a post-pass findings dedup. Same lifecycle and `AgenticScan` row shape as [`/api/agent/run/audit`](vigolium-audit.md) — the existing `/agent/status/:id`, `/agent/sessions/:id/logs`, and `/agent/sessions/:id/artifacts` endpoints work uniformly across both harnesses.
+`POST /api/agent/run/audit` is the **unified driver endpoint** — it dispatches
+audit and/or piolium based on the `driver` field. The default, `"auto"`, runs
+audit when its selected Claude/Codex CLI is available and otherwise falls back
+to piolium. Use `"both"` to run both sequentially, `"piolium"` for piolium only,
+or `"audit"` for audit only. Multi-driver runs have per-driver child rows and a
+post-pass findings dedup. The existing `/agent/status/:id`,
+`/agent/sessions/:id/logs`, and `/agent/sessions/:id/artifacts` endpoints work
+uniformly across both harnesses.
 
 The server-side handler does **not** run the CLI's preflight roundtrip (`pi --mode json` is started straight after request validation). Auth/quota failures surface in the SSE/runtime.log stream instead.
 
@@ -308,7 +317,8 @@ The server-side handler does **not** run the CLI's preflight roundtrip (`pi --mo
 | `source` | string | **Required.** Local path, git URL, `gs://<bucket>/<key>` archive (auto-downloaded + extracted server-side), or local `.zip`/`.tar.gz`/`.tar.bz2`/`.tar.xz`. With `driver: "both"`, the source is resolved once and reused by both drivers. |
 | `target` | string | Optional target URL stored on the run row for cross-referencing scans. |
 | `intensity` | string | `quick` / `balanced` (default) / `deep`. Bundles `mode` + `timeout` + `commit_depth` (quick → `lite`/1h/depth 1, balanced → `balanced`/6h/depth 1, deep → `deep`/12h/depth 0). Explicit `mode`/`timeout`/`commit_depth` win per-field over the preset. |
-| `mode` | string | Audit mode override. With `driver: "both"`, must be in the shared set: `lite` / `balanced` / `deep` / `revisit` / `confirm` / `merge`. Single-driver mode adds `diff` plus driver-specific values (`longshot` for piolium, `status`/`mock` for audit). |
+| `mode` | string | Single audit mode override. With `driver: "auto"` or `"both"`, it must be supported by both drivers. Driver-specific modes require the corresponding single-driver selection. |
+| `modes` | string[] | Mode chain. Overrides `mode`/`intensity`; unsupported entries are skipped per driver, while a value unknown to both drivers is rejected. |
 | `timeout` | string | Go duration (e.g. `"2h"`). Overrides intensity preset. Applied per-driver under `driver: "both"` so an audit hang doesn't burn piolium's budget. |
 | `diff` | string | Focus on changed code: PR URL, git ref range, or `HEAD~N`. |
 | `last_commits` | int | Focus on last N commits (shorthand for `diff HEAD~N`). |
@@ -318,7 +328,7 @@ The server-side handler does **not** run the CLI's preflight roundtrip (`pi --mo
 | `upload_results` | bool | Upload session bundle to cloud storage on completion. With `driver: "both"`, skipped when any driver failed. |
 | `project_uuid` | string | Project UUID for data scoping. Falls back to `X-Project-UUID` header. |
 | `scan_uuid` | string | Optional scan UUID. |
-| `driver` | string | `"piolium"` / `"audit"` / `"both"` (default). With `"both"`, mode must be in the shared set. |
+| `driver` | string | `"auto"` (default), `"both"`, `"audit"`, or `"piolium"`. `auto` runs audit and falls back to piolium only when the selected audit CLI is unavailable. |
 | `no_dedup` | bool | Skip the post-pass project-wide findings dedup that runs after `driver: "both"` completes. Ignored for single-driver runs (those already INSERT-time-dedup by `finding_hash`). |
 | `agent` | string | Audit platform when audit participates: `claude` (default) / `codex`. Ignored when `driver: "piolium"`. |
 | `pi_provider` | string | Forwarded as `pi --provider <name>`. Ignored when `driver: "audit"`. |
@@ -338,8 +348,8 @@ All `pi_*` and `plm_*` fields are optional and only emit their flag when populat
 ### Examples
 
 ```bash
-# Default — driver=both with intensity=balanced (audit then piolium,
-# project-wide findings dedup after both exit)
+# Default — driver=auto with intensity=balanced (audit when available,
+# otherwise piolium)
 curl -s -X POST http://localhost:9002/api/agent/run/audit \
   -H "Content-Type: application/json" \
   -d '{
@@ -347,7 +357,7 @@ curl -s -X POST http://localhost:9002/api/agent/run/audit \
     "intensity": "balanced"
   }' | jq .
 
-# Quick triage with intensity preset — driver=both, mode=lite,
+# Quick triage with both drivers — intensity resolves to mode=lite,
 # commit_depth=1 (resolved server-side from the preset)
 curl -s -X POST http://localhost:9002/api/agent/run/audit \
   -H "Content-Type: application/json" \
@@ -366,7 +376,7 @@ curl -s -X POST http://localhost:9002/api/agent/run/audit \
     "intensity": "deep",
     "driver": "piolium",
     "pi_provider": "vertex-anthropic",
-    "pi_model": "claude-opus-4-6"
+    "pi_model": "claude-opus-5"
   }' | jq .
 
 # Source from Google Cloud Storage — server downloads + extracts the
@@ -456,16 +466,9 @@ curl -N -s -X POST http://localhost:9002/api/agent/run/audit \
 
 ## In-Pipeline Audit (autopilot / swarm)
 
-`vigolium agent autopilot` and `vigolium agent swarm` can drive piolium as the in-pipeline audit that runs alongside (and feeds findings into) the operator agent. The same CLI that historically defaulted to audit now auto-picks piolium when it's locally available.
+`vigolium agent autopilot` and `vigolium agent swarm` can drive piolium as the in-pipeline audit that runs alongside (and feeds findings into) the operator agent.
 
-### Auto-pick
-
-When `--source` is set and **neither** `--audit` nor `--piolium` is passed:
-
-- If `pi` is on `$PATH` **and** the piolium extension is registered in `~/.pi/agent/settings.json` → **piolium** runs (mode = whatever the intensity preset chose, default `lite`).
-- Otherwise → **audit** runs (existing default).
-
-This preserves the prior behavior on machines without Pi while picking up piolium automatically once a user installs it.
+**No nested harness runs unless asked** (autopilot, swarm, and their REST endpoints): `--audit` defaults to `off`, `--piolium` to empty, and the intensity preset never turns one on. An installed `pi` is never picked automatically. Pass `--audit <mode>` or `--piolium <mode>` (REST: `audit` / `piolium`) explicitly; a natural-language prompt that asks for an audit counts as asking. The `-j` run document echoes the choice as `audit_harness: {mode, piolium, harness, agent_cli}`.
 
 ### Explicit override
 
@@ -473,13 +476,13 @@ This preserves the prior behavior on machines without Pi while picking up pioliu
 |---|---|
 | `--piolium` (explicit, any mode) | Piolium runs at that mode; audit turns off. |
 | `--audit` (explicit, any mode) | Audit runs at that mode; piolium stays off. |
-| `--audit=off --piolium=off` | No audit. |
+| neither (or `--audit=off --piolium=off`) | No audit (the default). |
 
 Only one harness runs per scan — there's no "run both" mode. If you want to compare both harnesses on the same source, run two scans.
 
 ### REST API equivalents
 
-Both `POST /api/agent/run/autopilot` and `POST /api/agent/run/swarm` accept a new `piolium` field that mirrors the CLI flag exactly. The same auto-pick rule applies server-side: omitting both `audit` and `piolium` triggers piolium when the **server process** has pi+piolium installed, audit otherwise.
+Both `POST /api/agent/run/autopilot` and `POST /api/agent/run/swarm` accept a `piolium` field that mirrors the CLI flag exactly. Omitting both `audit` and `piolium` runs no nested harness, whatever the server has installed.
 
 ```bash
 # Autopilot — explicit piolium audit
@@ -501,7 +504,7 @@ curl -s -X POST http://localhost:9002/api/agent/run/swarm \
     "piolium": "lite"
   }' | jq .
 
-# Autopilot — let auto-pick decide; pi+piolium on this host means piolium wins
+# Autopilot over REST — no audit/piolium field: the operator reads the source itself, no nested CLI
 curl -s -X POST http://localhost:9002/api/agent/run/autopilot \
   -H "Content-Type: application/json" \
   -d '{
@@ -516,15 +519,16 @@ Whichever harness runs:
 
 - The audit's `audit-state.json` and `findings/` tree are synced into `<sessionDir>/<harness.SessionSubdir>/` (`vigolium-results/` or `piolium-audit/`).
 - The autopilot pipeline blocks on the audit before launching the operator agent, then folds the findings into the operator's frozen context bundle (same flow that audit has used).
-- Findings land in the database tagged with `finding_source = "audit"` or `"piolium"`. Mix and match in queries:
+- Findings use `module_type = "whitebox"`; the harness-specific module-ID
+  prefix and tag (`audit` or `piolium`) distinguish them. Query both together:
   ```bash
-  vigolium finding list --source piolium,audit
+  vigolium finding --module-type whitebox
   ```
 
 ### Caveats
 
 - **Pi-specific knobs** (`--pi-provider`, `--pi-model`, `--plm-*`) are **not** exposed on the autopilot/swarm surface. If you need those, run `vigolium agent audit --driver=piolium` (or `POST /api/agent/run/audit`) directly.
-- Auto-pick is host-local. If your CLI machine has pi installed but the **server** running autopilot doesn't (or vice versa), the auto-pick decision happens where the request handler runs.
+- `piolium` needs pi+piolium on the host that runs the request handler: a REST request runs it on the **server**, not on your CLI machine.
 
 ---
 
@@ -741,7 +745,7 @@ When the audit completes, findings are automatically parsed and stored in the Vi
 
 All findings are stored with:
 
-- `finding_source`: `piolium`
+- `finding_source`: `audit` (shared by both audit harnesses)
 - `module_type`: `whitebox`
 - `finding_hash`: `MD5(auditID + moduleID + findingID)` for deduplication
 
@@ -756,13 +760,13 @@ The associated `AgenticScan` row carries:
 
 ```bash
 # Via CLI
-vigolium finding list --source piolium
+vigolium finding --finding-source audit --search 'piolium:'
 
 # Via API
-GET /api/findings?source=piolium
+GET /api/findings?finding_source=audit&search=piolium%3A
 
 # Combined with audit
-vigolium finding list --source piolium,audit
+vigolium finding --finding-source audit --module-type whitebox
 ```
 
 ### Manual import
@@ -825,7 +829,7 @@ make test-e2e-piolium
 
 # Override the provider/model for the run
 VIGOLIUM_E2E_PI_PROVIDER=vertex-anthropic \
-VIGOLIUM_E2E_PI_MODEL=claude-opus-4-6 \
+VIGOLIUM_E2E_PI_MODEL=claude-opus-5 \
   make test-e2e-piolium
 
 VIGOLIUM_E2E_PI_PROVIDER=google-vertex \

@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Triggers errors to detect Django applications running with DEBUG=True. When
-enabled, Django displays detailed error pages containing settings, URL
-patterns, stack traces, and environment variables. This module sends requests
-designed to trigger 404 and 500 error pages that reveal debug information.
+	ModuleDesc = `**What it means:** A Django application is running in production with DEBUG=True, returning verbose error pages that expose URL patterns, settings, stack traces, and environment details - handing attackers an internal map of the application.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Sends a request to a random non-existent path to trigger a Django debug 404 page
-- Sends a malformed JSON POST to trigger a 500 error with stack trace
-- Validates responses with Django-specific debug page markers
+**How it's exploited:** An attacker triggers Django's debug 404/500 pages with a bad path or malformed input, then reads the leaked URL routes, installed apps, framework version, and frequently the SECRET_KEY or database credentials - used to forge sessions and pivot deeper.
 
-## References
-- https://docs.djangoproject.com/en/stable/ref/settings/#debug`
+**Fix:** Set DEBUG=False in production and configure proper ALLOWED_HOSTS and custom error pages so internal details are never rendered to clients.`
 
 	ModuleConfirmation = "Confirmed when error responses contain Django debug page markers indicating DEBUG=True"
 	ModuleSeverity     = severity.High

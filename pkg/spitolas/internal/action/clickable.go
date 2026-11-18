@@ -3,6 +3,8 @@ package action
 import (
 	"fmt"
 
+	"github.com/go-rod/rod/lib/proto"
+
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/browser"
 )
 
@@ -49,8 +51,37 @@ function getEventHandlers(xpath) {
 // cdpComputedStylesheet is the CDP script to check multiple elements.
 const cdpComputedStylesheet = `Array.from(%s).map(element => {return {xpath: element, attributes: getEventHandlers(element)}});`
 
+// DetectClickablesPierced turns a pierced snapshot's click-listener elements into
+// ClickableResults: a light-DOM element carries its XPath, one behind a shadow
+// or frame hop its encoded Locator (as Selector and Locator). Both carry the
+// backend node id, which is how they are resolved. When the snapshot found no
+// click listener at all it tries the jQuery pass, like DetectClickablesCDP:
+// jQuery-bound handlers sit on the document, not the element.
+func DetectClickablesPierced(page *browser.Page, snap *browser.PierceSnapshot) []ClickableResult {
+	results := make([]ClickableResult, 0, len(snap.ClickListeners))
+	for _, el := range snap.ClickListeners {
+		r := ClickableResult{BackendNodeID: el.BackendNodeID, HasListener: true}
+		if el.Locator.IsLight() {
+			r.XPath = el.Locator.InnerXPath
+		} else {
+			loc := el.Locator
+			r.Locator = &loc
+			r.Selector = loc.String()
+		}
+		results = append(results, r)
+	}
+	if len(results) == 0 {
+		if jq, err := detectJQueryClickHandlers(page); err == nil {
+			results = append(results, jq...)
+		}
+	}
+	return results
+}
+
 // DetectClickablesCDP uses Chrome DevTools Protocol to find elements
-// with click event listeners attached via JavaScript.
+// with click event listeners attached via JavaScript. It is the script-based
+// light-DOM pass, kept as the fallback when the pierced snapshot is unavailable
+// (see DetectClickablesPierced).
 func DetectClickablesCDP(page *browser.Page) ([]ClickableResult, error) {
 	// First, get all element XPaths in the body
 	xpaths, err := getAllXPaths(page)
@@ -155,6 +186,96 @@ func detectJQueryClickHandlers(page *browser.Page) ([]ClickableResult, error) {
 	return clickables, nil
 }
 
+// DetectHoverMenus finds high-precision menu-hover triggers whose submenu opens
+// on CSS :hover (or a framework dropdown), which the click passes miss because a
+// click on them often does nothing. It targets explicit affordances
+// (aria-haspopup, role=menu(bar), Bootstrap dropdown toggles) plus a narrow
+// heuristic — an element that directly wraps a currently-hidden nested menu — and
+// caps the count so it contributes a handful of hover actions, not a hover for
+// every element.
+func DetectHoverMenus(page *browser.Page) ([]ClickableResult, error) {
+	script := `(function() {
+		var out = [];
+		var seen = new Set();
+		var MAX = 30;
+
+		function selector(el) {
+			if (el.id) return '#' + CSS.escape(el.id);
+			var parts = [];
+			while (el && el.nodeType === Node.ELEMENT_NODE) {
+				var s = el.tagName.toLowerCase();
+				if (el.id) { parts.unshift('#' + CSS.escape(el.id)); break; }
+				var nth = 1, sib = el;
+				while (sib = sib.previousElementSibling) { if (sib.tagName === el.tagName) nth++; }
+				if (nth > 1) s += ':nth-of-type(' + nth + ')';
+				parts.unshift(s);
+				el = el.parentElement;
+			}
+			return parts.join(' > ');
+		}
+		function visible(el) {
+			var st = window.getComputedStyle(el);
+			if (st.display === 'none' || st.visibility === 'hidden') return false;
+			var r = el.getBoundingClientRect();
+			return r.width > 0 && r.height > 0;
+		}
+		function hidden(el) {
+			var st = window.getComputedStyle(el);
+			if (st.display === 'none' || st.visibility === 'hidden') return true;
+			var r = el.getBoundingClientRect();
+			return r.height === 0 || r.width === 0;
+		}
+		function add(el, reason) {
+			if (!el || out.length >= MAX || !visible(el)) return;
+			var sel = selector(el);
+			if (!sel || seen.has(sel)) return;
+			seen.add(sel);
+			out.push({selector: sel, reason: reason});
+		}
+
+		// 1. Explicit menu affordances — the trigger element itself.
+		var explicit = document.querySelectorAll(
+			'[aria-haspopup="true"],[aria-haspopup="menu"],[role="menuitem"][aria-haspopup],' +
+			'[data-toggle="dropdown"],[data-bs-toggle="dropdown"],.dropdown-toggle');
+		for (var i = 0; i < explicit.length && out.length < MAX; i++) add(explicit[i], 'aria-haspopup');
+
+		// 2. Heuristic: an element that DIRECTLY wraps a currently-hidden nested menu
+		// (the classic CSS mega-menu: <li><a>Products</a><ul class="submenu">…</ul></li>).
+		// Target the wrapper's first interactive child (the visible label) as the hover
+		// trigger.
+		var wraps = document.querySelectorAll('li,[class*="menu"],[class*="nav"],[class*="dropdown"]');
+		for (var j = 0; j < wraps.length && out.length < MAX; j++) {
+			var w = wraps[j];
+			var sub = w.querySelector(':scope > ul, :scope > [role="menu"], :scope > .submenu, :scope > .dropdown-menu');
+			if (!sub || !hidden(sub)) continue;
+			var trigger = w.querySelector(':scope > a, :scope > button, :scope > [role="button"], :scope > span') || w;
+			add(trigger, 'hidden-submenu');
+		}
+
+		return out;
+	})()`
+
+	result, err := page.Eval(script)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]ClickableResult, 0)
+	if arr, ok := result.([]interface{}); ok {
+		for _, item := range arr {
+			if m, ok := item.(map[string]interface{}); ok {
+				sel, _ := m["selector"].(string)
+				if sel == "" {
+					continue
+				}
+				reason, _ := m["reason"].(string)
+				results = append(results, ClickableResult{Selector: sel, HasListener: true, Reason: reason})
+			}
+		}
+	}
+	return results, nil
+}
+
 // getAllXPaths returns XPaths for all elements in the body.
 // CRITICAL FIX: Uses absolute XPath (starting with /html) instead of relative (//)
 func getAllXPaths(page *browser.Page) ([]string, error) {
@@ -222,6 +343,14 @@ type ClickableResult struct {
 	Selector     string // CSS selector
 	HasListener  bool   // Has click event listener
 	ListenerCode string // Event listener code (if available)
+	Reason       string // Why it was flagged (semantic pass): cursor/tabindex/handler/role-button/anchor/button/…
+
+	// BackendNodeID is set by the pierced snapshot pass; the element is
+	// resolved through it (the only route into a closed shadow root).
+	BackendNodeID proto.DOMBackendNodeID
+	// Locator is set for an element behind a shadow or frame hop; it becomes
+	// the candidate's HowLocator identification.
+	Locator *browser.Locator
 }
 
 // parseClickableResults parses the CDP result into clickable results.
@@ -402,11 +531,16 @@ func DetectClickablesSimple(page *browser.Page) ([]ClickableResult, error) {
 				if v, ok := itemMap["selector"].(string); ok {
 					selector = v
 				}
+				reason := ""
+				if v, ok := itemMap["reason"].(string); ok {
+					reason = v
+				}
 
 				if selector != "" {
 					results = append(results, ClickableResult{
 						Selector:    selector,
 						HasListener: true,
+						Reason:      reason,
 					})
 				}
 			}

@@ -9,25 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for Drupal user enumeration through two vectors:
-1. User profile paths: /user/1 through /user/5, checking for redirects to /users/<username>
-2. JSON:API user listing: /jsonapi/user/user returns user objects anonymously
+	ModuleDesc = `**What it means:** Credential-free controls found distinct Drupal public profile names through numeric routes or structurally parsed JSON:API user resources. Public profiles and author directories may be intentional.
 
-Enumerated usernames can be used for password brute-force attacks.
+**How it's exploited:** Profile names may aid password spraying only if they equal private login identities. This module does not prove that mapping, private-account disclosure, or weak login controls, so results remain observations.
 
-## Notes
-- Runs once per host
-- Tests user IDs 1 through 5
-- Checks JSON:API endpoint for anonymous user data access
-- Non-destructive: only performs GET requests
+**Fix:** Restrict anonymous access to user profiles and the JSON:API user resource (require auth or disable the module if unused), and avoid exposing usernames in profile URLs and titles.`
 
-## References
-- https://www.drupal.org/docs/security-in-drupal
-- https://www.drupal.org/docs/core-modules-and-themes/core-modules/jsonapi-module`
-
-	ModuleConfirmation = "Confirmed when user profile paths expose usernames or JSON:API returns user objects"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Observed when profile controls yield distinct non-catch-all names or parsed JSON:API contains user--user resources; login identity is not inferred"
+	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Certain
 	ModuleTags         = []string{"drupal", "php", "info-disclosure", "probe", "moderate"}
 )

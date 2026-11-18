@@ -3,14 +3,19 @@ package ratelimit
 import (
 	"container/heap"
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/types"
 )
 
 func TestDefaultHostRateLimiterConfig(t *testing.T) {
 	cfg := DefaultHostRateLimiterConfig()
-	if cfg.MaxPerHost != 20 {
-		t.Errorf("MaxPerHost = %d, want 20", cfg.MaxPerHost)
+	if cfg.MaxPerHost != types.DefaultMaxPerHost {
+		t.Errorf("MaxPerHost = %d, want %d", cfg.MaxPerHost, types.DefaultMaxPerHost)
 	}
 	if cfg.MaxEntries != 1000 {
 		t.Errorf("MaxEntries = %d, want 1000", cfg.MaxEntries)
@@ -29,8 +34,8 @@ func TestNewHostRateLimiter_AppliesDefaults(t *testing.T) {
 	h := NewHostRateLimiter(HostRateLimiterConfig{})
 	defer func() { _ = h.Close() }()
 
-	if h.maxPerHost != 20 {
-		t.Errorf("maxPerHost = %d, want 20", h.maxPerHost)
+	if h.maxPerHost != types.DefaultMaxPerHost {
+		t.Errorf("maxPerHost = %d, want %d", h.maxPerHost, types.DefaultMaxPerHost)
 	}
 	if h.maxEntries != 1000 {
 		t.Errorf("maxEntries = %d, want 1000", h.maxEntries)
@@ -64,6 +69,62 @@ func TestHostRateLimiter_AcquireRelease(t *testing.T) {
 	h.Release(host)
 	if err := h.Acquire(context.Background(), host); err != nil {
 		t.Fatalf("Acquire after Release: %v", err)
+	}
+}
+
+func TestHostRateLimiter_AcquireWithTimeoutContext_Cancellation(t *testing.T) {
+	// A long acquire timeout means a slow unblock would clearly exceed the
+	// test's tolerance — proving the caller context, not the limiter's own
+	// acquireTimeout, is what releases the waiter.
+	h := NewHostRateLimiter(HostRateLimiterConfig{
+		MaxPerHost:     1,
+		EvictInterval:  time.Hour,
+		AcquireTimeout: 10 * time.Second,
+	})
+	defer func() { _ = h.Close() }()
+
+	const host = "example.com"
+
+	// Occupy the only slot so the next acquire must wait.
+	if err := h.Acquire(context.Background(), host); err != nil {
+		t.Fatalf("initial Acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- h.AcquireWithTimeoutContext(ctx, host)
+	}()
+
+	cancel() // caller-side shutdown
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AcquireWithTimeoutContext did not unblock on caller-context cancellation " +
+			"(it waited on the limiter's own timeout instead of ctx)")
+	}
+}
+
+func TestHostRateLimiter_AcquireWithTimeoutContext_Timeout(t *testing.T) {
+	// With no caller deadline, the limiter's own acquireTimeout must still fire.
+	h := NewHostRateLimiter(HostRateLimiterConfig{
+		MaxPerHost:     1,
+		EvictInterval:  time.Hour,
+		AcquireTimeout: 30 * time.Millisecond,
+	})
+	defer func() { _ = h.Close() }()
+
+	const host = "example.com"
+	if err := h.Acquire(context.Background(), host); err != nil {
+		t.Fatalf("initial Acquire: %v", err)
+	}
+
+	if err := h.AcquireWithTimeoutContext(context.Background(), host); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
 }
 
@@ -179,6 +240,54 @@ func TestHostRateLimiter_EvictsIdleHosts(t *testing.T) {
 	}
 }
 
+// TestHostRateLimiter_EvictsManyHostsAfterConcurrentUse verifies that idle
+// eviction still drains every host after heavy concurrent acquire/release
+// traffic, even though Acquire no longer maintains the eviction heap on the hot
+// path. Correctness now relies on the eviction loop's lazy reconciliation of
+// stale heap entries against the authoritative atomic lastUsed.
+func TestHostRateLimiter_EvictsManyHostsAfterConcurrentUse(t *testing.T) {
+	h := NewHostRateLimiter(HostRateLimiterConfig{
+		MaxPerHost:    4,
+		MaxEntries:    100000, // don't trigger capacity eviction; isolate idle eviction
+		EvictAfter:    10 * time.Millisecond,
+		EvictInterval: 10 * time.Millisecond,
+	})
+	defer func() { _ = h.Close() }()
+
+	const hosts = 200
+	const goroutines = 16
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < hosts; i++ {
+				host := fmt.Sprintf("host-%d.example", i)
+				if err := h.Acquire(context.Background(), host); err != nil {
+					t.Errorf("Acquire(%s): %v", host, err)
+					return
+				}
+				h.Release(host)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// All hosts are now idle; the eviction loop must drain every shard.
+	deadline := time.After(3 * time.Second)
+	for {
+		tracked, _ := h.Stats()
+		if tracked == 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("idle hosts were not fully evicted: %d still tracked", tracked)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestHostRateLimiter_Close(t *testing.T) {
 	h := NewHostRateLimiter(HostRateLimiterConfig{MaxPerHost: 1, EvictInterval: 10 * time.Millisecond})
 	if err := h.Close(); err != nil {
@@ -208,6 +317,28 @@ func TestHostRateLimiter_AcquireAfterClose(t *testing.T) {
 	if err := h.AcquireWithTimeout("example.com"); err != nil {
 		t.Fatalf("AcquireWithTimeout after Close = %v, want nil", err)
 	}
+}
+
+// BenchmarkAcquireRelease_SingleHost measures the steady-state hot path under
+// contention for one host — the common pentest case where every request hashes
+// to the same shard. With heap maintenance removed from Acquire this path no
+// longer takes the shard write lock.
+func BenchmarkAcquireRelease_SingleHost(b *testing.B) {
+	h := NewHostRateLimiter(HostRateLimiterConfig{
+		MaxPerHost:    1024, // high enough that the semaphore never blocks
+		EvictInterval: time.Hour,
+	})
+	defer func() { _ = h.Close() }()
+	ctx := context.Background()
+	const host = "target.example.com"
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = h.Acquire(ctx, host)
+			h.Release(host)
+		}
+	})
 }
 
 func TestHostHeap_OrdersByLastUsed(t *testing.T) {

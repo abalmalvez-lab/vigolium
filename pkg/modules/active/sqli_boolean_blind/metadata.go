@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for boolean-based blind SQL injection by sending paired TRUE/FALSE payloads and comparing
-response differentials. Uses triple-verification to minimize false positives: TRUE and FALSE
-payloads must produce consistently different responses across multiple requests.
+	ModuleDesc = `**What it means:** A request parameter is concatenated into a backend SQL query, letting an attacker alter its logic. No errors or output appear, but a TRUE payload returns a different page than a FALSE one (boolean-based blind SQL injection), confirmed via matched AND 1=1 / AND 1=2 conditions.
 
-## Notes
-- Sends TRUE and FALSE payload pairs to each injection point
-- Compares responses using status code, body length differential, and content hash
-- Triple-verification: confirms TRUE/FALSE differential is consistent across retries
-- Tests string context, numeric context, and WAF bypass payloads
-- Uses NoRedirects to capture TRUE/FALSE differential before redirect
+**How it's exploited:** An attacker turns the TRUE/FALSE difference into a one-bit oracle, extracting data character by character - credentials, hashes, whole tables - and escalating to authentication bypass or data exfiltration.
 
-## References
-- https://owasp.org/www-community/attacks/Blind_SQL_Injection
-- https://portswigger.net/web-security/sql-injection/blind`
+**Fix:** Use parameterized queries or prepared statements for all database access, never concatenating user input into SQL.`
 
 	ModuleConfirmation = "Confirmed when TRUE payloads consistently produce different responses from FALSE payloads across multiple verification requests"
 	ModuleSeverity     = severity.High

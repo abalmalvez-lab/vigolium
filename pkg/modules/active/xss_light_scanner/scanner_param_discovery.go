@@ -11,6 +11,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
+	"github.com/vigolium/vigolium/pkg/spitolas"
 	"go.uber.org/zap"
 )
 
@@ -21,6 +22,10 @@ type ParamDiscoveryModule struct {
 	transformAnalyzer *TransformAnalyzer
 	jsAnalyzer        *JavaScriptContextAnalyzer
 	paramDiscovery    *ParameterDiscovery
+
+	// Probe runs the headless-browser confirmation step. Overridable so tests
+	// never spawn a real browser. Default: spitolas.ProbeURL.
+	Probe ProbeFunc
 }
 
 // NewParamDiscoveryScanner creates a new parameter discovery XSS scanner.
@@ -41,6 +46,7 @@ func NewParamDiscoveryScanner() *ParamDiscoveryModule {
 		transformAnalyzer: NewTransformAnalyzer(),
 		jsAnalyzer:        NewJavaScriptContextAnalyzer(),
 		paramDiscovery:    NewParameterDiscovery(),
+		Probe:             spitolas.ProbeURL,
 	}
 	m.ModuleTags = ModuleTags
 	return m
@@ -100,12 +106,9 @@ func (m *ParamDiscoveryModule) scanDiscoveredParameters(
 		workingRequest = getRequest
 	}
 
-	// Create context for discovery
-	parsedReq, err := httpmsg.ParseRawRequest(string(workingRequest))
-	if err != nil {
-		return nil, err
-	}
-	parsedReq = parsedReq.WithService(ctx.Service())
+	// Create context for discovery. ToggleRequestMethod/original raw is
+	// well-formed, so wrap directly instead of re-parsing on this hot path.
+	parsedReq := httpmsg.NewRequestResponseRaw(workingRequest, ctx.Service())
 
 	// Discover parameters that echo in response
 	points, modifiedRequest, err := m.paramDiscovery.DiscoverAndCreatePoints(parsedReq, httpClient)
@@ -131,12 +134,9 @@ func (m *ParamDiscoveryModule) scanDiscoveredParameters(
 		return nil, nil
 	}
 
-	// Create new context with modified request
-	modifiedParsed, err := httpmsg.ParseRawRequest(string(modifiedRequest))
-	if err != nil {
-		return nil, err
-	}
-	modifiedParsed = modifiedParsed.WithService(ctx.Service())
+	// Create new context with modified request. DiscoverAndCreatePoints returns
+	// well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	modifiedParsed := httpmsg.NewRequestResponseRaw(modifiedRequest, ctx.Service())
 
 	// Get base response for the modified request
 	resp, _, err := httpClient.Execute(modifiedParsed, http.Options{})
@@ -152,6 +152,9 @@ func (m *ParamDiscoveryModule) scanDiscoveredParameters(
 
 	// Scan each discovered parameter
 	for _, ip := range points {
+		if scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
+			continue // another xss module already reported this param here
+		}
 		result, err := m.scanInsertionPointWithPrefixes(modifiedParsed, ip, baseBody, httpClient)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -161,9 +164,15 @@ func (m *ParamDiscoveryModule) scanDiscoveredParameters(
 		}
 
 		if result != nil && result.HasVulnerability() {
+			// Re-send a real, context-shaped XSS payload and grade the candidate:
+			// drop it when the executable breakout never survives in the body,
+			// report Low when it survives but no popup fires, and only report
+			// High once a headless browser actually pops alert(marker).
+			evt := confirmXSS(m.Probe, modifiedParsed, ip, result, httpClient, "[discovered:"+ip.Name()+"] ", nil)
+			if evt == nil {
+				continue
+			}
 			*foundXSS = true
-			evt := m.buildResultEvent(modifiedParsed, ip, result)
-			evt.Info.Description = "[discovered:" + ip.Name() + "] " + evt.Info.Description
 			results = append(results, evt)
 		}
 	}
@@ -373,35 +382,5 @@ func (m *ParamDiscoveryModule) detectContext(
 
 	default:
 		return HTMLGeneric
-	}
-}
-
-// buildResultEvent creates a ResultEvent from scan result
-func (m *ParamDiscoveryModule) buildResultEvent(
-	ctx *httpmsg.HttpRequestResponse,
-	ip httpmsg.InsertionPoint,
-	result *XSSScanResult,
-) *output.ResultEvent {
-	urlx, _ := ctx.URL()
-
-	var evidenceParts []string
-	for _, ea := range result.ExploitableAnalyses {
-		evidenceParts = append(evidenceParts, ea.Context.String())
-	}
-	description := strings.Join(evidenceParts, " | ")
-
-	if result.UsedPrefix != "" && result.UsedPrefix != "none" {
-		description += " [bypass: " + result.UsedPrefix + "]"
-	}
-
-	return &output.ResultEvent{
-		URL:              urlx.String(),
-		Request:          string(ip.BuildRequest([]byte(result.PrimaryPayload.FullPayload))),
-		Response:         string(result.PrimaryResponse),
-		FuzzingParameter: ip.Name(),
-		ExtractedResults: []string{ip.BaseValue()},
-		Info: output.Info{
-			Description: description,
-		},
 	}
 }

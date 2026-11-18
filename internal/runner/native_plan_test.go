@@ -1,8 +1,13 @@
 package runner
 
 import (
+	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/types"
 )
 
@@ -24,11 +29,87 @@ func TestNormalizeNativePhase_Aliases(t *testing.T) {
 		{"kis", "known-issue-scan"},
 		{"known-issues", "known-issue-scan"},
 		{"known-issue-scan", "known-issue-scan"},
+		// Symmetry with "discover": the spidering phase used to have no short
+		// spelling, so `run discover` worked and `run spider` was an error.
+		{"spider", "spidering"},
+		{"spidering", "spidering"},
+		{"crawl", "spidering"},
+		{"crawling", "spidering"},
+		{"discovering", "discovery"},
+		{"harvest", "external-harvest"},
+		{"harvesting", "external-harvest"},
+		{"external_harvester", "external-harvest"},
+		{"ingest", "ingestion"},
+		{"assess", "dynamic-assessment"},
+		{"extensions", "extension"},
+		// Case and surrounding whitespace are normalized away.
+		{"  Spider ", "spidering"},
+		{"DISCOVER", "discovery"},
 		{"unknown", "unknown"},
 	}
 	for _, tt := range tests {
 		if got := NormalizeNativePhase(tt.input); got != tt.want {
 			t.Errorf("NormalizeNativePhase(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// TestPhaseVocabularyIsSelfConsistent locks the property the single table
+// exists for: every spelling the vocabulary advertises resolves, and everything
+// that resolves is advertised. A hand-maintained valid-list is exactly what
+// drifted before — `spider` normalized nowhere while the help text implied a
+// full set of aliases.
+func TestPhaseVocabularyIsSelfConsistent(t *testing.T) {
+	for _, p := range nativePhaseVocabulary {
+		if got := NormalizeNativePhase(p.Canonical); got != p.Canonical {
+			t.Errorf("canonical %q normalized to %q", p.Canonical, got)
+		}
+		if !IsNativePhaseSpelling(p.Canonical) {
+			t.Errorf("canonical %q not recognized as a phase spelling", p.Canonical)
+		}
+		for _, a := range p.Aliases {
+			if got := NormalizeNativePhase(a); got != p.Canonical {
+				t.Errorf("alias %q normalized to %q, want %q", a, got, p.Canonical)
+			}
+			// An alias must be accepted wherever its canonical is, so --only
+			// never rejects a spelling the help text lists — and never accepts
+			// one for an internal step that cannot run alone.
+			_, _, err := parseOnlyPhases(a)
+			if p.onlyAccepted() && err != nil {
+				t.Errorf("parseOnlyPhases(%q) rejected an advertised alias: %v", a, err)
+			}
+			if !p.onlyAccepted() && err == nil {
+				t.Errorf("parseOnlyPhases(%q) accepted an alias of internal phase %q", a, p.Canonical)
+			}
+		}
+	}
+
+	// No spelling may be claimed by two phases: the index would silently keep
+	// whichever entry was built last.
+	seen := make(map[string]string)
+	for _, p := range nativePhaseVocabulary {
+		for _, s := range append([]string{p.Canonical}, p.Aliases...) {
+			if owner, dup := seen[s]; dup {
+				t.Errorf("spelling %q claimed by both %q and %q", s, owner, p.Canonical)
+			}
+			seen[s] = p.Canonical
+		}
+	}
+}
+
+// TestSkippableVocabularyMatchesSkipDispatch keeps the Skippable column honest:
+// it drives the --skip help text and error message, while the actual behaviour
+// lives in ApplyNativePhaseSelection's switch. A phase listed as skippable that
+// the switch rejects would advertise a flag value that always errors.
+func TestSkippableVocabularyMatchesSkipDispatch(t *testing.T) {
+	for _, p := range nativePhaseVocabulary {
+		opts := &types.Options{SkipPhases: []string{p.Canonical}}
+		err := ApplyNativePhaseSelection(opts, nil)
+		if p.Skippable && err != nil {
+			t.Errorf("--skip %s is advertised as skippable but was rejected: %v", p.Canonical, err)
+		}
+		if !p.Skippable && err == nil {
+			t.Errorf("--skip %s is not advertised as skippable but was accepted", p.Canonical)
 		}
 	}
 }
@@ -107,6 +188,30 @@ func TestApplyNativePhaseSelection_OnlyPhase(t *testing.T) {
 			},
 		},
 		{
+			name:  "extension with dynamic-assessment keeps built-ins",
+			input: "dynamic-assessment,extension",
+			want: want{
+				onlyPhase:     "dynamic-assessment,extension",
+				skipIngestion: true,
+			},
+		},
+		{
+			name:  "extension aliases with dast alias keep built-ins",
+			input: "ext,dast",
+			want: want{
+				onlyPhase:     "extension,dynamic-assessment",
+				skipIngestion: true,
+			},
+		},
+		{
+			name:  "dynamic-assessment alone is not extensions-only",
+			input: "dynamic-assessment",
+			want: want{
+				onlyPhase:     "dynamic-assessment",
+				skipIngestion: true,
+			},
+		},
+		{
 			name:  "duplicates collapse",
 			input: "discovery,discovery,spidering",
 			want: want{
@@ -172,6 +277,53 @@ func TestApplyNativePhaseSelection_OnlyPhase(t *testing.T) {
 	}
 }
 
+func TestApplyNativePhaseSelection_SkipDiscoveryClearsDiscoverEnabled(t *testing.T) {
+	// A strategy (e.g. balanced) may have enabled DiscoverEnabled before phase
+	// selection runs. --skip discovery must both skip ingestion AND clear
+	// DiscoverEnabled so the config panel reports the phase as off and no
+	// downstream gate still sees discovery as active.
+	opts := &types.Options{
+		DiscoverEnabled: true,
+		SkipPhases:      []string{"discovery"},
+	}
+	if err := ApplyNativePhaseSelection(opts, nil); err != nil {
+		t.Fatalf("ApplyNativePhaseSelection: %v", err)
+	}
+	if !opts.SkipIngestion {
+		t.Errorf("SkipIngestion = false, want true")
+	}
+	if opts.DiscoverEnabled {
+		t.Errorf("DiscoverEnabled = true, want false after --skip discovery")
+	}
+
+	// The native plan derived from these opts must not include PhaseDiscovery.
+	plan := BuildNativeScanPlan(opts)
+	for _, step := range plan.Steps {
+		if step.Phase == PhaseDiscovery && step.Enabled {
+			t.Errorf("PhaseDiscovery still enabled in plan after --skip discovery")
+		}
+	}
+}
+
+// TestApplyNativePhaseSelection_ExtensionEnablesExtensions pins that any --only
+// containing "extension" turns extensions on, whether or not the built-in
+// dynamic-assessment modules run alongside them.
+func TestApplyNativePhaseSelection_ExtensionEnablesExtensions(t *testing.T) {
+	for _, only := range []string{"extension", "dynamic-assessment,extension", "spidering,ext"} {
+		called := false
+		opts := &types.Options{OnlyPhase: only}
+		if err := ApplyNativePhaseSelection(opts, func(enabled bool) { called = enabled }); err != nil {
+			t.Fatalf("--only %s: %v", only, err)
+		}
+		if !called {
+			t.Errorf("--only %s did not enable extensions", only)
+		}
+		if opts.SkipDynamicAssessment {
+			t.Errorf("--only %s skipped dynamic-assessment; extensions run inside it", only)
+		}
+	}
+}
+
 func TestApplyNativePhaseSelection_OnlyPhaseErrors(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -189,4 +341,469 @@ func TestApplyNativePhaseSelection_OnlyPhaseErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestProbeOnlyDefaults pins the defaults a standalone host sweep gives itself,
+// and that each one yields to an operator who asked for something else. They
+// live in ApplyNativePhaseSelection rather than the CLI so that the REST API and
+// the programmatic launcher — which call the same function — run the probe phase
+// identically; a regression here is a phase that behaves differently depending
+// on how it was started.
+func TestProbeOnlyDefaults(t *testing.T) {
+	probeOnly := func() *types.Options {
+		return &types.Options{OnlyPhase: "probe"}
+	}
+
+	t.Run("applied for a probe-only run", func(t *testing.T) {
+		opts := probeOnly()
+		if err := ApplyNativePhaseSelection(opts, nil); err != nil {
+			t.Fatalf("ApplyNativePhaseSelection: %v", err)
+		}
+		if !opts.ProbeEnabled {
+			t.Fatal("ProbeEnabled = false")
+		}
+		if !opts.RecordRedirectChain {
+			t.Error("RecordRedirectChain = false; a sweep is mostly redirects and must record the hops")
+		}
+		if opts.RedirectMode != http.RedirectModeSameApex {
+			t.Errorf("RedirectMode = %q, want same-apex", opts.RedirectMode)
+		}
+		if opts.TransportProfile != http.TransportProfileSweep {
+			t.Errorf("TransportProfile = %q, want sweep", opts.TransportProfile)
+		}
+		if !opts.NoWafPacing {
+			t.Error("NoWafPacing = false; one request per host has no burst for the pre-arm to pre-empt")
+		}
+	})
+
+	t.Run("an explicit choice always wins", func(t *testing.T) {
+		opts := probeOnly()
+		opts.RedirectMode = http.RedirectModeOff
+		opts.TransportProfile = "custom"
+		opts.RecordRedirectChainSet = true // operator typed --record-redirect-chain=false
+		opts.NoWafPacingSet = true         // operator typed --no-waf-pacing=false
+		if err := ApplyNativePhaseSelection(opts, nil); err != nil {
+			t.Fatalf("ApplyNativePhaseSelection: %v", err)
+		}
+		if opts.RedirectMode != http.RedirectModeOff {
+			t.Errorf("RedirectMode = %q, want the operator's off", opts.RedirectMode)
+		}
+		if opts.TransportProfile != "custom" {
+			t.Errorf("TransportProfile = %q, want the operator's custom", opts.TransportProfile)
+		}
+		if opts.RecordRedirectChain {
+			t.Error("RecordRedirectChain was defaulted on over an explicit false")
+		}
+		if opts.NoWafPacing {
+			t.Error("NoWafPacing was defaulted on over an explicit false")
+		}
+	})
+
+	// The defaults are for a STANDALONE sweep. Riding along inside a larger scan
+	// they would silently retune the transport and redirect policy for every
+	// other phase in that scan.
+	t.Run("not applied when the probe rides along in a wider scan", func(t *testing.T) {
+		opts := &types.Options{OnlyPhase: "probe,discovery"}
+		if err := ApplyNativePhaseSelection(opts, nil); err != nil {
+			t.Fatalf("ApplyNativePhaseSelection: %v", err)
+		}
+		if !opts.ProbeEnabled {
+			t.Fatal("ProbeEnabled = false")
+		}
+		if opts.RecordRedirectChain || opts.RedirectMode != "" || opts.TransportProfile != "" || opts.NoWafPacing {
+			t.Errorf("probe-only defaults leaked into a multi-phase scan: chain=%v mode=%q profile=%q nopacing=%v",
+				opts.RecordRedirectChain, opts.RedirectMode, opts.TransportProfile, opts.NoWafPacing)
+		}
+	})
+
+	t.Run("not applied to a scan that never selected the probe", func(t *testing.T) {
+		opts := &types.Options{OnlyPhase: "discovery"}
+		if err := ApplyNativePhaseSelection(opts, nil); err != nil {
+			t.Fatalf("ApplyNativePhaseSelection: %v", err)
+		}
+		if opts.NoWafPacing || opts.TransportProfile != "" {
+			t.Error("probe defaults applied to a non-probe run")
+		}
+	})
+}
+
+// Infrastructure that only shapes target traffic must not be built for a plan
+// that never contacts the target; see SendsTargetTraffic for what that cost.
+func TestNativeScanPlanSendsTargetTraffic(t *testing.T) {
+	// Derived from a real plan rather than hand-built steps, so the SkipsTarget
+	// attribute comes from the phase table itself. A literal here would pass
+	// while the table said something else, which is the drift this attribute was
+	// moved onto the table to prevent.
+	enabledOnly := func(phases ...NativePhase) NativeScanPlan {
+		reference := BuildNativeScanPlan(&types.Options{})
+		steps := make([]NativePhaseStep, 0, len(reference.Steps))
+		for _, step := range reference.Steps {
+			step.Enabled = slices.Contains(phases, step.Phase)
+			steps = append(steps, step)
+		}
+		return NativeScanPlan{Steps: steps}
+	}
+
+	t.Run("external-harvest alone never contacts the target", func(t *testing.T) {
+		assert.False(t, enabledOnly(PhaseExternalHarvest).SendsTargetTraffic())
+	})
+
+	t.Run("nothing enabled", func(t *testing.T) {
+		assert.False(t, enabledOnly().SendsTargetTraffic())
+	})
+
+	// Every other phase reaches the target directly or through the shared
+	// requester, so each one on its own has to keep sessions and hooks.
+	for _, phase := range []NativePhase{
+		PhaseHeuristicsCheck, PhasePortSweep, PhaseHarvestProbe, PhaseSpidering, PhaseProbe,
+		PhaseDiscovery, PhaseTargetedReSpider, PhaseSeed,
+		PhaseDynamicAssessment, PhaseKnownIssueScan,
+	} {
+		t.Run(string(phase)+" reaches the target", func(t *testing.T) {
+			assert.True(t, enabledOnly(phase).SendsTargetTraffic())
+		})
+	}
+
+	t.Run("external-harvest alongside a scanning phase still counts", func(t *testing.T) {
+		assert.True(t, enabledOnly(PhaseExternalHarvest, PhaseProbe).SendsTargetTraffic())
+	})
+
+	// A disabled step must not count, or --only external-harvest would be
+	// indistinguishable from a full plan.
+	t.Run("disabled steps are ignored", func(t *testing.T) {
+		plan := NativeScanPlan{Steps: []NativePhaseStep{
+			{Phase: PhaseProbe, Enabled: false},
+			{Phase: PhaseExternalHarvest, Enabled: true, SkipsTarget: true},
+		}}
+		assert.False(t, plan.SendsTargetTraffic())
+	})
+
+	// The attribute has to be declared on the step, not inferred: a plan that
+	// forgets it must fail closed (build the infrastructure) rather than skip
+	// session hydration for a phase that does reach the target.
+	t.Run("an unmarked phase counts as reaching the target", func(t *testing.T) {
+		plan := NativeScanPlan{Steps: []NativePhaseStep{
+			{Phase: PhaseExternalHarvest, Enabled: true},
+		}}
+		assert.True(t, plan.SendsTargetTraffic())
+	})
+}
+
+// TestEveryPlannedPhaseIsInTheVocabulary: every step BuildNativeScanPlan can
+// schedule appears on phase.started/phase.finished, so each must be a canonical
+// vocabulary id — or a consumer sees a phase name it cannot look up, --skip,
+// or find in `strategy -j`.
+func TestEveryPlannedPhaseIsInTheVocabulary(t *testing.T) {
+	canonical := map[string]bool{}
+	for _, p := range nativePhaseVocabulary {
+		canonical[p.Canonical] = true
+	}
+	for _, step := range BuildNativeScanPlan(&types.Options{}).Steps {
+		if !canonical[string(step.Phase)] {
+			t.Errorf("plan step %q is not in nativePhaseVocabulary", step.Phase)
+		}
+	}
+}
+
+func TestPhaseVocabulary_InternalAndOnlyAccepted(t *testing.T) {
+	byName := map[string]PhaseSpelling{}
+	for _, p := range PhaseVocabulary() {
+		byName[p.Canonical] = p
+		if p.OnlyAccepted == p.Internal {
+			t.Errorf("%s: only_accepted=%v internal=%v; an internal phase is exactly one --only rejects",
+				p.Canonical, p.OnlyAccepted, p.Internal)
+		}
+	}
+	for name, want := range map[string]struct{ internal, skippable bool }{
+		"heuristics-check":  {false, true},
+		"port-sweep":        {false, true},
+		"targeted-respider": {false, true},
+		"seed":              {true, false},
+		"preflight":         {true, true},
+		"extension":         {false, true},
+		"harvest-probe":     {true, true},
+	} {
+		got, ok := byName[name]
+		if !ok {
+			t.Errorf("%s missing from PhaseVocabulary", name)
+			continue
+		}
+		if got.Internal != want.internal || got.Skippable != want.skippable {
+			t.Errorf("%s: internal=%v skippable=%v, want %v/%v", name, got.Internal, got.Skippable, want.internal, want.skippable)
+		}
+	}
+	for alias, canonical := range map[string]string{
+		"heuristics": "heuristics-check", "heuristic": "heuristics-check",
+		"ports": "port-sweep", "portsweep": "port-sweep", "port-scan": "port-sweep",
+		"respider": "targeted-respider", "re-spider": "targeted-respider",
+		"harvest-check": "harvest-probe",
+	} {
+		if got := NormalizeNativePhase(alias); got != canonical {
+			t.Errorf("NormalizeNativePhase(%q) = %q, want %q", alias, got, canonical)
+		}
+	}
+}
+
+func planStepEnabled(plan NativeScanPlan, phase NativePhase) bool {
+	for _, step := range plan.Steps {
+		if step.Phase == phase {
+			return step.Enabled
+		}
+	}
+	return false
+}
+
+// TestPortSweepGate: the sweep runs under deep / --follow-subdomains or when
+// --only names it, and --skip port-sweep or an --only without it turn it off.
+func TestPortSweepGate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts types.Options
+		want bool
+	}{
+		{"deep schedules it", types.Options{Intensity: "deep"}, true},
+		{"follow-subdomains schedules it", types.Options{FollowSubdomains: true}, true},
+		{"balanced does not", types.Options{Intensity: "balanced"}, false},
+		{"--skip port-sweep under deep", types.Options{Intensity: "deep", SkipPhases: []string{"port-sweep"}}, false},
+		{"--skip ports alias under deep", types.Options{Intensity: "deep", SkipPhases: []string{"ports"}}, false},
+		{"--only dast under deep", types.Options{Intensity: "deep", OnlyPhase: "dast"}, false},
+		{"--only discovery under follow-subdomains", types.Options{FollowSubdomains: true, OnlyPhase: "discovery"}, false},
+		{"--only port-sweep without deep", types.Options{OnlyPhase: "port-sweep"}, true},
+		{"--only discovery,ports under deep", types.Options{Intensity: "deep", OnlyPhase: "discovery,ports"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts
+			if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+				t.Fatalf("ApplyNativePhaseSelection: %v", err)
+			}
+			if got := planStepEnabled(BuildNativeScanPlan(&opts), PhasePortSweep); got != tc.want {
+				t.Errorf("port-sweep enabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("--only port-sweep runs nothing else", func(t *testing.T) {
+		opts := types.Options{OnlyPhase: "port-sweep", HeuristicsCheck: "basic"}
+		if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+			t.Fatal(err)
+		}
+		for _, step := range BuildNativeScanPlan(&opts).Steps {
+			if step.Enabled && step.Phase != PhasePortSweep {
+				t.Errorf("--only port-sweep also enabled %s", step.Phase)
+			}
+		}
+	})
+}
+
+func TestSkipHeuristicsAndRespider(t *testing.T) {
+	opts := types.Options{
+		HeuristicsCheck:  "basic",
+		SpideringEnabled: true,
+		SkipPhases:       []string{"heuristics", "re-spider"},
+	}
+	if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+		t.Fatal(err)
+	}
+	if opts.HeuristicsCheck != "none" {
+		t.Errorf("HeuristicsCheck = %q, want none", opts.HeuristicsCheck)
+	}
+	plan := BuildNativeScanPlan(&opts)
+	if planStepEnabled(plan, PhaseHeuristicsCheck) {
+		t.Error("heuristics-check still enabled after --skip heuristics")
+	}
+	if planStepEnabled(plan, PhaseTargetedReSpider) {
+		t.Error("targeted-respider still enabled after --skip re-spider")
+	}
+	if !planStepEnabled(plan, PhaseSpidering) {
+		t.Error("--skip targeted-respider must keep spidering")
+	}
+}
+
+// TestOnlyTargetedRespider: --only may name targeted-respider beside spidering
+// and discovery, and the re-spider then runs with no assessment; it cannot be
+// named without them. Left unnamed, it keeps its default gate: it rides along
+// when an assessment runs, and not otherwise.
+func TestOnlyTargetedRespider(t *testing.T) {
+	plan := func(only string) (NativeScanPlan, error) {
+		opts := types.Options{OnlyPhase: only}
+		if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+			return NativeScanPlan{}, err
+		}
+		return BuildNativeScanPlan(&opts), nil
+	}
+
+	for _, only := range []string{"discovery,spidering,targeted-respider", "deparos,spitolas,respider", "ingestion,crawl,re-spider"} {
+		p, err := plan(only)
+		if err != nil {
+			t.Fatalf("--only %s: %v", only, err)
+		}
+		for _, phase := range []NativePhase{PhaseDiscovery, PhaseSpidering, PhaseTargetedReSpider} {
+			if !planStepEnabled(p, phase) {
+				t.Errorf("--only %s: %s disabled", only, phase)
+			}
+		}
+		if planStepEnabled(p, PhaseDynamicAssessment) {
+			t.Errorf("--only %s enabled dynamic-assessment", only)
+		}
+	}
+
+	for _, only := range []string{"targeted-respider", "spidering,targeted-respider", "discovery,targeted-respider"} {
+		if _, err := plan(only); err == nil || !strings.Contains(err.Error(), "discovery,spidering,targeted-respider") {
+			t.Errorf("--only %s: err = %v, want the phases it needs named", only, err)
+		}
+	}
+
+	// Unnamed: rides on an assessment, as before.
+	if p, _ := plan("discovery,spidering,dast"); !planStepEnabled(p, PhaseTargetedReSpider) {
+		t.Error("--only discovery,spidering,dast: the re-spider no longer rides along")
+	}
+	if p, _ := plan("discovery,spidering"); planStepEnabled(p, PhaseTargetedReSpider) {
+		t.Error("--only discovery,spidering: the re-spider runs without being named or an assessment")
+	}
+	full := types.Options{SpideringEnabled: true}
+	if err := ApplyNativePhaseSelection(&full, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !planStepEnabled(BuildNativeScanPlan(&full), PhaseTargetedReSpider) {
+		t.Error("a full scan with spidering no longer schedules the re-spider")
+	}
+	if by := full.PhaseSelection[string(PhaseTargetedReSpider)]; by != "" {
+		t.Errorf("a full scan recorded a selection for the re-spider: %q", by)
+	}
+	unnamed := types.Options{OnlyPhase: "discovery,spidering"}
+	if err := ApplyNativePhaseSelection(&unnamed, nil); err != nil {
+		t.Fatal(err)
+	}
+	if by := unnamed.PhaseSelection[string(PhaseTargetedReSpider)]; by != "" {
+		t.Errorf("an --only that leaves the re-spider out recorded %q; its gate explains it", by)
+	}
+}
+
+func TestOnlyHeuristicsCheck(t *testing.T) {
+	opts := types.Options{OnlyPhase: "heuristics-check", HeuristicsCheck: "none"}
+	if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !planStepEnabled(BuildNativeScanPlan(&opts), PhaseHeuristicsCheck) {
+		t.Error("--only heuristics-check did not schedule heuristics-check")
+	}
+	opts = types.Options{OnlyPhase: "discovery", HeuristicsCheck: "advanced"}
+	if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+		t.Fatal(err)
+	}
+	if opts.HeuristicsCheck != "none" {
+		t.Errorf("--only discovery left HeuristicsCheck = %q", opts.HeuristicsCheck)
+	}
+}
+
+func TestSkipExtensionDisablesExtensions(t *testing.T) {
+	enabled := true
+	opts := types.Options{SkipPhases: []string{"ext"}}
+	if err := ApplyNativePhaseSelection(&opts, func(on bool) { enabled = on }); err != nil {
+		t.Fatalf("--skip extension rejected: %v", err)
+	}
+	if enabled {
+		t.Error("--skip extension did not disable extensions")
+	}
+	if opts.SkipDynamicAssessment {
+		t.Error("--skip extension must keep the built-in dynamic-assessment modules")
+	}
+}
+
+func TestSkipPreflightAccepted(t *testing.T) {
+	opts := types.Options{SkipPhases: []string{"preflight"}}
+	if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+		t.Fatalf("--skip preflight rejected: %v", err)
+	}
+	if !opts.SkipPreflight {
+		t.Error("SkipPreflight not set")
+	}
+}
+
+func TestInternalPhasesRejectedByOnly(t *testing.T) {
+	for _, phase := range []string{"seed", "preflight", "harvest-probe", "harvest-check"} {
+		opts := types.Options{OnlyPhase: phase}
+		if err := ApplyNativePhaseSelection(&opts, nil); err == nil {
+			t.Errorf("--only %s accepted; internal steps cannot run alone", phase)
+		}
+	}
+	if err := ApplyNativePhaseSelection(&types.Options{SkipPhases: []string{"seed"}}, nil); err == nil {
+		t.Error("--skip seed accepted; seed is not skippable")
+	}
+}
+
+// TestPhaseVocabularyJSONShape pins the wire keys `strategy -j` publishes under
+// "phases": a caller decides what --only/--skip accept from them.
+func TestPhaseVocabularyJSONShape(t *testing.T) {
+	raw, err := json.Marshal(PhaseVocabulary())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		for _, key := range []string{"canonical", "skippable", "internal", "only_accepted"} {
+			if _, ok := row[key]; !ok {
+				t.Errorf("phase %v lacks %q", row["canonical"], key)
+			}
+		}
+	}
+}
+
+// TestHarvestProbeGate: the probe rides on external-harvest, and only when a
+// later step reaches the target. A harvest-only run must stay target-silent, so
+// it must not schedule the probe (which sends requests) at all.
+func TestHarvestProbeGate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		only string
+		skip []string
+		opts types.Options
+		want bool
+	}{
+		{name: "harvest only stays silent", only: "external-harvest", want: false},
+		{name: "harvest + dynamic-assessment probes", only: "harvest,dast", want: true},
+		{name: "harvest + discovery probes", only: "harvest,discovery", want: true},
+		{name: "harvest + spidering probes", only: "harvest,spidering", want: true},
+		{name: "full scan with harvest probes", opts: types.Options{ExternalHarvestEnabled: true}, want: true},
+		{name: "--skip harvest-probe", opts: types.Options{ExternalHarvestEnabled: true}, skip: []string{"harvest-probe"}, want: false},
+		{name: "--skip harvest-check alias", opts: types.Options{ExternalHarvestEnabled: true}, skip: []string{"Harvest-Check"}, want: false},
+		{name: "no harvest, no probe", opts: types.Options{}, want: false},
+		// Heuristics and the port sweep run BEFORE the harvest; they reach the
+		// target, but nothing after the harvest does.
+		{name: "only earlier phases reach the target", only: "harvest,heuristics,port-sweep", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := tc.opts
+			opts.OnlyPhase = tc.only
+			opts.SkipPhases = tc.skip
+			if err := ApplyNativePhaseSelection(&opts, nil); err != nil {
+				t.Fatalf("ApplyNativePhaseSelection: %v", err)
+			}
+			plan := BuildNativeScanPlan(&opts)
+			if got := planStepEnabled(plan, PhaseHarvestProbe); got != tc.want {
+				t.Errorf("harvest-probe enabled = %v, want %v", got, tc.want)
+			}
+			if tc.only == "external-harvest" && plan.SendsTargetTraffic() {
+				t.Error("a harvest-only plan reports target traffic")
+			}
+		})
+	}
+}
+
+// TestHarvestProbeRunsRightAfterHarvest: the probe must precede every phase
+// that would otherwise scan an unchecked harvested URL.
+func TestHarvestProbeRunsRightAfterHarvest(t *testing.T) {
+	steps := BuildNativeScanPlan(&types.Options{}).Steps
+	for i, step := range steps {
+		if step.Phase == PhaseExternalHarvest {
+			if i+1 >= len(steps) || steps[i+1].Phase != PhaseHarvestProbe {
+				t.Fatalf("step after external-harvest is not harvest-probe")
+			}
+			return
+		}
+	}
+	t.Fatal("external-harvest missing from the plan")
 }

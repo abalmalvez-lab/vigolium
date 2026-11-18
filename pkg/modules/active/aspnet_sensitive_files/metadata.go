@@ -9,24 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Discovers ASP.NET-specific sensitive files and directories exposed on the web
-server. Covers web.config and its backups/transforms, appsettings.json files,
-connection string configs, Global.asax, App_Data/bin directories, NuGet configs,
-cross-domain policy files, and classic ASP include files.
+	ModuleDesc = `**What it means:** The server returns ASP.NET sensitive files that should never be web-accessible (web.config and .bak/.old variants, appsettings.json, connectionStrings.config, Global.asax, App_Data and bin listings, crossdomain.xml). Hits are confirmed on a 200 with expected content markers, ruling out custom error pages.
 
-## Notes
-- Runs once per unique host
-- Validates responses with content marker matching
-- Fingerprints 404 responses to avoid false positives from custom error pages
-- Anti-markers prevent false positives from HTML error pages
+**How it's exploited:** An attacker downloads these to harvest database connection strings, authentication and machine keys, and API secrets, or abuse a wildcard cross-domain policy to read authenticated responses cross-origin.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information
-- https://learn.microsoft.com/en-us/aspnet/core/fundamentals/configuration/`
+**Fix:** Block direct access to these paths and store configuration secrets outside the web root or in a secret manager.`
 
 	ModuleConfirmation = "Confirmed when sensitive file paths return 200 with expected content markers"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"aspnet", "sensitive-file", "probe", "light"}
 )

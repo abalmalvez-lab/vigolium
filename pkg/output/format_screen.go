@@ -2,12 +2,40 @@ package output
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
+
+// maxFileSuffixWidth caps the extracted-results/evidence suffix when output is
+// redirected to a file or pipe, where terminal-width truncation is skipped.
+const maxFileSuffixWidth = 500
+
+// oneLineEscaper renders embedded control characters as their literal
+// backslash-escape sequences. A CRLF pair collapses to a single \n so
+// Windows-style line breaks don't render as the noisier \r\n.
+var oneLineEscaper = strings.NewReplacer(
+	"\r\n", `\n`,
+	"\r", `\r`,
+	"\n", `\n`,
+	"\t", `\t`,
+)
+
+// EscapeOneLine renders embedded control characters (newlines, carriage
+// returns, tabs) as their literal backslash-escape sequences so a finding's
+// extracted value always prints as a single console line — while preserving
+// the visual cue that the value spanned multiple lines (e.g. a JS snippet),
+// rather than collapsing the structure away into spaces. Values without such
+// characters pass through untouched.
+func EscapeOneLine(s string) string {
+	if !strings.ContainsAny(s, "\r\n\t") {
+		return s
+	}
+	return oneLineEscaper.Replace(s)
+}
 
 // formatScreen formats the output for showing on screen.
 // Format: [template-id] [type] [severity] matched-at [extracted-results]
@@ -58,12 +86,7 @@ func (w *StandardWriter) formatScreen(output *ResultEvent) []byte {
 		prefixLen -= 3 // no "[" + "] " for module name
 	}
 	// matched-at (URL)
-	urlStr := output.Host
-	if output.Matched != "" {
-		urlStr = output.Matched
-	} else if output.URL != "" {
-		urlStr = output.URL
-	}
+	urlStr := MatchedURL(output)
 
 	// Prepend HTTP method when available
 	if output.Request != "" {
@@ -76,26 +99,37 @@ func (w *StandardWriter) formatScreen(output *ResultEvent) []byte {
 	termWidth := terminal.TerminalWidth()
 	remaining := termWidth - prefixLen
 
-	// Build suffix parts (extracted results, fuzzing parameter) first to account for their width
+	// Build suffix parts (pattern label, extracted results, fuzzing parameter)
+	// first to account for their width.
 	var suffix string
+	// A leading [pattern] bracket names the kind of match ahead of the value —
+	// e.g. secret-detect tags each finding with the credential family ("JWT",
+	// "Google API key") so the console line reads `... [JWT] [eyJ…]`.
+	if label := patternLabel(output); label != "" {
+		suffix = " [" + EscapeOneLine(label) + "]"
+	}
 	if len(output.ExtractedResults) > 0 {
-		s := &bytes.Buffer{}
-		s.WriteString(" [")
-		for i, result := range output.ExtractedResults {
-			s.WriteString(result)
-			if i < len(output.ExtractedResults)-1 {
-				s.WriteString(",")
-			}
-		}
-		s.WriteString("]")
-		suffix = s.String()
+		suffix += " [" + EscapeOneLine(strings.Join(output.ExtractedResults, ",")) + "]"
 	}
 	if output.IsFuzzingResult && output.FuzzingParameter != "" {
 		suffix += " [" + output.FuzzingParameter + "]"
 	}
+	// Hint that the finding carries extra comparison evidence (baseline,
+	// confirmation rounds). The console is the only output that doesn't show the
+	// pairs inline; the other formats (jsonl/html/markdown/UI) render them in full.
+	if n := len(output.AdditionalEvidence); n > 0 {
+		suffix += " (+" + strconv.Itoa(n) + " evidence pairs)"
+	}
 
-	// Truncate URL + suffix to fit terminal width
-	if remaining > 20 {
+	// Truncate URL + suffix to fit terminal width — but only when writing to an
+	// interactive terminal. When stdout is redirected to a file or pipe (e.g. the
+	// per-target .console.log captured by `-P` parallel scans), term.GetSize fails
+	// and TerminalWidth falls back to 150, which would clip URLs/payloads mid-token
+	// with an ellipsis. File/pipe consumers want the full URL, so the URL is never
+	// truncated there — only the evidence suffix is capped (it is unbounded:
+	// per-match snippet extractors can emit thousands of chars per finding; the
+	// full data is still in jsonl/html/DB).
+	if terminal.IsTerminal() && remaining > 20 {
 		combined := urlStr + suffix
 		if len(combined) > remaining {
 			if len(suffix) >= remaining {
@@ -106,6 +140,8 @@ func (w *StandardWriter) formatScreen(output *ResultEvent) []byte {
 				urlStr = terminal.Truncate(urlStr, remaining-len(suffix))
 			}
 		}
+	} else if !terminal.IsTerminal() {
+		suffix = terminal.Truncate(suffix, maxFileSuffixWidth)
 	}
 
 	builder.WriteString(urlStr)
@@ -114,6 +150,21 @@ func (w *StandardWriter) formatScreen(output *ResultEvent) []byte {
 	}
 
 	return builder.Bytes()
+}
+
+// patternLabel returns the optional short classification a module attaches to a
+// finding via Metadata["pattern"] — the kind of match, rendered as a leading
+// bracket before the extracted value (e.g. secret-detect's credential family
+// "JWT" / "Google API key"). Empty when the module sets no such label, so the
+// console line is unchanged for every module that doesn't opt in.
+func patternLabel(output *ResultEvent) string {
+	if output == nil || output.Metadata == nil {
+		return ""
+	}
+	if v, ok := output.Metadata["pattern"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
 }
 
 // severityColor returns ANSI color coded severity string with symbol

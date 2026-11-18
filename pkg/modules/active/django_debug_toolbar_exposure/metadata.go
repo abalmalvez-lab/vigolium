@@ -9,19 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed django-debug-toolbar endpoints. When debug toolbar is left
-enabled in production, it exposes internal application state including SQL queries,
-template context, signal handlers, cache operations, and profiling data.
+	ModuleDesc = `**What it means:** The django-debug-toolbar is reachable on what should be a production deployment, confirmed via /__debug__/ and /__debug__/render_panel/ matching toolbar markers. This development-only component surfaces internal application state and should never be live.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Fingerprints 404 responses to detect custom error pages
-- DJ-06: django-debug-toolbar detection
+**How it's exploited:** An attacker browsing these endpoints reads executed SQL queries, request and template context, settings, installed apps, and profiling data. This leaks database schema, internal paths, and dependency versions, mapping follow-on SQL injection, authentication, or configuration attacks.
 
-## References
-- https://django-debug-toolbar.readthedocs.io/`
+**Fix:** Set DEBUG=False, remove debug_toolbar from INSTALLED_APPS and its URL include in production, and restrict access via INTERNAL_IPS or the SHOW_TOOLBAR_CALLBACK.`
 
 	ModuleConfirmation = "Confirmed when debug toolbar endpoints return 200 with expected django-debug-toolbar markers"
 	ModuleSeverity     = severity.High

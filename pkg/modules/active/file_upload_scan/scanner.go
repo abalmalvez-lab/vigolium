@@ -10,6 +10,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
@@ -71,7 +72,21 @@ func (m *Module) ScanPerRequest(
 	}
 
 	marker := generateMarker()
-	probes := buildProbes(marker)
+
+	// If a collaborator is configured, mint one out-of-band host for this scan and
+	// embed it in the PHP shell / SVG probes. A callback proves the uploaded file
+	// executed or was rendered even when it is stored out of our reach — an
+	// execution proof independent of the retrieval path below. Findings for these
+	// arrive asynchronously via the OAST polling callback.
+	var oastHost string
+	if oast := scanCtx.OASTProv(); oast != nil && oast.Enabled() {
+		oastHost = modkit.OASTURLFor(oast, oastclass.CMDI, urlx.String(), "file", "file-upload code execution (command)", ModuleID, ctx.Request().ID())
+		if oastHost != "" {
+			oast.RecordPayload(oastHost, "Uploaded PHP web shell / SVG image issuing an out-of-band request on execution or render")
+		}
+	}
+
+	probes := buildProbes(marker, oastHost)
 
 	for i, probe := range probes {
 		modified, err := replaceFilePart(ctx.Request().Raw(), probe)
@@ -79,11 +94,8 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(modified))
-		if err != nil {
-			continue
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
+		// modified is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+		fuzzedReq := httpmsg.NewRequestResponseRaw(modified, ctx.Service())
 
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 		if err != nil {
@@ -111,55 +123,71 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		// Try to verify the uploaded file is accessible
-		verified, verifyBody := m.verifyUpload(ctx, httpClient, respBody, probe, marker)
+		// Strict drop-on-fail: a 2xx on the upload endpoint alone is not proof of
+		// an arbitrary file upload — many endpoints return 200/redirect even when
+		// the upload is rejected, stored out of reach, or handled by middleware.
+		// Only report when the file is independently retrievable AND echoes our
+		// unique marker (upload accepted + file fetchable + marker present), which
+		// is the actual vulnerability. Unverified candidates are dropped.
+		verified, executed, verifyBody := m.verifyUpload(ctx, httpClient, respBody, probe, marker)
+		if !verified {
+			continue
+		}
 
+		// Two confirmation outcomes with distinct impact:
+		//   - executed: the retrieved file printed the arithmetic signature, so the
+		//     server ran our code — remote code execution (Critical).
+		//   - stored:   the file is retrievable and echoes the marker verbatim, so an
+		//     arbitrary file is uploaded and served, but we did not observe execution
+		//     (High). Either way the marker/signature match is unforgeable.
+		name := "Arbitrary File Upload"
 		sev := severity.High
-		description := fmt.Sprintf("File upload accepted: %s (%s)", probe.name, probe.filename)
-		confidence := severity.Firm
-
-		if verified {
-			description = fmt.Sprintf("File upload and execution confirmed: %s (%s)", probe.name, probe.filename)
-			confidence = severity.Certain
+		desc := fmt.Sprintf("File upload and retrieval confirmed: %s (%s)", probe.name, probe.filename)
+		signal := "Verified: stored + retrievable"
+		if executed {
+			name = "Arbitrary File Upload to Remote Code Execution"
+			sev = severity.Critical
+			desc = fmt.Sprintf("Uploaded file executed server-side: %s (%s) — the retrieved file returned the computed arithmetic signature, proving code execution.", probe.name, probe.filename)
+			signal = "Verified: executed (arithmetic signature)"
 		}
 
 		results = append(results, &output.ResultEvent{
-			URL:     urlx.String(),
-			Request: string(modified),
-			Response: func() string {
-				if verified {
-					return verifyBody
-				}
-				return respBody
-			}(),
+			URL:              urlx.String(),
+			Request:          string(modified),
+			Response:         verifyBody,
 			FuzzingParameter: "file",
 			ExtractedResults: []string{
 				fmt.Sprintf("Probe: %s", probe.name),
 				fmt.Sprintf("Filename: %s", probe.filename),
-				fmt.Sprintf("Verified: %v", verified),
+				signal,
 			},
 			Info: output.Info{
-				Name:        "Arbitrary File Upload",
-				Description: description,
+				Name:        name,
+				Description: desc,
 				Severity:    sev,
-				Confidence:  confidence,
+				Confidence:  severity.Certain,
 			},
 		})
 
-		return results, nil // One finding is enough
+		return results, nil // One confirmed finding is enough
 	}
 
 	return results, nil
 }
 
-// verifyUpload attempts to access the uploaded file to confirm execution.
+// verifyUpload attempts to access the uploaded file to confirm it. It returns
+// verified (the file was retrieved and carries our marker), executed (the retrieved
+// file contained the arithmetic execution signature, i.e. the server ran the code
+// rather than serving it as text), and the retrieved body. The execution check is
+// tried first so a genuinely-executing endpoint is rated as RCE rather than a plain
+// upload.
 func (m *Module) verifyUpload(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	uploadResponse string,
 	probe uploadProbe,
 	marker string,
-) (bool, string) {
+) (verified, executed bool, body string) {
 	// Try to extract upload path from response
 	uploadPath := extractUploadPath(uploadResponse)
 
@@ -173,18 +201,22 @@ func (m *Module) verifyUpload(
 		pathsToTry = append(pathsToTry, dir+probe.filename)
 	}
 
+	execSig := markerExecSignature(marker)
 	for _, path := range pathsToTry {
-		body, err := m.fetchPath(ctx, httpClient, path)
+		fetched, err := m.fetchPath(ctx, httpClient, path)
 		if err != nil {
 			continue
 		}
 
-		if strings.Contains(body, marker) {
-			return true, body
+		if strings.Contains(fetched, execSig) {
+			return true, true, fetched // interpreter ran the code -> RCE
+		}
+		if strings.Contains(fetched, marker) {
+			return true, false, fetched // stored + retrievable, execution not observed
 		}
 	}
 
-	return false, ""
+	return false, false, ""
 }
 
 // fetchPath sends a GET request to the specified path.
@@ -209,11 +241,8 @@ func (m *Module) fetchPath(
 		return "", err
 	}
 
-	getReq, err := httpmsg.ParseRawRequest(string(modified))
-	if err != nil {
-		return "", err
-	}
-	getReq = getReq.WithService(ctx.Service())
+	// modified is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	getReq := httpmsg.NewRequestResponseRaw(modified, ctx.Service())
 
 	resp, _, err := httpClient.Execute(getReq, http.Options{})
 	if err != nil {

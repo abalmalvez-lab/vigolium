@@ -9,18 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies GraphQL endpoints by matching common GraphQL paths
-(/graphql, /v1/graphql, /api/graphql) and inspecting JSON responses for
-GraphQL-specific shapes ("data", "errors" arrays with locations).
+	ModuleDesc = `**What it means:** A GraphQL API endpoint was identified, from a known path (/graphql, /api/graphql, /graphiql, /playground) or a JSON response carrying the GraphQL errors array. An informational fingerprint that pinpoints a sensitive part of the API attack surface.
 
-## Signals
-- URL path matches a known GraphQL endpoint pattern
-- Response body contains a top-level {"data": …} or {"errors": [{"message": …, "locations": [...]}]} shape
+**How it's exploited:** Knowing the endpoint exists lets an attacker focus on GraphQL-specific attacks: introspection to dump the schema, nested or batched queries for denial of service, aliasing to bypass rate limits, and probing resolvers for injection.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Publishes "graphql" to the tech registry so graphql-tagged active modules run`
+**Fix:** Restrict or remove unauthenticated GraphQL IDEs, disable introspection in production, and enforce authentication plus query depth and cost limits.`
 
 	ModuleConfirmation = "Confirmed when a GraphQL endpoint path or response body shape is observed"
 	ModuleSeverity     = severity.Info

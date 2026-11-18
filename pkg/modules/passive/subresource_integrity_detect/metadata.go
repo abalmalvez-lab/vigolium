@@ -5,27 +5,18 @@ import "github.com/vigolium/vigolium/pkg/types/severity"
 const (
 	ModuleID    = "subresource-integrity-detect"
 	ModuleName  = "Subresource Integrity Detect"
-	ModuleShort = "Detects external resources loaded without subresource integrity"
+	ModuleShort = "Observes truly cross-origin scripts and stylesheets without valid SRI"
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects external scripts and stylesheets loaded without Subresource
-Integrity (SRI) attributes. Missing SRI allows compromised CDNs or third-party
-hosts to inject malicious code.
+	ModuleDesc = `**What it means:** A truly cross-origin script or stylesheet lacks a valid Subresource Integrity digest. This is a supply-chain hardening observation, not evidence that the provider is compromised; mutable resources may intentionally omit SRI.
 
-## Notes
-- Scans HTML response bodies for script and link tags referencing external origins
-- Flags external resources (http://, https://, //) that lack an integrity attribute
-- Skips inline scripts, same-origin resources, and data: URIs
-- Deduplicates by host+path
+**How it's exploited:** If the third-party asset or delivery path is compromised, malicious code can execute in the page's origin without an integrity check.
 
-## References
-- https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity
-- https://www.w3.org/TR/SRI/`
+**Fix:** Pin immutable external assets with SHA-256/384/512 integrity and crossorigin attributes, or self-host them.`
 
-	ModuleConfirmation = "Confirmed when external script or stylesheet is loaded without an integrity attribute"
-	ModuleSeverity     = severity.Low
+	ModuleConfirmation = "Observed when a truly cross-origin executable script or stylesheet lacks a valid sha256/sha384/sha512 integrity digest"
+	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Certain
-	ModuleTags         = []string{"header-security", "javascript", "light"}
+	ModuleTags         = []string{"header-security", "javascript", "hygiene", "light"}
 )

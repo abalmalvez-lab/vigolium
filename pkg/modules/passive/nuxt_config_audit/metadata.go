@@ -9,28 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans response bodies for insecure Nuxt.js configuration patterns and sensitive data leaked
-through Nuxt state blobs. Detects exposed __NUXT__ and __NUXT_DATA__ state in HTML, checks
-for sensitive data patterns (API keys, tokens, internal URLs) within Nuxt state, and identifies
-dangerous configuration options such as enabled devtools, exposed runtime secrets, production
-source maps, and debug mode.
+	ModuleDesc = `**What it means:** Nuxt client state or source contains security-relevant values and configuration. Routine role data, public identifiers, internal addresses, config flags, and source-map references are observations. Substantive private credentials in state are candidates.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects: __NUXT__ / __NUXT_DATA__ state blobs in HTML
-- Scans Nuxt state for API keys, tokens, admin flags, internal IPs
-- Checks config patterns: devtools, runtimeConfig secrets, productionSourceMap, debug
-- Also detects /_nuxt/ source map exposure
-- Deduplicates by host
+**How it's exploited:** Anyone who loads the page reads the disclosed values. Leaked keys, tokens, or database URLs are reused against backends; internal IPs map the network; source maps reconstruct the original source.
 
-## References
-- https://nuxt.com/docs/guide/directory-structure/nuxt-config
-- https://nuxt.com/docs/api/nuxt-config#runtimeconfig
-- https://cwe.mitre.org/data/definitions/540.html
-- https://cwe.mitre.org/data/definitions/200.html`
+**Fix:** Keep secrets in server-only runtimeConfig, never in public state; disable devtools, debug, and production source maps.`
 
-	ModuleConfirmation = "Confirmed when insecure configuration patterns or sensitive data are found in Nuxt state or config"
+	ModuleConfirmation = "Candidate for substantive private credentials in Nuxt state; config strings and source-map references remain observations until runtime access or sensitive content is verified"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"nuxt", "javascript", "misconfiguration", "light"}

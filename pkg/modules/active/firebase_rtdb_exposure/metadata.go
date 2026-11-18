@@ -9,25 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Extracts Firebase Realtime Database URLs from crawled responses and probes
-them for public read access. Tests root-level access and common subpaths
-that often contain sensitive data.
+	ModuleDesc = `**What it means:** An isolated credential-free client reproducibly read a non-empty JSON object or array from a referenced Firebase Realtime Database. Public read alone is a candidate because some datasets are intentionally public.
 
-## Notes
-- Extracts databaseURL from Firebase config in HTML/JS responses
-- Probes root with shallow=true for efficient detection
-- Tests common subpaths: users, config, admin, tokens, etc.
-- Non-destructive: all probes are read-only GET requests
-- Scans leaked data for embedded secrets (JWT, API keys)
-- Deduplicates by database URL to avoid redundant probing
+**How it's exploited:** The result becomes a finding only when returned values include sensitive fields or private credential formats. A shallow list of keys is not full-data exposure, Google client API keys are not secrets, and write access is never inferred.
 
-## References
-- https://firebase.google.com/docs/database/rest/start
-- https://firebase.google.com/docs/database/security`
+**Fix:** Set security rules so reads and writes require authentication and authorization instead of public access, and rotate any exposed secrets.`
 
-	ModuleConfirmation = "Confirmed when Firebase RTDB REST endpoint returns HTTP 200 with JSON data instead of permission denied"
-	ModuleSeverity     = severity.Critical
+	ModuleConfirmation = "Candidate requires two credential-free non-empty structured JSON reads; finding additionally requires substantive sensitive fields or private-credential evidence"
+	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Certain
 	ModuleTags         = []string{"firebase", "info-disclosure", "moderate"}
 )

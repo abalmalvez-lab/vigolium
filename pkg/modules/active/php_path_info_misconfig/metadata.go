@@ -9,24 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for PHP-FPM/CGI PATH_INFO routing misconfiguration (cgi.fix_pathinfo=1)
-where requests to non-existent PHP scripts with PATH_INFO are routed to a
-different script. This can enable authorization bypass or unintended script
-execution by appending arbitrary paths to valid PHP endpoints.
+	ModuleDesc = `**What it means:** The server runs PHP with cgi.fix_pathinfo=1, so requests like /index.php/anything/here pass the trailing PATH_INFO to a real script instead of being rejected. The scanner confirmed a valid 200 differing from the 404 fingerprint and a catch-all control.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Sends requests to deliberately invalid script paths
-- Compares responses to establish if PATH_INFO rewriting is active
-- Low false positive rate due to multi-step validation
+**How it's exploited:** An attacker appends arbitrary segments to a valid endpoint (for example /index.php/admin) to slip past path-based access controls, WAF rules, or routing checks, and on classic Nginx-plus-PHP-FPM setups can coerce an uploaded file to execute.
 
-## References
-- https://www.nginx.com/resources/wiki/start/topics/tutorials/config_pitfalls/#passing-uncontrolled-requests-to-php
-- https://www.php.net/manual/en/ini.core.php#ini.cgi.fix-pathinfo
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Set cgi.fix_pathinfo=0 so only existing .php files reach the handler.`
 
-	ModuleConfirmation = "Confirmed when requests to non-existent PHP scripts with PATH_INFO return valid responses instead of 404"
+	ModuleConfirmation = "Confirmed when PATH_INFO requests return a valid 200 that differs from both the random-path 404 fingerprint and a random script-shaped catch-all control, ruling out blanket SPA/rewrite handlers that serve a generic body for any path"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"php", "misconfiguration", "light"}

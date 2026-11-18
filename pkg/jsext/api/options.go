@@ -22,9 +22,12 @@ type APIOptions struct {
 	ProjectUUID  string
 
 	// Security controls (from extensions config)
-	AllowExec   bool   // gate for exec() and setEnv(); default false
-	SandboxDir  string // base path for file ops; empty = cwd
-	ExecTimeout int    // max seconds for exec(); default 30, cap 120
+	AllowExec  bool   // gate for exec() and setEnv(); default false
+	SandboxDir string // base path for file ops; empty = cwd
+	// AllowOutOfScope lets vigolium.http.* reach hosts the scope matcher
+	// refuses (extensions.allow_out_of_scope).
+	AllowOutOfScope bool
+	ExecTimeout     int // max seconds for exec(); default 30, cap 120
 
 	// Finding emitter for hooks that want to create findings
 	FindingEmitter func(*output.ResultEvent)
@@ -37,4 +40,11 @@ type APIOptions struct {
 
 	// OASTService enables vigolium.oast.* API (nil = disabled)
 	OASTService *oast.Service
+
+	// Mode selects runtime wiring (the default) or load/lint wiring, where
+	// every non-pure handler is a recording stub. See Mode.
+	Mode Mode
+	// OnLoadEffect receives each stubbed effectful call in ModeLoad. Nil
+	// discards them.
+	OnLoadEffect func(EffectCall)
 }

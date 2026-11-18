@@ -9,23 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Joomla installations from HTML responses. Detects Joomla
-via generator meta tags, /administrator/ links, /media/com_* and /components/com_*
-asset paths, and Joomla-specific JavaScript objects. Enumerates installed
-extensions (components, modules, plugins) from URL patterns. Distinguishes
-Joomla 4+ by /api/index.php references.
+	ModuleDesc = `**What it means:** The target runs the Joomla CMS, identified from the generator meta tag, /media/system/js/ and com_* asset paths, or the Joomla 4+ JS API. The check reports the major generation and enumerates installed components, modules, and plugins. Informational recon, not a vulnerability.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects Joomla via generator meta tag, /media/system/js/ paths, com_* references
-- Enumerates extensions from /components/com_*, /media/com_*, /modules/mod_* paths
-- Detects Joomla 4+ via /api/index.php references
-- Deduplicates by host
+**How it's exploited:** An attacker uses the disclosed version and extensions to map the surface and look up version-specific CVEs - third-party Joomla extensions are a common source of SQLi, LFI, and RCE.
 
-## References
-- https://docs.joomla.org/
-- https://developer.joomla.org/security-centre.html`
+**Fix:** Keep Joomla core and every extension patched, remove unused ones, and consider suppressing the generator meta tag.`
 
 	ModuleConfirmation = "Confirmed when Joomla-specific asset paths, headers, or meta tags are detected in the response"
 	ModuleSeverity     = severity.Info

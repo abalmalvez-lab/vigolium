@@ -39,6 +39,24 @@ func IsRetryable(err error) bool {
 		return false
 	}
 
+	// A refused request is a policy decision, not a transport failure. Checked
+	// FIRST, and before any unwrapping, because the *url.Error net/http wraps it in
+	// satisfies net.Error — so the generic network-error arm below would otherwise
+	// report an operator exclusion as retryable, retry it, and feed it to the
+	// engine's NetworkErrorTracker as if the host were flapping.
+	if errors.Is(err, ErrRequestFiltered) {
+		return false
+	}
+
+	// An error that states its own retryability wins over the shape checks
+	// below: a caller's egress gate refusing a request (quarantined host, a slot
+	// wait that timed out) sent nothing, and its cause can still look like a
+	// net.Error (context.DeadlineExceeded is one).
+	var stated interface{ Retryable() bool }
+	if errors.As(err, &stated) {
+		return stated.Retryable()
+	}
+
 	// Unwrap RequestError to get underlying error
 	var reqErr *RequestError
 	if errors.As(err, &reqErr) {

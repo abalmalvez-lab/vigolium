@@ -9,22 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Local File Inclusion vulnerabilities using advanced path traversal techniques
-including null byte injection, double URL encoding, Unicode bypass characters, and
-multi-marker confirmation to reduce false positives.
+	ModuleDesc = `**What it means:** A parameter naming a file or path lets an attacker escape the intended directory and read arbitrary server files (Local File Inclusion / path traversal). Confirmed when real OS file contents (/etc/passwd, win.ini) appear in the response but not the baseline.
 
-## Notes
-- Complements lfi_generic with deeper traversal payloads and stronger confirmation
-- Requires at least 2 markers to match in fuzzed response (not present in baseline)
-- Body length delta check prevents matching on trivially similar responses
-- Pre-filters insertion points by file-like parameter names and path-like values
+**How it's exploited:** An attacker supplies ../../../../etc/passwd, optionally with encoding tricks to defeat filters, exposing credentials and secrets (.env, .git) and reaching RCE when included content is executed.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/11.1-Testing_for_Local_File_Inclusion
-- https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/File%20Inclusion`
+**Fix:** Never pass user input into filesystem paths; use a fixed allow-list, reject traversal and absolute paths, and confirm the resolved path stays inside the base directory.`
 
-	ModuleConfirmation = "Confirmed when multiple file content markers appear in the response after injecting path traversal payloads and are absent from the baseline response"
+	ModuleConfirmation = "Confirmed when a served (non-blocked, 2xx/3xx) response carries the targeted file's real structural content — a passwd account line, a bracketed win.ini section, an anchored nginx/apache directive — that is absent from the baseline. WAF/CDN block pages, challenge interstitials, and 4xx/5xx errors are rejected before matching."
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"lfi", "injection", "heavy"}

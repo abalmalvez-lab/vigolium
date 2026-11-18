@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -12,6 +10,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/terminal"
+	"github.com/vigolium/vigolium/pkg/vulnclass"
 )
 
 var moduleOpts = &moduleOptions{}
@@ -30,12 +29,12 @@ var moduleCmd = &cobra.Command{
 	Short:   "Manage scanner modules",
 	Long:    "List, enable, and disable built-in scanner modules. Running 'vigolium module [search]' is a shortcut for 'module ls [search]'. Use 'enable' / 'disable' subcommands to toggle modules in the active configuration.",
 	Args:    cobra.MaximumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		filter := ""
 		if len(args) > 0 {
 			filter = args[0]
 		}
-		printModuleTable(moduleOpts, filter)
+		return printModuleTable(cmd, moduleOpts, filter)
 	},
 }
 
@@ -46,18 +45,25 @@ var moduleLsCmd = &cobra.Command{
 	Short:   "List available modules",
 	Long:    "Print a table of every registered active or passive module, grouped by scan scope. Filter by substring on id/name/description/tag, or by --type (active|passive). Use --list-enabled to show only enabled modules, --tags to dump unique tags, and -v for full descriptions and confirmation criteria.",
 	Args:    cobra.MaximumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		filter := ""
 		if len(args) > 0 {
 			filter = args[0]
 		}
-		printModuleTable(moduleOpts, filter)
+		return printModuleTable(cmd, moduleOpts, filter)
 	},
 }
+
+// listModulesShortcut runs the root -M/--list-modules shortcut as `module ls`.
+// A variable assigned in init, because the root command's own literal calling
+// printModuleTable would be an initialization cycle (the envelope resolves
+// command paths through rootCmd).
+var listModulesShortcut func() error
 
 func init() {
 	rootCmd.AddCommand(moduleCmd)
 	moduleCmd.AddCommand(moduleLsCmd)
+	listModulesShortcut = func() error { return printModuleTable(moduleLsCmd, moduleOpts, "") }
 
 	for _, cmd := range []*cobra.Command{moduleCmd, moduleLsCmd} {
 		cmd.Flags().StringVar(&moduleOpts.ModuleType, "type", "all",
@@ -67,7 +73,7 @@ func init() {
 		cmd.Flags().BoolVarP(&moduleOpts.Verbose, "verbose", "v", false,
 			"Show long description and confirmation criteria")
 		cmd.Flags().BoolVar(&moduleOpts.TagsOnly, "tags", false,
-			"Show only unique module tags")
+			"Show only unique module tags, with how many modules carry each (rows {tag, modules} under -j)")
 	}
 }
 
@@ -91,31 +97,11 @@ func moduleMatchesFilter(m modules.Module, filter string) bool {
 	return false
 }
 
-// loadEnabledModulesConfig loads the enabled_modules section from the config file.
-// Returns defaults (all enabled) on any error.
+// loadEnabledModulesConfig loads the enabled_modules section from the config
+// file. Falls back to defaults (all enabled) on any error, with one warning —
+// see settingsOrDefaults for why this one cannot simply fail.
 func loadEnabledModulesConfig() *config.EnabledModulesConfig {
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		return config.DefaultEnabledModulesConfig()
-	}
-	return &settings.DynamicAssessment.EnabledModules
-}
-
-// isModuleEnabled checks whether a module ID is enabled given a list from config.
-// An empty list or ["all"] means every module is enabled.
-func isModuleEnabled(moduleID string, configList []string) bool {
-	if len(configList) == 0 {
-		return true
-	}
-	if len(configList) == 1 && configList[0] == "all" {
-		return true
-	}
-	for _, id := range configList {
-		if id == moduleID {
-			return true
-		}
-	}
-	return false
+	return &settingsOrDefaults().DynamicAssessment.EnabledModules
 }
 
 // moduleRow holds display data for a single module in the table.
@@ -162,20 +148,21 @@ func modulePrimaryScope(m modules.Module) modules.ScanScope {
 	return 0
 }
 
-func printModuleTable(opts *moduleOptions, filter string) {
+// printModuleTable renders the module list. cmd names the command in the -j
+// envelope; the -M/--list-modules shortcut passes moduleLsCmd, whose list it is.
+func printModuleTable(cmd *cobra.Command, opts *moduleOptions, filter string) error {
 	if globalJSON {
-		printModuleJSON(opts, filter)
-		return
+		return printModuleJSON(cmd, opts, filter)
 	}
 
 	if opts.TagsOnly {
 		printModuleTags(opts, filter)
-		return
+		return nil
 	}
 
 	if opts.Verbose {
 		printModuleVerbose(opts, filter)
-		return
+		return nil
 	}
 
 	emCfg := loadEnabledModulesConfig()
@@ -190,7 +177,7 @@ func printModuleTable(opts *moduleOptions, filter string) {
 			if !moduleMatchesFilter(m, filter) {
 				continue
 			}
-			enabled := isModuleEnabled(m.ID(), emCfg.ActiveModules)
+			enabled := emCfg.ActiveEnabled(m.ID())
 			if opts.ListEnabled && !enabled {
 				continue
 			}
@@ -226,7 +213,7 @@ func printModuleTable(opts *moduleOptions, filter string) {
 			if !moduleMatchesFilter(m, filter) {
 				continue
 			}
-			enabled := isModuleEnabled(m.ID(), emCfg.PassiveModules)
+			enabled := emCfg.PassiveEnabled(m.ID())
 			if opts.ListEnabled && !enabled {
 				continue
 			}
@@ -272,6 +259,7 @@ func printModuleTable(opts *moduleOptions, filter string) {
 	printScopedGroups("Passive Modules", passiveGroups, terminal.BoldBlue)
 
 	printModuleFooter()
+	return nil
 }
 
 func printScopedGroups(title string, groups []moduleScopeGroup, colorFn func(string) string) {
@@ -303,9 +291,11 @@ func printModuleFooter() {
 	fmt.Printf("%s Filter by tag: %s\n",
 		terminal.InfoSymbol(),
 		terminal.Gray("vigolium scan --module-tag spring --module-tag injection"))
+	// The same resolution `module enable/disable` writes through, so the file
+	// this names under --config is the file an edit would land in.
 	fmt.Printf("%s Configure enabled modules in: %s\n",
 		terminal.InfoSymbol(),
-		terminal.Gray(config.ConfigFilePath()))
+		terminal.Gray(effectiveConfigPath()))
 	fmt.Printf("%s Module docs: %s\n",
 		terminal.InfoSymbol(),
 		terminal.Gray("https://docs.vigolium.com"))
@@ -323,11 +313,58 @@ type moduleJSONEntry struct {
 	ScanScope            []string `json:"scan_scope"`
 	Tags                 []string `json:"tags"`
 	Enabled              bool     `json:"enabled"`
+	// Tier is the intensity tier the module's tags declare: light, moderate,
+	// heavy or intrusive, or "none" (no tier tag: it runs at every intensity).
+	Tier string `json:"tier"`
+	// RiskHigh: the module carries risk:high (its probes can change server
+	// state); a broad selection drops it below --intensity deep unless
+	// --allow-risky-payloads is set.
+	RiskHigh bool `json:"risk_high"`
+	// VulnClass is the module's reported class (pkg/vulnclass), the value its
+	// findings carry as vuln_class; "multiple" when its findings span classes
+	// and each names its own; absent for a module with no declaration.
+	VulnClass string `json:"vuln_class,omitempty"`
 }
 
-func printModuleJSON(opts *moduleOptions, filter string) {
+// newModuleJSONEntry is the -j row of one module.
+func newModuleJSONEntry(m modules.Module, typ string, enabled bool) moduleJSONEntry {
+	tags := m.Tags()
+	return moduleJSONEntry{
+		ID:                   m.ID(),
+		Name:                 m.Name(),
+		Type:                 typ,
+		Description:          m.Description(),
+		ShortDescription:     m.ShortDescription(),
+		ConfirmationCriteria: m.ConfirmationCriteria(),
+		Severity:             m.Severity().String(),
+		Confidence:           m.Confidence().String(),
+		ScanScope:            scanScopeNames(m.ScanScopes()),
+		Tags:                 tags,
+		Enabled:              enabled,
+		Tier:                 modules.ModuleTierName(tags),
+		RiskHigh:             modules.IsRiskHighModule(tags),
+		VulnClass:            string(vulnclass.ForModule(m.ID())),
+	}
+}
+
+// moduleTagRow is one row of `module ls -j --tags`.
+type moduleTagRow struct {
+	Tag     string `json:"tag"`
+	Modules int    `json:"modules"`
+}
+
+func printModuleJSON(cmd *cobra.Command, opts *moduleOptions, filter string) error {
+	if opts.TagsOnly {
+		counts := moduleTagCounts(opts, filter)
+		rows := make([]moduleTagRow, 0, len(counts))
+		for tag, n := range counts {
+			rows = append(rows, moduleTagRow{Tag: tag, Modules: n})
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].Tag < rows[j].Tag })
+		return emitRead(cmd, "tags", rows, int64(len(rows)), 0, len(rows))
+	}
 	emCfg := loadEnabledModulesConfig()
-	var entries []moduleJSONEntry
+	entries := []moduleJSONEntry{}
 	var activeCount, passiveCount int
 
 	if opts.ModuleType == "all" || opts.ModuleType == "active" {
@@ -335,24 +372,12 @@ func printModuleJSON(opts *moduleOptions, filter string) {
 			if !moduleMatchesFilter(m, filter) {
 				continue
 			}
-			enabled := isModuleEnabled(m.ID(), emCfg.ActiveModules)
+			enabled := emCfg.ActiveEnabled(m.ID())
 			if opts.ListEnabled && !enabled {
 				continue
 			}
 			activeCount++
-			entries = append(entries, moduleJSONEntry{
-				ID:                   m.ID(),
-				Name:                 m.Name(),
-				Type:                 "active",
-				Description:          m.Description(),
-				ShortDescription:     m.ShortDescription(),
-				ConfirmationCriteria: m.ConfirmationCriteria(),
-				Severity:             m.Severity().String(),
-				Confidence:           m.Confidence().String(),
-				ScanScope:            scanScopeNames(m.ScanScopes()),
-				Tags:                 m.Tags(),
-				Enabled:              enabled,
-			})
+			entries = append(entries, newModuleJSONEntry(m, "active", enabled))
 		}
 	}
 
@@ -361,36 +386,20 @@ func printModuleJSON(opts *moduleOptions, filter string) {
 			if !moduleMatchesFilter(m, filter) {
 				continue
 			}
-			enabled := isModuleEnabled(m.ID(), emCfg.PassiveModules)
+			enabled := emCfg.PassiveEnabled(m.ID())
 			if opts.ListEnabled && !enabled {
 				continue
 			}
 			passiveCount++
-			entries = append(entries, moduleJSONEntry{
-				ID:                   m.ID(),
-				Name:                 m.Name(),
-				Type:                 "passive",
-				Description:          m.Description(),
-				ShortDescription:     m.ShortDescription(),
-				ConfirmationCriteria: m.ConfirmationCriteria(),
-				Severity:             m.Severity().String(),
-				Confidence:           m.Confidence().String(),
-				ScanScope:            scanScopeNames(m.ScanScopes()),
-				Tags:                 m.Tags(),
-				Enabled:              enabled,
-			})
+			entries = append(entries, newModuleJSONEntry(m, "passive", enabled))
 		}
 	}
 
-	out := map[string]interface{}{
-		"modules":       entries,
-		"total":         len(entries),
-		"active_count":  activeCount,
-		"passive_count": passiveCount,
-	}
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	_ = encoder.Encode(out)
+	// The rows are `items` (legacy alias `modules`); the per-type counts stay at
+	// the top level under their old names.
+	return emitRead(cmd, "modules", entries, int64(len(entries)), 0, len(entries),
+		withExtra("active_count", activeCount),
+		withExtra("passive_count", passiveCount))
 }
 
 // formatTags joins tags with commas for table display.
@@ -416,9 +425,9 @@ func scanScopeNames(s modkit.ScanScope) []string {
 	return names
 }
 
-func printModuleTags(opts *moduleOptions, filter string) {
+// moduleTagCounts counts, per tag, the modules the type and name filters keep.
+func moduleTagCounts(opts *moduleOptions, filter string) map[string]int {
 	tagCounts := make(map[string]int)
-
 	if opts.ModuleType == "all" || opts.ModuleType == "active" {
 		for _, m := range modules.GetActiveModules() {
 			if !moduleMatchesFilter(m, filter) {
@@ -439,6 +448,11 @@ func printModuleTags(opts *moduleOptions, filter string) {
 			}
 		}
 	}
+	return tagCounts
+}
+
+func printModuleTags(opts *moduleOptions, filter string) {
+	tagCounts := moduleTagCounts(opts, filter)
 
 	if len(tagCounts) == 0 {
 		fmt.Printf("%s No tags found.\n", terminal.InfoSymbol())
@@ -490,7 +504,7 @@ func printModuleVerbose(opts *moduleOptions, filter string) {
 			if !moduleMatchesFilter(m, filter) {
 				continue
 			}
-			enabled := isModuleEnabled(m.ID(), emCfg.ActiveModules)
+			enabled := emCfg.ActiveEnabled(m.ID())
 			if opts.ListEnabled && !enabled {
 				continue
 			}
@@ -510,7 +524,7 @@ func printModuleVerbose(opts *moduleOptions, filter string) {
 			if !moduleMatchesFilter(m, filter) {
 				continue
 			}
-			enabled := isModuleEnabled(m.ID(), emCfg.PassiveModules)
+			enabled := emCfg.PassiveEnabled(m.ID())
 			if opts.ListEnabled && !enabled {
 				continue
 			}

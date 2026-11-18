@@ -12,11 +12,23 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9002/api/diagnostics 
 
 ```json
 {
-  "status": "degraded",
-  "timestamp": "2026-03-29T03:40:08+08:00",
+  "status": "ready",
+  "timestamp": "2026-07-14T23:46:20+08:00",
   "database": {
     "status": "ok",
-    "message": "driver=sqlite"
+    "message": "driver=sqlite, schema=ok"
+  },
+  "scope": {
+    "status": "ok",
+    "message": "scope rules valid"
+  },
+  "oast": {
+    "status": "ok",
+    "message": "interactsh server oast.pro (not probed)"
+  },
+  "initialized": {
+    "status": "ok",
+    "message": "path=~/.vigolium/initialized, version=v0.3.2"
   },
   "queue": {
     "status": "ok",
@@ -24,37 +36,59 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:9002/api/diagnostics 
   },
   "agent": {
     "status": "ok",
-    "name": "claude",
-    "binary": "/opt/homebrew/bin/claude",
-    "protocol": "sdk"
+    "name": "olium",
+    "protocol": "openai-compatible"
   },
   "browser": {
-    "status": "warning",
-    "message": "disabled in config"
+    "status": "ok",
+    "message": "/opt/homebrew/bin/agent-browser"
+  },
+  "embedded_binaries": {
+    "jstangle": { "status": "ok", "message": "protocol=v2, probe=ok" },
+    "vigolium-audit": { "status": "ok", "message": "runtime=darwin/arm64, list=ok" }
+  },
+  "audit": {
+    "status": "ok",
+    "message": "mode=balanced, embedded binary ok"
+  },
+  "piolium": {
+    "status": "ok",
+    "message": "pi + piolium extension loaded"
   },
   "tools": {
     "chromium": {
       "status": "ok",
       "path": "/opt/homebrew/bin/chromium"
-    }
+    },
+    "claude": { "status": "ok", "path": "/usr/local/bin/claude" },
+    "codex": { "status": "ok", "path": "/usr/local/bin/codex" },
+    "pi": { "status": "ok", "path": "/usr/local/bin/pi" }
   },
   "templates_dir": {
     "status": "ok",
-    "message": "path=~/.vigolium/prompts, templates=38"
+    "message": "path=~/.vigolium/prompts, templates=29"
   },
   "sessions_dir": {
     "status": "ok",
     "message": "path=~/.vigolium/agent-sessions, writable=true"
+  },
+  "nuclei_templates": {
+    "status": "ok",
+    "message": "path=~/nuclei-templates"
   }
 }
 ```
+
+Fields whose integration is disabled may be omitted. `details` and `tip`
+arrays/strings provide diagnostic evidence and remediation guidance when
+available.
 
 ### Top-Level Status
 
 | Value | Meaning |
 |---|---|
 | `ready` | All checks passed |
-| `degraded` | Some non-critical checks failed (e.g., optional tool missing, browser disabled) |
+| `degraded` | Some non-critical checks failed (e.g., optional tool missing, browser disabled, a scope rule with an error-level issue) |
 | `not_ready` | Critical checks failed (database or agent unavailable) |
 
 ### Check Statuses
@@ -66,12 +100,18 @@ Each individual check returns one of: `ok`, `warning`, `error`.
 | Check | Critical | Description |
 |---|---|---|
 | `database` | Yes | Pings the database with a 2s timeout |
+| `initialized` | No | Reports the first-run initialization marker and version |
+| `scope` | No (an error degrades) | Runs the shared scope validator (`vigolium config validate`); errors make the verdict `degraded`, warnings do not |
+| `oast` | No | OAST callback readiness. A fixed `oast_url` is ok; interactsh is resolved and TLS-connected (3s, no registration) only by the CLI doctor; the server endpoint never probes the network |
 | `agent` | Yes | Resolves the configured olium provider and confirms credentials are available |
 | `queue` | No | Reports queue depth and error counts |
 | `browser` | No | Checks `agent-browser` binary if enabled in config |
-| `tools.chromium` | No | Checks for chromium/chrome binary (fallbacks: `chromium-browser`, `google-chrome`, `google-chrome-stable`) |
+| `embedded_binaries` | No | Probes embedded JSTangle and Vigolium Audit runtimes |
+| `audit` / `piolium` | No | Checks the configured Audit path and Piolium extension |
+| `tools.*` | No | Resolves Chromium, agent-browser, Claude, Codex, Pi, Bun, and npm |
 | `templates_dir` | No | Verifies prompt templates directory exists and contains `.md` files |
 | `sessions_dir` | No | Verifies agent sessions directory exists and is writable |
+| `nuclei_templates` | No | Verifies the configured Nuclei template directory |
 
 ### CLI Equivalent
 
@@ -86,3 +126,7 @@ vigolium doctor --json
 ```
 
 The CLI version omits the `queue` check since the queue is only available when the server is running.
+
+`vigolium doctor` exits 1 with `error.code: not_ready` when the verdict is
+`not_ready`, and with `--strict` also when it is `degraded`. The report is
+written to stdout first either way.

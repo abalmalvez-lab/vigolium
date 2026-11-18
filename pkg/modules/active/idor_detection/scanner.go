@@ -79,15 +79,6 @@ func (m *Module) ScanPerInsertionPoint(
 		}
 	}
 
-	// Per-host rate limit
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil {
-		hostKey := utils.Sha1(urlx.Host)
-		if _, ok := diskSet.IncrementAndCheck(hostKey, maxProbesPerHost); !ok {
-			return nil, nil
-		}
-	}
-
 	// Classify the parameter
 	isPathParam := ip.Type() == httpmsg.INS_URL_PATH_FOLDER || ip.Type() == httpmsg.INS_URL_PATH_FILENAME
 	pathSegments := strings.Split(urlx.Path, "/")
@@ -101,6 +92,17 @@ func (m *Module) ScanPerInsertionPoint(
 	neighbors := authzutil.GenerateNeighborIDs(ip.BaseValue(), classification.IDType, 3)
 	if len(neighbors) == 0 {
 		return nil, nil
+	}
+
+	// Per-host budget, charged only for a point that is actually going to be
+	// probed: an object ID with neighbours. Charging before classification spent
+	// the whole budget on the first maxProbesPerHost parameters of any kind, and
+	// the real id parameters after them were never tested.
+	if diskSet := m.ds.Get(scanCtx.DedupMgr()); diskSet != nil {
+		hostKey := utils.Sha1(urlx.Host)
+		if _, ok := diskSet.IncrementAndCheck(hostKey, maxProbesPerHost); !ok {
+			return nil, nil
+		}
 	}
 
 	// Get baseline response
@@ -123,7 +125,7 @@ func (m *Module) ScanPerInsertionPoint(
 
 	// Probe each neighbor
 	for _, neighborID := range neighbors {
-		result, err := m.probeNeighbor(ctx, ip, neighborID, httpClient, baseline, compareOpts, host, urlStr, classification)
+		result, err := m.probeNeighbor(ctx, ip, neighborID, httpClient, scanCtx, baseline, compareOpts, host, urlStr, classification)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return nil, nil
@@ -143,6 +145,11 @@ type baselineSummary struct {
 	StatusCode int
 	BodyLength int
 	Summary    *authzutil.ResponseSummary
+	// Request/Response are the captured original-id baseline pair, attached to
+	// the finding's AdditionalEvidence at emit time. May be empty when the
+	// baseline came from a source without a raw response.
+	Request  string
+	Response string
 }
 
 // getBaseline obtains a baseline response to compare against probes.
@@ -154,6 +161,14 @@ func (m *Module) getBaseline(
 	// Prefer the existing response if available
 	if ctx.HasResponse() {
 		resp := ctx.Response()
+		// A baseline that is a vendor WAF/CDN edge block is not the object's real
+		// response. The caller's 2xx-baseline gate already drops a 403/429 block, but
+		// a challenge served at 200 (Cf-Mitigated) would slip through and, if the
+		// determinism re-fetch cannot run (connection reset), be reported as an IDOR.
+		// A challenge page is never a genuine per-object baseline, so drop it.
+		if modkit.IsEdgeBlockedResponse(resp) {
+			return nil, nil
+		}
 		body := resp.Body()
 		summary := authzutil.SummarizeResponse(
 			resp.StatusCode(),
@@ -164,6 +179,8 @@ func (m *Module) getBaseline(
 			StatusCode: resp.StatusCode(),
 			BodyLength: len(body),
 			Summary:    summary,
+			Request:    string(ctx.Request().Raw()),
+			Response:   string(resp.Raw()),
 		}, nil
 	}
 
@@ -173,6 +190,10 @@ func (m *Module) getBaseline(
 		return nil, err
 	}
 	if entry == nil || entry.Response == nil {
+		return nil, nil
+	}
+	// Same edge-block gate on the replayed baseline (see above).
+	if modkit.IsEdgeBlockedResponse(entry.Response) {
 		return nil, nil
 	}
 
@@ -186,6 +207,8 @@ func (m *Module) getBaseline(
 		StatusCode: entry.StatusCode,
 		BodyLength: entry.BodyLen,
 		Summary:    summary,
+		Request:    string(ctx.Request().Raw()),
+		Response:   string(entry.Response.Raw()),
 	}, nil
 }
 
@@ -195,6 +218,7 @@ func (m *Module) probeNeighbor(
 	ip httpmsg.InsertionPoint,
 	neighborID string,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	baseline *baselineSummary,
 	compareOpts authzutil.CompareOptions,
 	host string,
@@ -203,11 +227,18 @@ func (m *Module) probeNeighbor(
 ) (*output.ResultEvent, error) {
 	// Build the probe request
 	fuzzedRaw := ip.BuildRequest([]byte(neighborID))
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return nil, err
+	// fuzzedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
+
+	// Public-navigation gate: if the baseline page already links to the neighbor
+	// target (pagination "Next"/"Prev", sibling hrefs, catalog entries) the
+	// neighbor is reachable by design — intended public browsing, not a broken
+	// authorization boundary. This is the blog/catalog false positive: GET
+	// /blog/3/ whose body links href="/blog/4/" and href="/blog/2/", where each id
+	// is *expected* to serve different content. Skip before spending an HTTP probe.
+	if authzutil.BaselineLinksNeighbor(string(baseline.Summary.Body), fuzzedReq.Request().Path()) {
+		return nil, nil
 	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -270,10 +301,56 @@ func (m *Module) probeNeighbor(
 		return nil, nil
 	}
 
-	// Structurally similar + content differs → potential IDOR
-	confidence := severity.Tentative
-	if comparison.UserFieldsDiffer {
-		confidence = severity.Firm
+	// Collect the supporting request/response pairs for this candidate finding:
+	// the original-id baseline plus the same-id determinism refetches (added by
+	// ConfirmCrossIDDifferential via the Evidence field below).
+	ev := modkit.NewEvidenceCollector()
+	ev.Add("original-id", baseline.Request, baseline.Response)
+
+	// Determinism gate: re-issue the ORIGINAL id a couple of times to measure how
+	// much this endpoint varies its response for an UNCHANGED id. Analytics /
+	// tracking endpoints (randomized JS beacons, ad rotators) return different
+	// content on every request regardless of the object id, so a changed-id
+	// response looks like an IDOR when it is just per-request dynamic noise. Keep
+	// the finding only when the changed-id difference exceeds the endpoint's own
+	// same-id variation. Fail open (keep) if the refetch could not run.
+	idVerdict := modkit.ConfirmCrossIDDifferential(
+		httpClient,
+		ctx.Service(),
+		ip.BuildRequest([]byte(ip.BaseValue())),
+		string(baseline.Summary.Body),
+		baseline.StatusCode,
+		string(probeBody),
+		modkit.CrossIDConfig{Evidence: ev},
+	)
+	if idVerdict.Ran && !idVerdict.Trustworthy {
+		return nil, nil
+	}
+
+	// Endpoint-determinism gate. The cross-ID noise envelope above measures the
+	// endpoint's own variation from SelfRounds same-id refetches, which is the right
+	// shape but too few samples for a bimodal endpoint: a host round-robining
+	// between mismatched backends serves two different renderings of the SAME
+	// template for the SAME id, and when every refetch happens to land on the
+	// baseline's backend the envelope reads as deterministic and the changed-id
+	// difference looks like broken object-level authorization. Sampling the
+	// unmodified request harder settles it, and the verdict is memoized per record
+	// so it is paid once no matter how many ids this endpoint offers.
+	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+		return nil, nil
+	}
+
+	// Structurally similar + content differs → potential IDOR.
+	//
+	// High/Firm only when BOTH hold: the original request carried a credential
+	// (so there is a per-user boundary to cross) AND user-specific fields differ
+	// between the two objects (so the neighbor really is another user's data).
+	// Anything less — public per-id content, or a credentialed differential with
+	// no user fields — is a single-session neighbour diff, an unproven oracle:
+	// a Suspect/Tentative lead.
+	sev, confidence := severity.Suspect, severity.Tentative
+	if comparison.UserFieldsDiffer && authzutil.RequestCarriesCredential(ctx.Request()) {
+		sev, confidence = severity.High, severity.Firm
 	}
 
 	desc := fmt.Sprintf(
@@ -287,20 +364,21 @@ func (m *Module) probeNeighbor(
 	}
 
 	return &output.ResultEvent{
-		ModuleID:         ModuleID,
-		Host:             host,
-		URL:              urlStr,
-		Matched:          urlStr,
-		Request:          probeRequest,
-		Response:         probeResponse,
-		FuzzingParameter: ip.Name(),
+		ModuleID:           ModuleID,
+		Host:               host,
+		URL:                urlStr,
+		Matched:            urlStr,
+		Request:            probeRequest,
+		Response:           probeResponse,
+		FuzzingParameter:   ip.Name(),
+		AdditionalEvidence: ev.Entries(),
 		ExtractedResults: []string{
 			fmt.Sprintf("%s=%s → %s", ip.Name(), ip.BaseValue(), neighborID),
 		},
 		Info: output.Info{
 			Name:        "IDOR / Broken Object Level Authorization",
 			Description: desc,
-			Severity:    severity.High,
+			Severity:    sev,
 			Confidence:  confidence,
 			Tags:        []string{"idor", "bola", "access-control", "api-security"},
 			Reference: []string{
@@ -323,6 +401,9 @@ func (m *Module) probeNeighbor(
 			"content_identical":  comparison.ContentIdentical,
 			"user_fields_differ": comparison.UserFieldsDiffer,
 			"differing_fields":   comparison.DifferingFields,
+			"self_id_ratio":      idVerdict.SelfRatio,
+			"cross_id_ratio":     idVerdict.CrossRatio,
+			"determinism_gate":   idVerdict.Reason,
 		},
 	}, nil
 }

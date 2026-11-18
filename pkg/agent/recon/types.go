@@ -90,6 +90,23 @@ type TechStackReport struct {
 	// FaviconHash is the MD5 of /favicon.ico. Useful for the planner to
 	// correlate with known signatures (Shodan/favicon hash databases).
 	FaviconHash string `json:"favicon_hash,omitempty"`
+	// Favicon is the icon hashed for search-engine pivots (mmh3 for Shodan and
+	// FOFA, MD5 for Censys). Set by Analyze; FaviconHash carries its MD5.
+	Favicon *FaviconInfo `json:"favicon,omitempty"`
+
+	// Base-response facts, from data already on the wire.
+	BaseStatus   int    `json:"base_status,omitempty"`
+	BaseLocation string `json:"base_location,omitempty"`
+	Title        string `json:"title,omitempty"`
+	Server       string `json:"server,omitempty"`
+	PoweredBy    string `json:"powered_by,omitempty"`
+	HTTPVersion  string `json:"http_version,omitempty"`
+	AltSvc       string `json:"alt_svc,omitempty"`
+
+	// SourceMaps are the source maps that answered with a map document.
+	SourceMaps []string `json:"source_maps,omitempty"`
+	// Depth is the plan depth an Analyze pass ran at ("" for Run).
+	Depth string `json:"depth,omitempty"`
 
 	// VHostFindings records anomalies observed when probing alternate
 	// Host headers (localhost, admin.<host>, target IP). Differences in
@@ -102,7 +119,13 @@ type TechStackReport struct {
 	// when servers don't implement Allow on OPTIONS but still accept e.g.
 	// PUT/DELETE on a path that returns 200 to GET — a strong access-
 	// control flag for the planner.
-	MethodMatrix map[string][]string `json:"method_matrix,omitempty"`
+	//
+	// Only Run fills it: it sends PUT/DELETE/PATCH, and the planned pass
+	// (Plan/Analyze, the fingerprint command) sends no state-changing method,
+	// so it never can. It is therefore left out of the published schemas
+	// (`jsonschema:"-"`), which describe the fingerprint and hosts documents —
+	// a schema must not promise a field those documents never carry.
+	MethodMatrix map[string][]string `json:"method_matrix,omitempty" jsonschema:"-"`
 
 	// LoginCandidates records HTML forms scraped from probed pages that
 	// look like login pages (input[type=password] present). Surfaces to
@@ -110,10 +133,50 @@ type TechStackReport struct {
 	// available, and so the CLI can suggest `--browser-auth` to the user.
 	LoginCandidates []LoginCandidate `json:"login_candidates,omitempty"`
 
-	ProbeCount  int           `json:"probe_count"`
+	ProbeCount int `json:"probe_count"`
+	// ProbeErrors counts the probes that have no answer, whatever the reason;
+	// Errors names each of them (Analyze only).
 	ProbeErrors int           `json:"probe_errors,omitempty"`
+	Errors      []ProbeError  `json:"errors,omitempty"`
 	Duration    time.Duration `json:"duration"`
 	Notes       []string      `json:"notes,omitempty"`
+}
+
+// Probe error kinds: why a planned probe has no answer. The sender classifies
+// the cause from its typed outcome (see Observation.ErrKind); a read that has
+// no answer and no kind is a network failure.
+const (
+	// ProbeErrNetwork: the request went out, or was attempted, and nothing came
+	// back — connect, TLS, timeout or reset — or the host had already been
+	// quarantined as unresponsive.
+	ProbeErrNetwork = "network"
+	// ProbeErrBudget: the request budget (--max-requests,
+	// --max-requests-per-host) refused the send.
+	ProbeErrBudget = "budget"
+	// ProbeErrScope: scope refused the request before it was sent.
+	ProbeErrScope = "scope"
+	// ProbeErrBlocked: the answer was a WAF or bot-wall page the sender drops.
+	ProbeErrBlocked = "blocked"
+	// ProbeErrCancelled: the pass was cancelled before the probe was answered.
+	ProbeErrCancelled = "cancelled"
+	// ProbeErrSkipped: the sender refused the probe for another reason.
+	ProbeErrSkipped = "skipped"
+)
+
+// ProbeError is one planned probe that has no answer, and why.
+type ProbeError struct {
+	// Path is the request target off the origin root.
+	Path string `json:"path"`
+	// Method is the request method; Host is the Host header a vhost probe sent.
+	Method string `json:"method,omitempty"`
+	Host   string `json:"host,omitempty"`
+	// Probe is what the answer would have fed (a ProbeKind: "well-known",
+	// "api-spec", "favicon", ...).
+	Probe ProbeKind `json:"probe,omitempty"`
+	// Kind is the cause class, one of the ProbeErr* values.
+	Kind string `json:"kind" jsonschema:"enum=network,enum=budget,enum=scope,enum=blocked,enum=cancelled,enum=skipped"`
+	// Error is the cause as the sender reported it.
+	Error string `json:"error"`
 }
 
 // JSFrameworkSignal is a single client-side framework / bundler signal

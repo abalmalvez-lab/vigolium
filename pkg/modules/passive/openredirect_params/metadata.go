@@ -9,16 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects URL parameters with names commonly associated with open redirect
-vulnerabilities (redirect, url, next, return, goto, etc.).
+	ModuleDesc = `**What it means:** An informational triage signal, not a confirmed flaw. The request URL carries a query parameter whose name (redirect, callback, cb, url, uri, link, location) commonly controls where the app sends the user next, a frequent source of open redirect if unvalidated.
 
-## Notes
-- Pattern-based detection on parameter names only; does not test for actual redirects
-- Low confidence; serves as a triage signal for the active open redirect module
+**How it's exploited:** If the app redirects to this value without an allowlist, a crafted link sets it to an attacker URL, forwarding victims to phishing while they believe they stayed on the trusted domain. Verify with the active open redirect module.
 
-## References
-- https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html`
+**Fix:** Validate redirect targets against a server-side allowlist and reject or rewrite off-domain URLs.`
 
 	ModuleConfirmation = "Indicated when URL contains parameters with redirect-associated names (redirect, url, next, return, goto)"
 	ModuleSeverity     = severity.Info

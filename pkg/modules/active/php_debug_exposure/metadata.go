@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for PHP-specific debug and administration endpoints that should not be
-publicly accessible: phpinfo() pages at common paths, PHP-FPM status/ping
-endpoints, and phpMyAdmin installations.
+	ModuleDesc = `**What it means:** A PHP debug or admin endpoint that should not be public is exposed and returns real content. The check confirms one of three classes: a phpinfo() page (/info.php, /test.php), a PHP-FPM status or ping endpoint, or a phpMyAdmin interface.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Complements sensitive_file_discovery with additional PHP-specific paths
-- Fingerprints 404 responses to detect custom error pages
+**How it's exploited:** A phpinfo() page leaks the PHP version, extensions, file paths, and environment, helping an attacker select version-specific exploits. PHP-FPM status discloses in-flight request URIs and script paths, and an open phpMyAdmin can be brute-forced.
 
-## References
-- https://www.php.net/manual/en/function.phpinfo.php
-- https://www.php.net/manual/en/fpm.status.php
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Remove debug pages from production and restrict phpMyAdmin and PHP-FPM status to trusted networks behind authentication.`
 
 	ModuleConfirmation = "Confirmed when probed PHP debug endpoints return 200 with expected content markers"
 	ModuleSeverity     = severity.Medium

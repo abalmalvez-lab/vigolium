@@ -9,23 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for framework-specific internal files and debug endpoints exposed by modern
-JavaScript meta-frameworks including Remix, Astro, and SvelteKit. These frameworks
-may inadvertently expose manifest files, build directories, version information,
-and development endpoints in production deployments.
+	ModuleDesc = `**What it means:** A JavaScript meta-framework (Remix, Astro, or SvelteKit) serves an internal build artifact or dev endpoint in production - the Remix route manifest or dev/HMR endpoint, Astro build and dev-toolbar directories, or SvelteKit version.json and data routes. An information-disclosure misconfiguration.
 
-## Notes
-- Runs once per host with internal deduplication
-- Tests 8 framework-specific paths across Remix, Astro, and SvelteKit
-- Each probe has tailored response matching to reduce false positives
+**How it's exploited:** An attacker reads these artifacts to map the route table, bundles, and directory structure, and to fingerprint the framework and build version, helping target version-specific vulnerabilities and find hidden routes.
 
-## References
-- https://remix.run/docs/en/main
-- https://docs.astro.build/en/getting-started/
-- https://kit.svelte.dev/docs/introduction`
+**Fix:** Build for production with dev endpoints disabled and block public access to internal build and dot directories (.astro, .svelte-kit, _astro) and manifest/data routes.`
 
-	ModuleConfirmation = "Confirmed when the server responds with framework-specific content at known internal paths, indicating exposed build artifacts or debug endpoints"
+	ModuleConfirmation = "Confirmed when an internal path returns framework-specific structured content (real JSON keys or a directory autoindex) that differs from the host's catch-all/SPA shell, indicating exposed build artifacts or debug endpoints"
 	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"javascript", "misconfiguration", "light"}

@@ -3,6 +3,7 @@ package code_exec
 import (
 	"net"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
@@ -56,13 +57,47 @@ var windowsPayloads = []string{
 	"& timeout /T 10 /NOBREAK",
 }
 
-// langPayloads maps language to specific command injection payloads.
+// langPayloads maps a language to time-based code-injection payloads. Unlike the
+// generic shell payloads above (which reach an OS shell), these are evaluated
+// *inside* the interpreter, where injected input typically lands within a quoted
+// string literal in the source. Each language therefore ships the same sleep in
+// several breakout contexts — a bare form (direct concatenation into code), single-
+// and double-quoted string breakouts, and the interpreter's string-interpolation
+// form — so the probe fires wherever the value is embedded, not only when it is
+// concatenated raw.
+//
+// The sleep argument is wrapped in a function that only the target language
+// defines (PHP hexdec/dechex, Perl lc, Ruby .to_i, Python compile/eval). Every
+// wrapper still evaluates to delaySeconds, so the fixed-delay confirmation below is
+// unchanged — but because a bare sleep() is accepted by several of these
+// interpreters, the wrapper makes an observed delay attributable to one specific
+// engine rather than ambiguous across all of them.
 var langPayloads = map[string][]string{
-	"perl":   {"/bin/sleep 10|"},
-	"php":    {`"; sleep(10);"`},
-	"ruby":   {"#{`sleep 10`}"},
-	"java":   {"${T(java.lang.Thread).sleep(10000)}"},
-	"python": {"__import__('time').sleep(10)"},
+	"perl": {
+		"sleep(lc(10))",
+		"'.sleep(lc(10)).'",
+		`".sleep(lc(10))."`,
+		"/bin/sleep 10|",
+	},
+	"php": {
+		"sleep(hexdec(dechex(10)))",
+		"'.sleep(hexdec(dechex(10))).'",
+		`".sleep(hexdec(dechex(10)))."`,
+		"{${sleep(hexdec(dechex(10)))}}",
+	},
+	"ruby": {
+		"sleep(10.to_i)",
+		"'+sleep(10.to_i)+'",
+		`"+sleep(10.to_i)+"`,
+		"#{sleep(10.to_i)}",
+	},
+	"java": {"${T(java.lang.Thread).sleep(10000)}"},
+	"python": {
+		"__import__('time').sleep(10)",
+		"'+__import__('time').sleep(10)+'",
+		`"+__import__('time').sleep(10)+"`,
+		"eval(compile('for x in range(1):\n import time\n time.sleep(10)','a','single'))",
+	},
 }
 
 // Time-delay detection tuning. Picked to keep false positives rare without
@@ -77,9 +112,11 @@ var langPayloads = map[string][]string{
 //     (initial + this many confirmations). 4 total
 //     independent slow probes before declaring vuln.
 //
-// Note: pkg/http.Requester.Execute returns duration as whole seconds
-// (int(time.Since(start).Seconds())), so all comparisons here operate at
-// 1-second granularity. That's coarse but adequate for a 10s threshold.
+// pkg/http.Requester.Execute reports elapsed time as a time.Duration, so these
+// thresholds are compared in real time. They used to be compared against
+// int(time.Since(start).Seconds()), which truncated — a 9.9s response against
+// the 10s threshold read as 9 and failed the check, losing exactly the delays
+// this module injects.
 const (
 	delaySeconds       = 10
 	baselineMaxSeconds = 5
@@ -117,6 +154,10 @@ func New() *Module {
 	return m
 }
 
+// VulnClass enables cross-module (param, class) dedup: once any code-injection module
+// reports a parameter, the others in the class skip it.
+func (m *Module) VulnClass() string { return modkit.VulnClassCodeInjection }
+
 func (m *Module) ScanPerRequest(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
@@ -138,6 +179,10 @@ func (m *Module) ScanPerRequest(
 	if err != nil {
 		return results, errors.Wrap(err, "failed to create insertion points")
 	}
+	// Header points: same class gate the executor applies to per-point
+	// modules — noise headers never, logged/negotiation/routing
+	// headers once per host.
+	points = modkit.FilterPointsFor(scanCtx, m, ctx, points)
 
 	// Filter out already checked insertion points
 	rhm := m.rhm.Get(scanCtx.DedupMgr())
@@ -153,6 +198,10 @@ func (m *Module) ScanPerRequest(
 
 ipScan:
 	for _, ip := range points {
+		// Another module of this vuln class already reported this param here.
+		if scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
+			continue
+		}
 		// Build a baseline request (same shape, original parameter value)
 		// to detect "server is just slow today" cases. Built once per IP
 		// and reused across payload attempts.
@@ -162,14 +211,10 @@ ipScan:
 			// Build fuzzed request with payload
 			fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-			// Parse the fuzzed raw request
-			fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-			if err != nil {
-				continue
-			}
-
-			// Copy HttpService from original request
-			fuzzedReq = fuzzedReq.WithService(ctx.Service())
+			// BuildRequest produces well-formed raw, so wrap directly
+			// (with the original service) instead of re-parsing on this
+			// hot path.
+			fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 			// Probe 1: fuzzed must be slow.
 			isSlow, sendErr := sendTimedRequest(fuzzedReq, httpClient)
@@ -225,18 +270,25 @@ ipScan:
 // check rather than fail the whole scan).
 func buildBaselineRequest(ctx *httpmsg.HttpRequestResponse, ip httpmsg.InsertionPoint) (*httpmsg.HttpRequestResponse, bool) {
 	raw := ip.BuildRequest([]byte(ip.BaseValue()))
-	req, err := httpmsg.ParseRawRequest(string(raw))
-	if err != nil {
-		return nil, false
-	}
-	return req.WithService(ctx.Service()), true
+	// BuildRequest produces well-formed raw, so wrap directly (with the
+	// original service) instead of re-parsing on this hot path.
+	return httpmsg.NewRequestResponseRaw(raw, ctx.Service()), true
 }
 
 // isResponseSlow sends req and reports whether the response took at least
-// thresholdSeconds (whole seconds, matching the resolution of the underlying
-// http.Requester).
+// thresholdSeconds.
+//
+// The comparison is in real time, not whole seconds. The requester used to
+// report elapsed time as int(seconds), so a 5.9s response against a 6s
+// threshold truncated to 5 and read as "not slow" — a false negative on
+// exactly the injected delay this module asks for. Now that the requester
+// returns a time.Duration, the threshold means what it says.
 func isResponseSlow(req *httpmsg.HttpRequestResponse, httpClient *http.Requester, thresholdSeconds int) (bool, error) {
-	resp, duration, err := httpClient.Execute(req, http.Options{IgnoreTimeoutTracking: true})
+	// NoClustering: timing-based blind RCE re-sends the identical delay payload across
+	// confirmation rounds. The 500ms request-cluster cache keys on raw request bytes,
+	// so a clustered re-send returns the first response's cached copy with duration ~0
+	// (< the delay threshold), and the confirmation never passes (a false negative).
+	resp, duration, err := httpClient.Execute(req, http.Options{IgnoreTimeoutTracking: true, NoClustering: true})
 	defer func() {
 		if resp != nil {
 			resp.Close()
@@ -251,7 +303,7 @@ func isResponseSlow(req *httpmsg.HttpRequestResponse, httpClient *http.Requester
 		}
 		return false, err
 	}
-	return duration >= thresholdSeconds, nil
+	return duration >= time.Duration(thresholdSeconds)*time.Second, nil
 }
 
 // isResponseTimeout reports whether err means the request timed out waiting on
@@ -309,9 +361,17 @@ func getPayloadsForExtension(request []byte) []string {
 }
 
 // sendTimedRequest sends a request and checks if response took >= delaySeconds.
+//
+// The threshold is converted to a time.Duration explicitly. `duration >=
+// delaySeconds` against an UNTYPED constant compiles fine and silently means
+// ">= 10 nanoseconds", so every response on earth is "slow" — the module went
+// from detecting a 10-second sleep to reporting command injection on any host
+// that answers at all.
 func sendTimedRequest(req *httpmsg.HttpRequestResponse, httpClient *http.Requester) (bool, error) {
 	timeout := false
-	resp, duration, err := httpClient.Execute(req, http.Options{IgnoreTimeoutTracking: true})
+	// NoClustering: see isResponseSlow — a clustered re-send of the identical delay
+	// payload returns a cached ~0ms duration and defeats timing confirmation.
+	resp, duration, err := httpClient.Execute(req, http.Options{IgnoreTimeoutTracking: true, NoClustering: true})
 	if err != nil {
 		if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 			return false, nil
@@ -327,7 +387,7 @@ func sendTimedRequest(req *httpmsg.HttpRequestResponse, httpClient *http.Request
 		}
 	}()
 
-	if duration >= delaySeconds || timeout {
+	if duration >= delaySeconds*time.Second || timeout {
 		return true, nil
 	}
 	return false, nil

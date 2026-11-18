@@ -9,23 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Broken Function-Level Authorization (BFLA) by testing admin and privileged
-endpoints with missing or downgraded authentication. Strips Authorization and Cookie
-headers, attempts empty tokens, and tests method switching on admin-like paths.
+	ModuleDesc = `**What it means:** A privileged endpoint (for example /admin or /users/delete) returns the same successful content even when credentials are removed, an invalid token is supplied, or the method is changed. This is Broken Function-Level Authorization: no access control on a function meant for authorized roles.
 
-## Notes
-- Runs once per unique host+path combination via DiskSet dedup
-- Skips non-2xx original responses (only tests endpoints that currently succeed)
-- Compares response status codes and body lengths to reduce false positives
-- Heuristic-based detection targeting known admin/privileged path patterns
+**How it's exploited:** Any anonymous user calls the endpoint to read privileged data or trigger admin actions, since credentials are not required and write methods succeed unauthenticated, enabling data disclosure or administrative takeover.
 
-## References
-- https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/
-- https://portswigger.net/web-security/access-control`
+**Fix:** Enforce server-side authorization on every privileged endpoint and method, validating identity and role on each request and denying by default.`
 
 	ModuleConfirmation = "Confirmed when a privileged endpoint returns a successful response after removing or downgrading authentication credentials"
-	ModuleSeverity     = severity.High
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"auth-bypass", "api-security", "moderate"}
 )

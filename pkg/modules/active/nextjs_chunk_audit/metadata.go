@@ -1,6 +1,9 @@
 package nextjs_chunk_audit
 
-import "github.com/vigolium/vigolium/pkg/types/severity"
+import (
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/sourcemap"
+	"github.com/vigolium/vigolium/pkg/types/severity"
+)
 
 const (
 	ModuleID    = "nextjs-chunk-audit"
@@ -9,39 +12,22 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Enumerates Next.js application static chunks (` + "`/_next/static/chunks/*.js`" + `)
-referenced by the HTML response, fetches each chunk, and analyses the content
-for embedded API routes, third-party domains, and secrets. When source maps
-(` + "`.js.map`" + `) are exposed alongside the chunk, those are scanned too.
+	ModuleDesc = `**What it means:** Anonymous Next.js chunks and source maps contain routes, third-party domains, client identifiers, or private-credential-shaped values. Routes, domains, and intentionally publishable identifiers are observations; unvalidated private formats are candidates.
 
-Discovered relative routes are fed back into the scan pipeline so existing
-Next.js scanners (data-leakage, middleware-bypass, etc.) can probe them.
-Chunk URLs are also re-emitted via the scan feeder so passive secret
-detection (kingfisher batch) gets coverage in addition to the inline
-regex-based matcher.
+**How it's exploited:** Attackers download the same chunks for reconnaissance. GitHub, Slack, or secret-key-shaped values may enable access if live, but AWS access-key IDs, Google API keys, and Stripe publishable keys are not secrets by themselves.
 
-## Notes
-- Activates on text/html responses that look like a Next.js app
-- Per-host cache prevents re-fetching chunks already seen
-- Caps: 50 chunks per host, 5 MB per chunk body, 10 MB per source map
-- Cross-origin domains found inside chunks are emitted as Info/Tentative intel
-- Secret findings inherit High/Firm; bumped to Certain on multi-pattern matches
+**Fix:** Keep private credentials server-side, validate and rotate candidate secrets, restrict publishable keys at the provider, and disable unnecessary production source maps.`
 
-## References
-- https://nextjs.org/docs/app/building-your-application/optimizing/static-assets
-- https://github.com/GerbenJavado/LinkFinder`
-
-	ModuleConfirmation = "Confirmed when /_next/static/chunks/<chunk>.js returns 200 with JavaScript content and is successfully parsed"
+	ModuleConfirmation = "Anonymous chunk must return non-HTML 200 content; private token formats remain candidates until provider validation, while public client identifiers remain observations"
 	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Certain
-	ModuleTags         = []string{"nextjs", "javascript", "intel", "info-disclosure", "medium"}
+	ModuleTags         = []string{"nextjs", "javascript", "intel", "info-disclosure", "medium", "light"}
 )
 
 const (
 	MaxChunksPerHost       = 50
 	MaxChunkBytes          = int64(5 * 1024 * 1024)
-	MaxMapBytes            = int64(10 * 1024 * 1024)
+	MaxMapBytes            = int64(sourcemap.MaxMapBytes) // the shared source-map parser's cap
 	MaxRoutesPerHost       = 5000
 	MaxDomainsPerHost      = 500
 	MaxCrossOriginPerChunk = 10

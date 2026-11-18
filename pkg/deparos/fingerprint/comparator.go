@@ -44,6 +44,7 @@ type WildcardDetection struct {
 type Comparator struct {
 	cache   *Cache
 	learner *Learner
+	clean   *cleanVerdicts
 }
 
 // NewComparator creates a new comparator
@@ -51,6 +52,7 @@ func NewComparator(cache *Cache, learner *Learner) *Comparator {
 	return &Comparator{
 		cache:   cache,
 		learner: learner,
+		clean:   newCleanVerdicts(cleanVerdictMax, cleanVerdictTTL),
 	}
 }
 
@@ -163,7 +165,7 @@ func (c *Comparator) ValidateDynamic(ctx context.Context, req *http.Request, sam
 	// Request each variation and check if it matches existing signatures
 	for _, pathVariation := range paths {
 		testURL := *req.URL // Copy
-		testURL.Path = pathVariation
+		SetWirePath(&testURL, pathVariation)
 
 		// Request the variation
 		varSample, err := c.learner.RequestAndExtract(ctx, &testURL)
@@ -227,8 +229,8 @@ func (c *Comparator) LearnIfNeeded(ctx context.Context, url *url.URL) error {
 // 4. Learn new wildcard patterns if detected
 // 5. Return whether content is valid or wildcard
 func (c *Comparator) CheckWildcardWithValidation(ctx context.Context, targetURL *url.URL, rc *responsechain.ResponseChain, sample *Sample) (MatchResult, error) {
-	// Quick exit: HTTP 404 is always a false positive (wildcard)
-	if rc.Response().StatusCode == 404 {
+	// Quick exit: a hard miss (404, 400, 414, 421, 431) never means content.
+	if IsHardMissStatus(rc.Response().StatusCode) {
 		return FalsePositive, nil
 	}
 
@@ -240,124 +242,152 @@ func (c *Comparator) CheckWildcardWithValidation(ctx context.Context, targetURL 
 
 	// No match in cache - need to validate with wildcard test
 	key := ExtractCacheKey(targetURL)
-	isValid, err := c.validateWithWildcardTest(ctx, targetURL, key)
+	verdict, err := c.validateWithWildcardTest(ctx, targetURL, key, sample)
 	if err != nil {
 		// Failed to validate - return unknown
 		return Unknown, err
 	}
-
-	if isValid {
-		return TruePositive, nil
-	}
-
-	return FalsePositive, nil
+	return verdict, nil
 }
 
 // validateWithWildcardTest performs 4-path wildcard validation.
 // Uses 4 strategies that only modify the last segment, preserving directory structure.
 // This ensures test paths stay within path-based catch-all patterns like /api/v1/*
 //
+// The 4 strategies split into two classes by whether they break the segment's
+// leading characters:
+//   - prefix-BREAKING: Prefix (prepend random) and Middle (insert random) — the
+//     probed path no longer starts with the target segment.
+//   - prefix-PRESERVING: Suffix (append) and Extension (add fake ext) — the probed
+//     path still starts with the target segment.
+//
+// A GENUINE host-wide catch-all answers content even for prefix-breaking probes.
+// A server that merely routes on the segment prefix (e.g. a gateway mapping
+// "/metrics*" to a real /metrics endpoint that returns an empty 200 on the
+// backends without the exporter) answers content ONLY for the prefix-preserving
+// probes while prefix-breaking probes 404. Treating that as a wildcard drops a
+// real resource, so we suppress ONLY when a prefix-breaking probe returns content.
+//
 // Algorithm:
-// 1. Generate 4 random path variations (Prefix, Suffix, Extension, Middle)
-// 2. Fetch each path with delays
-// 3. If ALL return non-content (404, errors) -> content is VALID
-// 4. If ANY return content -> learn as wildcard and return FALSE
-func (c *Comparator) validateWithWildcardTest(ctx context.Context, targetURL *url.URL, key CacheKey) (bool, error) {
-	basePath := targetURL.Path
+//  1. Generate 4 random path variations (Prefix, Suffix, Extension, Middle)
+//  2. Fetch each path with delays
+//  3. If NO prefix-breaking probe returns content -> content is VALID (covers both
+//     "all probes 404" unique files and "only prefix-preserving 200" real routes)
+//  4. If a prefix-breaking probe returns content that RESEMBLES the hit (same
+//     status and content type, same tag structure or length bucket) -> learn as
+//     wildcard and return FalsePositive. A breaking sibling that answers with a
+//     different page (a 403 next to a 200 hit) is not evidence against the hit.
+//
+// Siblings that answer with a hard-miss status (404/400/414/421/431) are misses
+// whatever the cache knows about their shape. A sibling that was throttled
+// (429/503/edge block) says nothing about the directory; when no resembling
+// breaking sibling was seen the verdict is Unknown, which keeps the hit.
+func (c *Comparator) validateWithWildcardTest(ctx context.Context, targetURL *url.URL, key CacheKey, hit *Sample) (MatchResult, error) {
+	// Escaped (wire) path so a bypass prefix survives into the sibling probes.
+	basePath := targetURL.EscapedPath()
 	if basePath == "" {
 		basePath = "/"
 	}
-
-	// Test path 1: Prepend random to last segment (6 chars)
-	// Detects suffix wildcards like *admin
-	prefix, err := generateRandomHex(6)
-	if err != nil {
-		return false, err
-	}
-	testPath1 := prependToLastSegment(basePath, prefix)
-
-	// Test path 2: Append random to last segment (6 chars)
-	// Detects prefix wildcards like user*
-	suffix, err := generateRandomHex(6)
-	if err != nil {
-		return false, err
-	}
-	testPath2 := appendToLastSegment(basePath, suffix)
-
-	// Test path 3: Add fake extension (4 chars)
-	// Detects extension-based routing
-	fakeExt, err := generateRandomHex(4)
-	if err != nil {
-		return false, err
-	}
-	testPath3 := addFakeExtension(basePath, fakeExt)
-
-	// Test path 4: Insert random into middle (9 chars)
-	// Most effective - breaks both prefix AND suffix wildcards
-	middle, err := generateRandomHex(9)
-	if err != nil {
-		return false, err
-	}
-	testPath4 := insertIntoLastSegment(basePath, middle)
-
-	// Map paths to strategies for tracking
-	testConfigs := []struct {
-		path     string
-		strategy PathVariation
-	}{
-		{testPath1, VariationPrefix},
-		{testPath2, VariationSuffix},
-		{testPath3, VariationExtension},
-		{testPath4, VariationMiddle},
+	gen := func(v PathVariation) (string, error) {
+		switch v {
+		case VariationPrefix:
+			r, err := generateRandomHex(6)
+			return prependToLastSegment(basePath, r), err
+		case VariationSuffix:
+			r, err := generateRandomHex(6)
+			return appendToLastSegment(basePath, r), err
+		case VariationExtension:
+			r, err := generateRandomHex(4)
+			return addFakeExtension(basePath, r), err
+		default:
+			r, err := generateRandomHex(9)
+			return insertIntoLastSegment(basePath, r), err
+		}
 	}
 
-	// Fetch all 4 random paths and track which strategy detected wildcard
-	wildcardDetections := make([]WildcardDetection, 0, 4)
-	foundContent := false
+	// Only the prefix-BREAKING probes (Prefix, Middle) decide the verdict, so
+	// they go first; the prefix-preserving ones (Suffix, Extension) are fetched
+	// only when a wildcard is being learned. A directory/extension that came
+	// back clean recently is re-checked with the Middle probe alone.
+	decisive := []PathVariation{VariationPrefix, VariationMiddle}
+	cleanKey := cleanVerdictKey(targetURL, key)
+	if c.clean != nil && c.clean.fresh(cleanKey) {
+		decisive = []PathVariation{VariationMiddle}
+	}
 
-	for i, config := range testConfigs {
-		// Add delay between requests (except first)
+	var wildcardDetections []WildcardDetection
+	breakingContent, throttled := false, false
+	probe := func(i int, v PathVariation) error {
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				return false, ctx.Err()
+				return ctx.Err()
 			case <-time.After(20 * time.Millisecond):
 			}
 		}
-
-		// Build test URL
+		wire, err := gen(v)
+		if err != nil {
+			return err
+		}
 		testURL := *targetURL
-		testURL.Path = config.path
-
-		// Fetch the random path
+		SetWirePath(&testURL, wire)
 		sample, hasContent, err := c.fetchAndCheckContent(ctx, &testURL)
 		if err != nil {
-			// Ignore errors - treat as no content
-			continue
+			return nil // ignore errors - treat as no content
 		}
+		if sample.Throttled() {
+			throttled = true
+			return nil
+		}
+		if !hasContent {
+			return nil
+		}
+		wildcardDetections = append(wildcardDetections, WildcardDetection{Sample: sample, Strategy: v})
+		// A prefix-breaking probe returning the SAME page as the hit means the
+		// catch-all does not require the segment's real leading characters ->
+		// genuine wildcard. A different page does not make the hit a false positive.
+		if (v == VariationPrefix || v == VariationMiddle) && (hit == nil || hit.Resembles(sample)) {
+			breakingContent = true
+		}
+		return nil
+	}
 
-		// Track which strategy detected this wildcard
-		if hasContent {
-			foundContent = true
-			wildcardDetections = append(wildcardDetections, WildcardDetection{
-				Sample:   sample,
-				Strategy: config.strategy,
-			})
+	n := 0
+	for _, v := range decisive {
+		if err := probe(n, v); err != nil {
+			return Unknown, err
+		}
+		n++
+		if breakingContent {
+			break
 		}
 	}
 
-	// If ALL random paths returned no content -> target is VALID
-	if !foundContent {
-		return true, nil
+	if !breakingContent {
+		// A throttled sibling leaves the directory's shape unknown: keep the hit
+		// without claiming it was validated (and remember nothing).
+		if throttled {
+			return Unknown, nil
+		}
+		if c.clean != nil {
+			c.clean.mark(cleanKey)
+		}
+		return TruePositive, nil
 	}
 
-	// At least one random path returned content -> wildcard detected
-	// Learn these wildcard responses and cache them
-	if len(wildcardDetections) > 0 {
-		_ = c.learnWildcardPatterns(ctx, key, targetURL, wildcardDetections)
+	// Genuine wildcard: fetch the prefix-preserving probes too, so every
+	// catch-all shape this directory answers with is learned and cached.
+	if c.clean != nil {
+		c.clean.forget(cleanKey)
 	}
-
-	return false, nil
+	for _, v := range []PathVariation{VariationSuffix, VariationExtension} {
+		if err := probe(n, v); err != nil {
+			break
+		}
+		n++
+	}
+	_ = c.learnWildcardPatterns(ctx, key, targetURL, wildcardDetections)
+	return FalsePositive, nil
 }
 
 // fetchAndCheckContent fetches a URL and checks if it returns content
@@ -368,6 +398,12 @@ func (c *Comparator) fetchAndCheckContent(ctx context.Context, targetURL *url.UR
 	sample, err := c.learner.RequestAndExtract(ctx, targetURL)
 	if err != nil {
 		return nil, false, err
+	}
+
+	// A hard-miss status is no content whatever shape the cache has seen: an
+	// uncached 404 shape must not count as a sibling "with content".
+	if IsHardMissStatus(sample.Status()) {
+		return sample, false, nil
 	}
 
 	// Use CASCADE check instead of single extension match!
@@ -406,12 +442,12 @@ func (c *Comparator) learnWildcardPatterns(ctx context.Context, key CacheKey, ba
 		}
 
 		// Generate 2 random paths using SAME strategy with different lengths
-		path1, err := GenerateRandomPathWithVariation(baseURL.Path, detection.Strategy, length1)
+		path1, err := GenerateRandomPathWithVariation(baseURL.EscapedPath(), detection.Strategy, length1)
 		if err != nil {
 			continue
 		}
 
-		path2, err := GenerateRandomPathWithVariation(baseURL.Path, detection.Strategy, length2)
+		path2, err := GenerateRandomPathWithVariation(baseURL.EscapedPath(), detection.Strategy, length2)
 		if err != nil {
 			continue
 		}
@@ -430,7 +466,7 @@ func (c *Comparator) learnWildcardPatterns(ctx context.Context, key CacheKey, ba
 			}
 
 			testURL := *baseURL
-			testURL.Path = path
+			SetWirePath(&testURL, path)
 
 			sample, err := c.learner.RequestAndExtract(ctx, &testURL)
 			if err != nil {

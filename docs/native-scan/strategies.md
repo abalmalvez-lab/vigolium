@@ -61,6 +61,7 @@ Vigolium accepts targets in multiple formats via `-I` / `--input-mode`:
 |--------|------|---------|
 | URL list (default) | `-I urls` | `vigolium scan -T urls.txt` |
 | OpenAPI / Swagger | `-I openapi` | `vigolium scan -i api-spec.yaml -I openapi` |
+| WSDL / SOAP | `-I wsdl` | `vigolium scan -i service.wsdl -I wsdl -t https://soap.example.com` |
 | Postman Collection | `-I postman` | `vigolium scan -i collection.json -I postman` |
 | Burp XML export | `-I burpxml` | `vigolium scan -i burp-export.xml -I burpxml` |
 | Raw HTTP request | `-I burpraw` | `vigolium scan -i request.txt -I burpraw` |
@@ -100,6 +101,12 @@ vigolium scan -t https://example.com --strategy deep
 ```
 
 Sources: Wayback Machine, CommonCrawl, AlienVault OTX, URLScan, VirusTotal. API keys for URLScan and VirusTotal can be configured in `vigolium-configs.yaml` under `external_harvester.sources`.
+
+The harvest itself never contacts the target. When a later phase does, the
+`harvest-probe` step checks the harvested URLs first (one liveness request per
+host, then one GET per URL) and drops dead hosts, `404`/`410` and soft-404 answers
+before anything scans them. `--skip harvest-probe` or `external_harvester.probe:
+false` turns that off; see [native scan phases](../guides/native-scan-phases.md#external-harvest).
 
 ### Content Discovery
 
@@ -143,7 +150,7 @@ Spider flags:
 
 ### Known Issue Scan
 
-Runs Nuclei templates and Kingfisher secret scanning against discovered hosts and response bodies. Enabled by `--strategy balanced`/`deep` or by the strategy.
+Runs Nuclei templates and the native in-process secret detector against discovered hosts and stored response bodies. Enabled by the `balanced` and `deep` strategies.
 
 By default, known-issue-scan enriches its target list with path prefixes discovered in previous phases (discovery, spidering). This increases coverage — Nuclei templates run against individual path prefixes (e.g., `https://example.com/api/v1/`) rather than just the host root. Disable this for faster but less granular scans:
 
@@ -169,7 +176,7 @@ vigolium scan -t https://example.com --known-issue-scan-templates-dir ~/nuclei-t
 
 The core scanning phase. Runs active and passive modules against all discovered HTTP records. Enabled in all strategies. CLI aliases: `audit`, `dast`, `assessment`.
 
-Uses a feedback loop (up to 3 rounds): after each round, checks for newly discovered records and rescans if found.
+Uses a configurable feedback loop: `dynamic-assessment.max_feedback_rounds` defaults to 1; increase it (for example, to 3) to check for newly discovered records and rescan them in later rounds.
 
 OAST (Out-of-band Application Security Testing) injects blind callback payloads when configured:
 
@@ -184,11 +191,12 @@ vigolium scan -t https://example.com --oast-url https://your-oast.example.com/ca
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-c` / `--concurrency` | 50 | Number of concurrent scan workers |
-| `--max-per-host` | 2 | Max concurrent requests per host |
+| `-c` / `--concurrency` | 25 | Number of concurrent scan workers |
+| `--max-per-host` | 40 | Max concurrent requests per host |
 | `-r` / `--rate-limit` | 100 | Max request submissions per second |
-| `--max-host-error` | 30 | Skip host after N consecutive errors |
-| `--max-findings-per-module` | 15 | Suppress findings after this many per module (0 = unlimited) |
+| `--max-host-error` | 30 | Quarantine a host:port after N consecutive transport errors; it is re-probed after `scanning_strategy.http.host_errors.cooldown` (30s, doubling to `max_cooldown` 5m) and dropped for the scan after `max_trips` (5) failed probes |
+| `--max-findings-per-module` | 50 | Suppress findings after this many distinct findings per module; drops are reported in the summary, `phase.finished`/`scan.finished` `findings_capped`, and the `findings_per_module` limit (0 = unlimited) |
+| `--no-waf-pacing` | off | Disable proactive CDN/WAF-edge throttling (reactive backoff still applies) |
 | `--timeout` | 15s | Per-request HTTP timeout |
 | `--retries` | 1 | Retry count for failed requests |
 | `--scanning-max-duration` | unset | Override global max scan duration |
@@ -216,9 +224,9 @@ The `scanning_pace` section in `vigolium-configs.yaml` provides centralized spee
 ```yaml
 scanning_pace:
   # Common defaults (inherited by all phases)
-  concurrency: 50
+  concurrency: 25
   rate_limit: 100
-  max_per_host: 10
+  max_per_host: 40
 
   # Per-phase overrides (0 = inherit from common)
   discovery:
@@ -308,10 +316,10 @@ vigolium scan -t https://example.com --list-modules
 vigolium module ls
 
 # Run specific modules only
-vigolium scan -t https://example.com -m xss-reflected,sqli-error
+vigolium scan -t https://example.com -m xss-light-url-params,sqli-error-based
 
 # Run a single module
-vigolium scan-url https://example.com/search?q=test -m xss-reflected
+vigolium scan-url https://example.com/search?q=test -m xss-light-url-params
 ```
 
 ### Filtering by Tag
@@ -326,14 +334,14 @@ vigolium scan -t https://example.com --module-tag spring
 vigolium scan -t https://example.com --module-tag rails --module-tag django
 
 # Combine with -m (results are merged as a union)
-vigolium scan -t https://example.com -m xss-reflected --module-tag spring
+vigolium scan -t https://example.com -m xss-light-url-params --module-tag spring
 ```
 
 Tags are matched with OR logic — a module runs if it matches *any* of the specified tags. When both `-m` and `--module-tag` are provided, the results are merged (union).
 
 ## Custom Extensions
 
-Load JavaScript or YAML extension modules alongside or instead of built-in modules. See [Extension Scanning](extension-scan.md) for full details.
+Load JavaScript or YAML extension modules alongside or instead of built-in modules. See [Extension Scanning](phases/extension.md) for full details.
 
 ```bash
 # Add extensions on top of built-in modules
@@ -446,8 +454,9 @@ vigolium scan -t https://example.com --strategy deep \
 # Quick CI check with JSON output
 vigolium scan -t https://staging.example.com --strategy lite -j
 
-# Rescan existing database records
-vigolium scan
+# Rescan every HTTP record already in the active project
+# (--all-records is required; a bare `vigolium scan` with no target is exit 2)
+vigolium scan --all-records
 
 # Scan with proxy (Burp, ZAP)
 vigolium scan -t https://example.com --proxy http://127.0.0.1:8080

@@ -5,25 +5,18 @@ import "github.com/vigolium/vigolium/pkg/types/severity"
 const (
 	ModuleID    = "password-autocomplete-detect"
 	ModuleName  = "Password Autocomplete Detect"
-	ModuleShort = "Detects password fields without autocomplete disabled"
+	ModuleShort = "Observes likely password fields without current-password or new-password semantics"
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects password input fields in HTML responses that do not have autocomplete
-disabled, which may allow browsers to store sensitive credentials.
+	ModuleDesc = `**What it means:** A likely account-password field lacks autocomplete="current-password" or "new-password". This is a markup observation, not a confirmed vulnerability; browsers often infer the purpose, and autocomplete="off" is not a security control.
 
-## Notes
-- Checks for autocomplete="off" or autocomplete="new-password" on password inputs
-- Also checks enclosing form elements for autocomplete attributes
-- Only fires on text/html responses
+**How it's exploited:** Ambiguous semantics can make password-manager behavior less reliable, indirectly encouraging weaker credential handling rather than enabling a direct attack.
 
-## References
-- https://owasp.org/www-community/controls/PasswordAutocomplete
-- https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html`
+**Fix:** Use current-password for login fields and new-password for password creation or changes.`
 
-	ModuleConfirmation = "Confirmed when password input fields lack autocomplete='off' or autocomplete='new-password'"
+	ModuleConfirmation = "Observed when a likely account-password input lacks current-password or new-password; this does not establish a security vulnerability"
 	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Certain
-	ModuleTags         = []string{"authentication", "misconfiguration", "light"}
+	ModuleTags         = []string{"authentication", "misconfiguration", "hygiene", "light"}
 )

@@ -9,22 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Rails Active Storage direct upload endpoints that may accept unauthenticated
-uploads, and Action Mailbox ingress endpoints that may accept unauthorized email submissions.
-Also checks for publicly accessible Active Storage blob routes.
+	ModuleDesc = `**What it means:** Rails Active Storage direct-upload, blob, or Action Mailbox inbound-email ingress routes are reachable at the network edge - internal upload and mail-ingest routes that widen the attack surface.
 
-## Notes
-- Uses OPTIONS requests for direct upload endpoint to check allowed methods
-- Probes Action Mailbox ingress paths for multiple email providers
-- Fingerprints 404 responses to avoid false positives
+**How it's exploited:** An unauthenticated direct-upload endpoint lets an attacker push arbitrary blobs to storage; an open Action Mailbox ingress accepts forged inbound emails the app processes as legitimate. The probe confirms only that the route is mounted and answers.
 
-## References
-- https://guides.rubyonrails.org/active_storage_overview.html
-- https://guides.rubyonrails.org/action_mailbox_basics.html`
+**Fix:** Require authentication on Active Storage and Action Mailbox routes, configure ingress credentials, and keep these routes off untrusted networks.`
 
-	ModuleConfirmation = "Confirmed when Active Storage or Action Mailbox endpoints respond with expected behavior"
-	ModuleSeverity     = severity.Medium
-	ModuleConfidence   = severity.Firm
+	ModuleConfirmation = "Tentatively flagged when an Active Storage / Action Mailbox OPTIONS probe returns a 2xx POST-only Allow header (subset of POST/OPTIONS) that a random sibling path does not reproduce, or a blob route redirects to a stored object"
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"rails", "ruby", "misconfiguration", "file-exposure", "light"}
 )

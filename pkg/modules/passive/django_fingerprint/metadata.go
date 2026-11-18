@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Django installations by analyzing HTTP response cookies
-(csrftoken, sessionid), body patterns (csrfmiddlewaretoken hidden field,
-Django-specific error strings), and default header configurations. Requires
-2+ independent signals to avoid false positives.
+	ModuleDesc = `**What it means:** The app runs the Django (Python) framework, identified passively from default cookies (csrftoken, sessionid), the csrfmiddlewaretoken form field, admin references, and error strings. Two or more signals are required to limit false positives. Informational fingerprinting. An observed Django error page is also noted as an exposed debug page.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Deduplicates by host to avoid redundant processing
-- Detects Django default CSRF cookie and session cookie names
-- Recognizes Django error page patterns (ImproperlyConfigured, OperationalError)
-- X-Frame-Options: DENY is a weak signal, only counted with another signal
+**How it's exploited:** Knowing the target runs Django lets an attacker focus on framework-specific weaknesses - version CVEs, default admin paths, insecure SECRET_KEY use, deserialization issues. A debug page reveals config and paths.
 
-## References
-- https://www.djangoproject.com/`
+**Fix:** Disable DEBUG in production, suppress framework and version banners, and keep Django patched.`
 
 	ModuleConfirmation = "Confirmed when 2+ independent Django-specific signals are detected in the response"
 	ModuleSeverity     = severity.Info

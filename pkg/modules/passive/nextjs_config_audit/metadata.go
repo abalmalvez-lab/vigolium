@@ -9,25 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans response bodies for insecure Next.js configuration patterns that can introduce
-security vulnerabilities. Checks for dangerous SVG allowances (XSS risk), wildcard
-image domains (SSRF risk), HTTP protocol in image config (cleartext transport),
-exposed production source maps (information disclosure), internal API exposure via
-rewrites/redirects, and missing security headers configuration.
+	ModuleDesc = `**What it means:** A Next.js config or bundled JS/JSON contains an insecure setting. The module reports the matched pattern: dangerouslyAllowSVG:true, a wildcard image remotePatterns hostname, an http image protocol, productionBrowserSourceMaps:true, an /api/internal route exposed via rewrites, or images lacking security headers.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects: dangerouslyAllowSVG, wildcard image hostnames, HTTP protocol, production source maps
-- Also checks for internal API route exposure and missing security headers config
-- Each matched pattern emits a separate finding with matched snippet
-- Deduplicates by host
+**How it's exploited:** Impact varies: a malicious SVG lands stored XSS, the wildcard image proxy reaches internal hosts (SSRF), leaked source maps reveal logic and secrets, or internal API routes become reachable.
 
-## References
-- https://nextjs.org/docs/app/api-reference/next-config-js
-- https://cwe.mitre.org/data/definitions/79.html
-- https://cwe.mitre.org/data/definitions/918.html
-- https://cwe.mitre.org/data/definitions/540.html`
+**Fix:** Restrict remotePatterns to trusted hosts, disable dangerouslyAllowSVG and production source maps, use HTTPS, and add security headers.`
 
 	ModuleConfirmation = "Confirmed when insecure configuration patterns are found in Next.js config files"
 	ModuleSeverity     = severity.Medium

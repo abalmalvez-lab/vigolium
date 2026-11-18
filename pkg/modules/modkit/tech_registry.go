@@ -1,18 +1,52 @@
 package modkit
 
 import (
+	"sort"
 	"strings"
 	"sync"
+
+	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
-// TechRegistry tracks technology stack detections per host during a scan.
-// Passive fingerprint modules publish detections (e.g. "nextjs", "spring") and
-// the executor consults it before dispatching tech-gated active modules.
+// RegistryHostKey returns the per-host key used by every registry in this
+// package — TechRegistry, ContentClassRegistry, WAFRegistry. It is the URL host:
+// the bare hostname plus ":port" for non-default ports.
+//
+// Read and write paths MUST agree on this key or detections silently go missing,
+// so it lives here rather than being re-derived per caller. The port is part of
+// the key on purpose: keying on the bare hostname let a stack detected on :443
+// gate modules on :8443 and dropped every non-default-port detection outright.
+// Falls back to the bare service host only when the URL cannot be parsed.
+func RegistryHostKey(item *httpmsg.HttpRequestResponse) string {
+	if item == nil {
+		return ""
+	}
+	if u, err := item.URL(); err == nil && u != nil && u.Host != "" {
+		return u.Host
+	}
+	if svc := item.Service(); svc != nil {
+		return svc.Host()
+	}
+	return ""
+}
+
+// TechRegistry tracks technology detections per host during a scan. Passive
+// fingerprint modules publish detections (e.g. "nextjs", "spring") and the
+// executor consults it before dispatching tech-gated active modules.
+//
+// Each host keeps two sets: STACK tags (IsStackTag: frameworks, languages,
+// platforms, servers — what the gate reasons about) and DESCRIPTIVE tags
+// (spa, angular, javascript, … — recorded, never gating). Mark routes a tag to
+// the right set. A host is "known" only once it has a stack tag: an Angular
+// front end publishing {angular, spa} says nothing about the backend, so
+// gating on it would skip every Spring/Java module on an Angular-on-Spring
+// host.
 //
 // Thread-safe for concurrent reads and writes.
 type TechRegistry struct {
 	mu     sync.RWMutex
-	byHost map[string]map[string]struct{}
+	byHost *lru.Cache[string, *hostTech] // bounded: see perHostRegistryCacheSize
 
 	// OnDetect fires exactly once per (host, tag) pair on first observation.
 	// The callback runs without the registry lock held; implementations must
@@ -20,9 +54,28 @@ type TechRegistry struct {
 	OnDetect func(host, tag string)
 }
 
-// NewTechRegistry returns an empty registry.
+// hostTech is one host's detections. cats holds the TechCategoryOf of every
+// stack tag, kept by Mark so Allows does not re-derive it per query.
+type hostTech struct {
+	stack map[string]struct{}
+	desc  map[string]struct{}
+	cats  map[TechCategory]struct{}
+}
+
+func (h *hostTech) has(tag string) bool {
+	if _, ok := h.stack[tag]; ok {
+		return true
+	}
+	_, ok := h.desc[tag]
+	return ok
+}
+
+// NewTechRegistry returns an empty registry. The host map is a bounded LRU so a
+// long-lived executor can't grow it per distinct host without limit; an evicted
+// host simply reads as unknown (fail-open) until re-fingerprinted.
 func NewTechRegistry() *TechRegistry {
-	return &TechRegistry{byHost: make(map[string]map[string]struct{})}
+	c, _ := lru.New[string, *hostTech](perHostRegistryCacheSize)
+	return &TechRegistry{byHost: c}
 }
 
 // Mark records that the given tech tag was observed for host.
@@ -37,14 +90,22 @@ func (r *TechRegistry) Mark(host, tag string) {
 		return
 	}
 	r.mu.Lock()
-	set, ok := r.byHost[host]
+	ht, ok := r.byHost.Get(host)
 	if !ok {
-		set = make(map[string]struct{})
-		r.byHost[host] = set
+		ht = &hostTech{stack: map[string]struct{}{}, desc: map[string]struct{}{}, cats: map[TechCategory]struct{}{}}
+		r.byHost.Add(host, ht)
+	}
+	stack := IsStackTag(tag)
+	set := ht.desc
+	if stack {
+		set = ht.stack
 	}
 	_, already := set[tag]
 	if !already {
 		set[tag] = struct{}{}
+		if cat := TechCategoryOf(tag); stack && cat != "" {
+			ht.cats[cat] = struct{}{}
+		}
 	}
 	r.mu.Unlock()
 	if !already && r.OnDetect != nil {
@@ -52,7 +113,7 @@ func (r *TechRegistry) Mark(host, tag string) {
 	}
 }
 
-// Has reports whether the given tech tag is detected for host.
+// Has reports whether the given tech tag (stack or descriptive) is detected for host.
 func (r *TechRegistry) Has(host, tag string) bool {
 	if r == nil {
 		return false
@@ -64,12 +125,13 @@ func (r *TechRegistry) Has(host, tag string) bool {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	set, ok := r.byHost[host]
+	// Peek, not Get: Get takes the LRU's internal write lock to bump recency,
+	// which would serialize concurrent read-only queries despite the outer RLock.
+	ht, ok := r.byHost.Peek(host)
 	if !ok {
 		return false
 	}
-	_, ok = set[tag]
-	return ok
+	return ht.has(tag)
 }
 
 // HasAny reports whether any of the given tech tags is detected for host.
@@ -84,8 +146,8 @@ func (r *TechRegistry) HasAny(host string, tags []string) bool {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	set, ok := r.byHost[host]
-	if !ok || len(set) == 0 {
+	ht, ok := r.byHost.Peek(host) // Peek: see Has (avoid LRU write-lock on the read path)
+	if !ok {
 		return false
 	}
 	for _, t := range tags {
@@ -93,20 +155,22 @@ func (r *TechRegistry) HasAny(host string, tags []string) bool {
 		if t == "" {
 			continue
 		}
-		if _, ok := set[t]; ok {
+		if ht.has(t) {
 			return true
 		}
 	}
 	return false
 }
 
-// Allows is the dispatch-hot-path query: returns true iff the host is unknown
-// (fail-open) OR has at least one of the candidate tech tags. Candidates MUST
-// already be normalized (lowercase, trimmed, non-empty) — passing raw input
-// here will silently miss matches.
+// Allows is the dispatch-hot-path query. Candidates are the module's required
+// stack tags and MUST already be normalized (lowercase, trimmed, non-empty).
 //
-// Combining the host-known and any-match check under a single RLock is the
-// hot-path's primary cost saving: one map lookup, no double normalization.
+// It returns false (skip the module) only on a positive contradiction: the
+// host has a stack tag in the category of one of the candidates, and none of
+// the candidates is detected on the host. Every other case runs the module —
+// an unknown host, a host known only by descriptive tags, a host whose known
+// stack is in another category (a Next.js front end says nothing about the
+// backend), and server tags (a reverse proxy's banner never excludes).
 func (r *TechRegistry) Allows(host string, candidates []string) bool {
 	if r == nil || host == "" || len(candidates) == 0 {
 		return true
@@ -117,19 +181,64 @@ func (r *TechRegistry) Allows(host string, candidates []string) bool {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	set, ok := r.byHost[host]
-	if !ok || len(set) == 0 {
-		return true // fail-open: host unknown
+	ht, ok := r.byHost.Peek(host) // Peek: see Has (avoid LRU write-lock on the read path)
+	if !ok || len(ht.stack) == 0 {
+		return true // fail-open: stack unknown
 	}
 	for _, t := range candidates {
-		if _, ok := set[t]; ok {
+		if _, ok := ht.stack[t]; ok {
 			return true
 		}
 	}
-	return false
+	// No candidate matched. Skip only when the host is positively identified
+	// in one of the candidates' (exclusive) categories.
+	for _, t := range candidates {
+		cat := TechCategoryOf(t)
+		if cat == "" || cat == TechCategoryServer {
+			continue
+		}
+		if _, known := ht.cats[cat]; known {
+			return false
+		}
+	}
+	return true
 }
 
-// HostKnown reports whether any tech has been detected for host yet.
+// Tags returns every tech tag detected for host (stack and descriptive),
+// sorted, or nil when the host is unknown. Sorted because the result is
+// persisted to http_records.technology and exported: an unstable order would
+// make two identical scans diff.
+//
+// The returned slice is a copy - the registry's own sets stay private, so a
+// caller cannot mutate another module's gating data by holding onto it.
+func (r *TechRegistry) Tags(host string) []string {
+	if r == nil {
+		return nil
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return nil
+	}
+	r.mu.RLock()
+	ht, ok := r.byHost.Peek(host) // Peek: see Has (avoid LRU write-lock on the read path)
+	if !ok || len(ht.stack)+len(ht.desc) == 0 {
+		r.mu.RUnlock()
+		return nil
+	}
+	tags := make([]string, 0, len(ht.stack)+len(ht.desc))
+	for tag := range ht.stack {
+		tags = append(tags, tag)
+	}
+	for tag := range ht.desc {
+		tags = append(tags, tag)
+	}
+	r.mu.RUnlock()
+	sort.Strings(tags)
+	return tags
+}
+
+// HostKnown reports whether a STACK tag has been detected for host yet.
+// Descriptive tags (spa, angular, …) do not make a host known.
 func (r *TechRegistry) HostKnown(host string) bool {
 	if r == nil {
 		return false
@@ -140,6 +249,6 @@ func (r *TechRegistry) HostKnown(host string) bool {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	set, ok := r.byHost[host]
-	return ok && len(set) > 0
+	ht, ok := r.byHost.Peek(host)
+	return ok && len(ht.stack) > 0
 }

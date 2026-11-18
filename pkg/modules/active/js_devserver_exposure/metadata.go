@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed JavaScript development server endpoints that should never be
-accessible in production. Development servers expose hot module replacement (HMR)
-endpoints, debug tools, and internal APIs that leak source code, enable code injection,
-or reveal server internals.
+	ModuleDesc = `**What it means:** A JavaScript build tool's development server endpoint is reachable on a public host. The scanner confirmed dev-only routes (webpack/Turbopack HMR, Vite ping, SockJS, Vue CLI open-in-editor, Nuxt, Remix, esbuild, Parcel) by status, Content-Type, or markers. Dev servers should never run in production.
 
-## Notes
-- Runs once per host
-- Probes: webpack HMR, Vite ping, webpack dev server sockjs, Vue CLI open-in-editor, Nuxt HMR, Remix dev
-- Validates via Content-Type and response body markers
-- Fingerprints 404 to avoid false positives on custom error pages
+**How it's exploited:** The surface reveals the framework and development mode, often meaning verbose errors, source maps, and unminified code. HMR and SockJS channels can leak source, and Vue CLI open-in-editor has allowed reading host files.
 
-## References
-- https://webpack.js.org/configuration/dev-server/
-- https://vitejs.dev/config/server-options`
+**Fix:** Build and serve in production mode so dev servers are disabled, or block these paths at the edge.`
 
 	ModuleConfirmation = "Confirmed when a dev server endpoint responds with expected Content-Type or markers"
 	ModuleSeverity     = severity.Medium

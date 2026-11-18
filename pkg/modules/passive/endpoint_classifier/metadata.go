@@ -9,19 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Classifies HTTP endpoints and annotates database records with semantic tags (remarks).
-Tags are derived from request/response characteristics such as content type, status code,
-path patterns, and authentication headers.
+	ModuleDesc = `**What it means:** An informational utility finding, not a vulnerability. The scanner passively attached semantic labels (such as graphql, api-endpoint, json-api, html-page, form-endpoint, file-upload, authenticated, redirect) so the endpoint's role is easier to triage. Labels come from the path, Content-Type, Authorization header, and status code.
 
-## Tags Applied
-- json-api, html-page, graphql, api-endpoint
-- file-upload, redirect, error-page, authenticated
-- xml-api, form-endpoint
+**How it's exploited:** No direct exploit. The tags help an auditor map attack surface faster - quickly locating file-upload, GraphQL, or authenticated API endpoints worth deeper injection, access-control, or upload testing.
 
-## Notes
-- Runs as a passive module, no additional requests sent
-- Tags stored in HTTPRecord.Remarks for downstream filtering and prioritization`
+**Fix:** No remediation required; use the labels to focus security review on the higher-risk endpoints they surface.`
 
 	ModuleConfirmation = "Endpoint classified based on HTTP request/response characteristics"
 	ModuleSeverity     = severity.Info

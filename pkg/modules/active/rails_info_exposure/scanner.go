@@ -68,21 +68,51 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
+	urlx, err := ctx.URL()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Walk the web root plus any context-path prefixes of the observed URL so a
+	// Rails app mounted under a sub-path (e.g. /app/rails/info/routes) is reached,
+	// not just the root. Claim each (host, base) pair up front so a fully-deduped
+	// request issues no traffic — including the soft-404 fingerprint.
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
 		return nil, nil
 	}
 
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
-	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p, fp); result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, p := range probes {
+			if result := m.probeEndpoint(ctx, httpClient, scanCtx, p, base+p.path, fp); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 
 	return results, nil
+}
+
+// looksLikeRailsHealthCheck reports whether a /up response is the genuine Rails
+// health page rendered by Rails::HealthController#show (Rails 7.1+):
+//
+//	<!DOCTYPE html><html><body style="background-color: #01d28e"></body></html>
+//
+// It is a tiny text/html page whose defining trait is a coloured <body> status
+// banner (green when healthy). Requiring that exact shape stops the markerless /up
+// probe from fingerprinting every framework that merely returns a small 200 for
+// /up — a Node/Express geo endpoint answering {"country":...} JSON, a generic
+// catch-all, a load-balancer "OK" — as a Rails app.
+func looksLikeRailsHealthCheck(contentType, body string) bool {
+	if contentType != "" && !strings.Contains(strings.ToLower(contentType), "text/html") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "<body") && strings.Contains(lower, "background-color")
 }
 
 func (m *Module) fingerprint404(
@@ -100,11 +130,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -122,23 +150,23 @@ func (m *Module) fingerprint404(
 func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	p probe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, p.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -202,14 +230,35 @@ func (m *Module) probeEndpoint(
 			return nil
 		}
 	} else {
-		// For the /up probe (no markers): accept any 200 with small body (< 1024 bytes).
-		if len(body) >= 1024 {
+		// For the /up probe (no markers): confirm the response is the genuine Rails
+		// health page rendered by Rails::HealthController#show, not merely a small
+		// 200. Accepting any small non-empty 200 mis-fingerprinted every app that
+		// answers /up — a Node/Express geo endpoint returning {"country":...} JSON,
+		// a catch-all, a load-balancer "OK" — as Rails (observed firing "firm" on an
+		// X-Powered-By: Express host). looksLikeRailsHealthCheck demands the Rails
+		// shape; the soft-404 check then rules out a host that wildcards that shape.
+		ct := ""
+		if resp.Response() != nil {
+			ct = resp.Response().Header.Get("Content-Type")
+		}
+		if !looksLikeRailsHealthCheck(ct, body) {
+			return nil
+		}
+		if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), "") {
 			return nil
 		}
 	}
 
+	// Sub-directory catch-all guard for marker-based probes: now that we probe
+	// under context-path prefixes, drop the finding if a nonexistent sibling under
+	// the same parent returns the same markers (a handler that 200s every child).
+	// The markerless /up probe is already guarded by ConfirmNotSoft404 above.
+	if len(p.markers) > 0 && modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, probePath, p.markers) {
+		return nil
+	}
+
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
 		URL:              targetURL,

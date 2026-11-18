@@ -9,24 +9,18 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for NoSQL injection by injecting MongoDB query operators ($ne, $gt, $regex,
-$where) and detecting authentication bypass, data exfiltration, and behavioral
-changes. Complements nosqli_error_based by focusing on operator-level injection
-rather than error messages.
+	ModuleDesc = `**What it means:** A parameter flows into a NoSQL query (typically MongoDB) without being treated as a plain string, so injected operators like $ne, $gt, $regex, $where, or array syntax such as param[$ne]= are interpreted as query logic, defeating authentication.
 
-## Notes
-- Payload selection adapts to insertion point type (JSON, URL, body)
-- Four detection modes: auth bypass, size increase, boolean differential, time delay
-- Skips when NoSQL error patterns are detected (deferred to nosqli_error_based)
-- Deduplicates by request hash manager
+**How it's exploited:** An attacker swaps a value for an always-matching operator to bypass login as another user, or uses $regex / $where tautologies to exfiltrate records, confirmed via auth bypass, boolean differential, or injected delay.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/05.6-Testing_for_NoSQL_Injection
-- https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/NoSQL%20Injection`
+**Fix:** Cast input to the expected scalar type, reject objects where strings are expected, and use parameterized queries so user data cannot supply operators.`
 
 	ModuleConfirmation = "Confirmed when NoSQL operator injection causes authentication bypass, data exfiltration, or measurable behavioral change"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"injection", "sqli", "moderate"}
+	// All detection paths here are behavioral inferences (status transition,
+	// boolean differential, body growth, time delay) rather than direct proof of
+	// query control, so every finding is reported High/Tentative — a high-impact
+	// lead to verify, not a confirmed injection.
+	ModuleSeverity   = severity.Suspect
+	ModuleConfidence = severity.Tentative
+	ModuleTags       = []string{"injection", "sqli", "moderate"}
 )

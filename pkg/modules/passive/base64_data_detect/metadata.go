@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects interesting base64 encoded data in HTTP requests and responses.
-Matches known prefixes for JSON (eyJ), PHP serialized objects (YTo, Tzo),
-XML/PHP (PD8/PD9), HTTPS/HTTP URLs (aHR0cHM6L, aHR0cDo), and Java serialized
-objects (rO0).
+	ModuleDesc = `**What it means:** Base64-encoded data was spotted whose decoded prefix matches a security-relevant format: JSON/JWT (eyJ), PHP serialized (YTo, Tzo), XML/PHP tags (PD8), or a Java serialized object (rO0). Base64 is not encryption, so the data is readable. Informational signal.
 
-## Notes
-- Scans both request and response content
-- Low noise: only flags known interesting base64 prefixes
-- Manual review is recommended to assess the encoded data
+**How it's exploited:** The blob marks where the app moves structured state through a parameter, cookie, or body. An attacker decodes it to forge or replay JSON/JWT claims, or supplies a crafted serialized payload that may trigger insecure deserialization.
 
-## References
-- https://portswigger.net/kb/issues/00700200_base64-encoded-data-in-parameter
-- https://cheatsheetseries.owasp.org/index.html
-- https://github.com/tomnomnom/gf/blob/master/examples/base64.json`
+**Fix:** Treat client-supplied encoded values as untrusted: integrity-protect tokens, validate decoded structures, and avoid native deserialization of PHP or Java objects.`
 
 	ModuleConfirmation = "Confirmed when request or response contains base64-encoded data matching known interesting prefixes (JSON, PHP objects, URLs, Java objects)"
 	ModuleSeverity     = severity.Info

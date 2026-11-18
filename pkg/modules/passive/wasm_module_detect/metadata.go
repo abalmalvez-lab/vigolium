@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects WebAssembly (WASM) module usage by identifying .wasm files,
-application/wasm content types, WASM magic bytes, and WebAssembly instantiation
-calls in JavaScript files.
+	ModuleDesc = `**What it means:** The application ships WebAssembly (WASM) to the browser. This passive fingerprint flags it via WASM magic bytes (the \x00asm signature), an application/wasm response, or WebAssembly.instantiate/compile calls in served JS. Informational recon, but WASM often holds proprietary client-side logic that can be inspected and bypassed.
 
-## Notes
-- Detects WASM binary files via magic bytes (\x00asm)
-- Identifies WebAssembly.instantiate, WebAssembly.compile, and WebAssembly.instantiateStreaming calls in JS
-- WASM modules may contain sensitive logic worth reverse engineering
-- Useful for identifying client-side logic that may bypass server-side controls
+**How it's exploited:** An attacker downloads the .wasm module and decompiles it (with wasm2wat) to reverse-engineer business logic, licensing or anti-fraud checks, and embedded secrets, and to find client-side controls to disable.
 
-## References
-- https://webassembly.org/
-- https://developer.mozilla.org/en-US/docs/WebAssembly`
+**Fix:** Treat WASM as untrusted client code: keep security decisions and secrets server-side, and avoid embedding sensitive logic or credentials.`
 
 	ModuleConfirmation = "Confirmed when response contains WASM magic bytes, application/wasm content type, or WebAssembly instantiation calls"
 	ModuleSeverity     = severity.Info

@@ -2,13 +2,13 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,24 +17,27 @@ import (
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/internal/ingestor"
 	"github.com/vigolium/vigolium/internal/runner"
+	"github.com/vigolium/vigolium/internal/scratch"
+	"github.com/vigolium/vigolium/pkg/apicontract"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/core"
-	"github.com/vigolium/vigolium/pkg/core/network"
-	hostlimit "github.com/vigolium/vigolium/pkg/core/ratelimit"
-	"github.com/vigolium/vigolium/pkg/core/services"
 	"github.com/vigolium/vigolium/pkg/database"
-	"github.com/vigolium/vigolium/pkg/dedup"
-	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/httpstack"
 	"github.com/vigolium/vigolium/pkg/input/formats/detect"
-	"github.com/vigolium/vigolium/pkg/input/formats/openapi"
 	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/notify/webhook"
+	"github.com/vigolium/vigolium/pkg/requestinput"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types"
+	"github.com/vigolium/vigolium/pkg/work"
 	"go.uber.org/zap"
 )
 
 var ingestOpts = ingestor.DefaultOptions()
+
+// ingestKeepBlocked backs --keep-blocked (core.ExecutorConfig.KeepBlocked).
+var ingestKeepBlocked bool
 var ingestScanUUID string
 
 var ingestCmd = &cobra.Command{
@@ -47,9 +50,12 @@ Two modes:
   • Remote — POSTs to a running 'vigolium server' via -s/--server (requires VIGOLIUM_API_KEY)
 
 Stdin and -i auto-detect the content shape: a URL list, a raw HTTP request,
-a Burp request/response pair (split by '***'), or a curl command. Inputs that
+a Burp request/response pair (split by '***'), a curl command, or any of the
+file formats (HAR, OpenAPI, Postman, Burp XML, ...); -I pins the format for
+either. Stdin is spooled to a temporary file and read like -i <file>. Inputs that
 already carry a response (Burp pair, HAR, …) are stored as-is — no live
 refetch — so the response you pasted is what lands in the database.`,
+	Args: cobra.NoArgs,
 	RunE: runIngestCmd,
 }
 
@@ -58,15 +64,34 @@ func init() {
 	flags := ingestCmd.Flags()
 
 	flags.StringVarP(&ingestOpts.ServerURL, "server", "s", "", "Server URL for remote ingestion (omit for local mode)")
-	flags.BoolVarP(&globalScanOnReceive, "scan-on-receive", "S", false, "Continuously scan new HTTP records as they arrive in the database")
+	registerScanOnReceiveFlags(flags, "Continuously scan new HTTP records as they arrive in the database")
 	flags.BoolVar(&globalFullNativeScanOnReceive, "full-native-scan-on-receive", false, "Run the full native scan pipeline (discovery + spidering + dynamic-assessment) continuously on received records, instead of dynamic-assessment only")
 	flags.BoolVar(&globalDisableFetchResponse, "disable-fetch-response", false, "Store requests without fetching responses during ingestion")
-	flags.StringVar(&globalScopeOrigin, "scope-origin", "", "Host scope strictness: all, relaxed, balanced, strict")
+	flags.BoolVar(&ingestKeepBlocked, "keep-blocked", false, "Store a fetched response the block detector classifies as a WAF/bot-wall page (remark blocked:<reason>) instead of dropping the record")
+	flags.StringVar(&globalScopeOrigin, "scope-origin", "", scopeOriginFlagUsage)
 
 	registerInputSourceFlags(flags)
+	registerIngestBatchFlags(flags)
+	// Make a repeated -i accumulate rather than overwrite. Installed after the
+	// flag exists, and only on ingest: `scan -i` is single-source by design.
+	installIngestRepeatableInput(ingestCmd)
 	registerHTTPClientFlags(flags)
 	registerScanModuleFlags(flags)
 	registerSpecFlags(flags)
+}
+
+// ingestFollowUpQuery returns the read that actually shows what an ingest just
+// stored.
+//
+// It used to interpolate the INPUT FORMAT into --source: `--source har`,
+// `--source urls`, `--source openapi`. Those are two disjoint vocabularies that
+// overlap only on the token `burp` — --source takes a record-source label
+// (ingest-cli, ingest-server, ingest-proxy, scanner, finding, burp, caido) — so
+// the hint reliably returned zero rows right after a successful ingest, which
+// reads as "the ingest silently did nothing". A plain recency listing answers
+// the question the hint is for without pretending to filter by provenance.
+func ingestFollowUpQuery() []string {
+	return []string{"traffic", "--json", "-n", "20"}
 }
 
 func runIngestCmd(cmd *cobra.Command, args []string) error {
@@ -75,6 +100,7 @@ func runIngestCmd(cmd *cobra.Command, args []string) error {
 	// Copy global flags into ingestOpts
 	ingestOpts.Input = globalInput
 	ingestOpts.InputFormat = globalInputMode
+	ingestOpts.TargetFiles = globalTargetFiles
 	ingestOpts.RateLimit = globalRateLimit
 	ingestOpts.Concurrency = globalConcurrency
 	ingestOpts.EnableModules = resolveModules()
@@ -92,35 +118,329 @@ func runIngestCmd(cmd *cobra.Command, args []string) error {
 		ingestOpts.TargetURL = globalTargets[0]
 	}
 
-	// Check for blank input: no targets, no input file, and no piped stdin
+	// Check for blank input: no targets, no input file, no target file, and no
+	// piped stdin
 	hasTargets := len(globalTargets) > 0
 	hasInputFile := ingestOpts.Input != "" && ingestOpts.Input != "-"
+	hasTargetFiles := len(globalTargetFiles) > 0
 	hasStdin := fileutil.HasStdin()
-	if !hasTargets && !hasInputFile && !hasStdin {
-		fmt.Fprintf(os.Stderr, "%s Tip: use %s, %s, or pipe data via stdin\n",
+	// --dir is input in its own right: the directory expands into sources below,
+	// after this check, so it must count here or `ingest --dir X` never runs.
+	hasDir := strings.TrimSpace(ingestDir) != ""
+	if !hasTargets && !hasInputFile && !hasTargetFiles && !hasDir && !hasStdin {
+		fmt.Fprintf(os.Stderr, "%s Tip: use %s, %s, %s, %s, or pipe data via stdin\n",
 			terminal.InfoSymbol(),
 			terminal.Cyan("-t <url>"),
-			terminal.Cyan("-i <file>"))
-		return fmt.Errorf("no input provided")
+			terminal.Cyan("-T <file>"),
+			terminal.Cyan("-i <file>"),
+			terminal.Cyan("--dir <dir>"))
+		return usageErrorf("no input provided: pass -t, -T, -i or --dir, or pipe data on stdin")
+	}
+
+	// Decide whether stdin is really this command's input, by the same rule the
+	// scanning commands use.
+	//
+	// The old test was `Input == "-" && !hasStdin`, which only dropped stdin for
+	// a TTY. But -i defaults to "-" (see flag_helpers.go) and HasStdin() is true
+	// for ANY stdin that is not a character device, so `vigolium ingest -t URL`
+	// under an inherited pipe - a CI runner, an agent harness - kept Input at "-"
+	// and handed os.Stdin to the parser. That read has no --input-read-timeout
+	// behind it, so unlike the scan path it hung forever rather than for three
+	// minutes. A typed `-i -` still asks for stdin explicitly.
+	if useStdin, _ := resolveStdinInput(hasStdin, cmd.Flags().Changed("input"), globalInput, len(globalTargets), len(globalTargetFiles)); !useStdin {
+		if ingestOpts.Input == "-" {
+			ingestOpts.Input = ""
+		}
+	}
+
+	// Stdin is spooled to a scratch file and ingested as that file, so -I and
+	// the file format detection (HAR, OpenAPI, Postman, Burp XML, ...) apply to
+	// piped input exactly as to -i <file>. The stdin path used to know only URL
+	// lists and single requests: a piped HAR stored nothing, and a piped
+	// OpenAPI document became requests to http://servers/ and http://paths/.
+	if ingestOpts.Input == "-" {
+		spooled, cleanup, err := spoolIngestStdin()
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		ingestOpts.Input = spooled
 	}
 
 	// Validate mutual exclusivity: -t/--target and --spec-url cannot both be set
 	if ingestOpts.TargetURL != "" && ingestOpts.UseSpecServers {
-		return fmt.Errorf("--target/-t and --spec-url are mutually exclusive")
+		return usageErrorf("--target/-t and --spec-url are mutually exclusive")
+	}
+
+	// Resolve the full source list (repeated -i plus --dir). One process handles
+	// all of them: N subprocesses against one SQLite file is the shape this
+	// removes, not a concurrency problem to tune.
+	sources, srcErr := ingestInputSources(ingestOpts.Input)
+	if srcErr != nil {
+		return asUsageError(srcErr)
 	}
 
 	// Branch: remote vs local mode
-	if ingestOpts.ServerURL != "" {
+	remote := ingestOpts.ServerURL != "" && !ingestDryRun // a dry run only parses, locally
+	run := runLocalIngest
+	if remote {
 		if globalScanOnReceive {
-			zap.L().Warn("--scan-on-receive/-S is ignored in remote mode; the server handles scanning independently")
+			zap.L().Warn("--scan-on-receive is ignored in remote mode; the server handles scanning independently")
 		}
-		return runRemoteIngest(cmd, args)
+		run = runRemoteIngest
 	}
-	return runLocalIngest(cmd, args)
+
+	// Multi-source: run the same path once per source, swapping only the input.
+	// A failing source does not discard its siblings — the point of a batch is
+	// that one bad HAR in fifty does not cost the other forty-nine — but the
+	// command still exits non-zero and names how many failed.
+	//
+	// Only an EMPTY list means stdin: ingestInputSources drops "-" and "", so a
+	// stdin run resolves to no sources and keeps ingestOpts.Input as resolved
+	// above. A single source is used as is — it may be the one file a --dir
+	// matched, which ingestOpts.Input never held.
+	switch {
+	case len(sources) == 0:
+		sources = []string{ingestOpts.Input}
+	case len(sources) > 1:
+		announceIngestBatch(sources)
+	}
+	// Every path is checked before anything is ingested: a missing file or a
+	// directory given to -i used to end as "0 records" and exit 0.
+	for _, src := range sources {
+		if err := checkIngestSourcePath(src); err != nil {
+			return err
+		}
+	}
+
+	// The summary is emitted ONCE, here, from the accumulated outcome. It used
+	// to be printed by each per-source run, so a batch of fifty HARs with -j
+	// wrote fifty top-level JSON documents to stdout — a stream no single
+	// json.Unmarshal can read.
+	started := time.Now()
+	var total ingestOutcome
+	failedSources := 0
+	var unparsed []string
+	for _, src := range sources {
+		ingestOpts.Input = src
+		ingestItemsRead.Store(0)
+		out, err := run(cmd, args)
+		total.add(out)
+		if err != nil {
+			if len(sources) == 1 {
+				return err
+			}
+			failedSources++
+			fmt.Fprintf(os.Stderr, "%s ingest %s: %v\n", terminal.WarnPrefix(), src, err)
+			continue
+		}
+		if !remote && ingestSourceIsFile(src) && ingestItemsRead.Load() == 0 {
+			unparsed = append(unparsed, src)
+		}
+	}
+	reportErr := reportIngest(total, remote, failedSources, len(sources), time.Since(started))
+	if reportErr == nil && len(unparsed) > 0 {
+		return clicommon.CLIError{
+			Err: fmt.Errorf("%d of %d input(s) yielded no records: %s",
+				len(unparsed), len(sources), strings.Join(unparsed, ", ")),
+			Code: apicontract.CodeInputUnparsed,
+			Hint: "Check the file's format; pin it with -I <format> (see 'vigolium scan --list-input-mode')",
+		}
+	}
+	return reportErr
+}
+
+// ingestItemsRead counts the work items the current source yielded.
+var ingestItemsRead atomic.Int64
+
+// countingInputSource counts the items its source yields into ingestItemsRead.
+type countingInputSource struct{ source.InputSource }
+
+func (c countingInputSource) Next(ctx context.Context) (*work.WorkItem, error) {
+	item, err := c.InputSource.Next(ctx)
+	if err == nil && item != nil {
+		ingestItemsRead.Add(1)
+	}
+	return item, err
+}
+
+// ingestSourceIsFile reports whether an ingest input is a local file (not
+// stdin, not a URL).
+func ingestSourceIsFile(src string) bool {
+	return src != "" && src != "-" && !strings.Contains(src, "://")
+}
+
+// checkIngestSourcePath refuses an -i path that does not exist (source_missing)
+// or is a directory (source_unreadable; --dir ingests a directory).
+func checkIngestSourcePath(src string) error {
+	if !ingestSourceIsFile(src) {
+		return nil
+	}
+	info, err := os.Stat(src)
+	switch {
+	case err != nil && errors.Is(err, os.ErrNotExist):
+		return clicommon.CLIError{Err: fmt.Errorf("ingest input %s: %w", src, err), Code: apicontract.CodeSourceMissing}
+	case err != nil:
+		return clicommon.CLIError{Err: fmt.Errorf("ingest input %s: %w", src, err), Code: apicontract.CodeSourceUnreadable}
+	case info.IsDir():
+		return clicommon.CLIError{
+			Err:  fmt.Errorf("ingest input %s is a directory", src),
+			Code: apicontract.CodeSourceUnreadable,
+			Hint: "To ingest every file in it: vigolium ingest --dir " + src,
+		}
+	}
+	return nil
+}
+
+// reportIngest emits the one completion document for the whole invocation and
+// decides the exit code.
+//
+// What it reports is what the database HOLDS. The old line printed
+// `executor.Processed() + directSaved` — items attempted — so an ingest whose
+// every fetch failed announced "30 records ingested" and exited 0 over a table
+// with no rows in it. A run that could not store everything it read now says so
+// and exits non-zero.
+func reportIngest(out ingestOutcome, remote bool, failedSources, totalSources int, elapsed time.Duration) error {
+	if remote {
+		return reportRemoteIngest(out, failedSources, totalSources, elapsed)
+	}
+
+	if globalJSON {
+		// items is [] rather than nil: the envelope's contract is that `items`
+		// is the canonical collection, and a JSON null breaks every consumer
+		// that iterates or measures it.
+		items := make([]any, 0, len(out.Records))
+		for _, r := range out.Records {
+			items = append(items, r)
+		}
+		changed := out.Stored > 0
+		if out.Written >= 0 {
+			changed = out.Written > 0
+		}
+		env := newAgentEnvelope("ingest", "", items, out.Stored, 0, 0).
+			asMutation(changed, "ingest", ingestDryRun)
+		if ingestDryRun {
+			env.With("would_ingest", ingestDryRunItems)
+		}
+		env.DBPath = resolvedReadDBPath()
+		env.With("records_ingested", out.Stored).
+			With("records_failed", out.Failed).
+			With("records_skipped", out.Skipped).
+			With("records_written", max(out.Written, 0)).
+			With("duration_ms", elapsed.Milliseconds()).
+			With("input_format", strings.Join(out.Formats, ",")).
+			With("record_source", database.RecordSourceIngestCLI).
+			With("items_truncated", out.RecordsTruncated)
+		if len(out.Reasons) > 0 {
+			env.With("failure_reasons", out.Reasons).With("failures", out.Failures)
+		}
+		// The obvious next step after an ingest is to look at what landed.
+		env.WithQuery(ingestFollowUpQuery()...)
+		if err := writeAgentJSON(env); err != nil {
+			return err
+		}
+	} else if !globalSilent {
+		if ingestDryRun {
+			fmt.Fprintf(os.Stderr, "\n%s Dry run: %d request(s) parsed; nothing was sent or stored\n", terminal.InfoSymbol(), ingestDryRunItems)
+		} else {
+			fmt.Fprintf(os.Stderr, "\n%s\n", ingestSummaryLine(out, elapsed))
+		}
+	}
+
+	if out.Failed > 0 {
+		return codedErrorf(errCodeIngestIncomplete,
+			"stored %d of %d record(s); %d could not be stored%s",
+			out.Stored, out.Stored+out.Failed, out.Failed, ingestFailureHint(out.Reasons))
+	}
+	if failedSources > 0 {
+		return fmt.Errorf("%d of %d ingest source(s) failed", failedSources, totalSources)
+	}
+	return nil
+}
+
+// ingestFailureHint names why records were not stored, most common reason
+// first, and the flag that fixes the dominant one. The per-record list is in
+// -j's `failures`.
+func ingestFailureHint(reasons map[string]int64) string {
+	if len(reasons) == 0 {
+		return " (no response to store, or the write was refused)"
+	}
+	keys := core.SortedDropReasons(reasons)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s %d", k, reasons[k]))
+	}
+	hint := " — " + strings.Join(parts, ", ")
+	switch keys[0] {
+	case core.DropBlocked:
+		hint += ". The answers were WAF/bot-wall pages: --keep-blocked stores them marked, --disable-fetch-response stores the requests without fetching"
+	case core.DropFetchError, core.DropQuarantined:
+		hint += ". The hosts did not answer: --disable-fetch-response stores the requests without fetching"
+	case core.DropBudget:
+		hint += ". The request budget ran out: raise --max-requests / --max-requests-per-host"
+	case core.DropOutOfScope:
+		hint += ". The answers were out of scope and scope.applied_on_ingest is set"
+	}
+	return hint + " (per-record reasons: -j, `failures`)"
+}
+
+// ingestSummaryLine renders the human completion line. A run that stored
+// everything keeps the wording it has always had; one that did not leads with
+// the shortfall rather than burying it after a success symbol.
+func ingestSummaryLine(out ingestOutcome, elapsed time.Duration) string {
+	suffix := ""
+	if globalDisableFetchResponse {
+		suffix = " (no response fetch)"
+	}
+	if out.Skipped > 0 {
+		suffix += fmt.Sprintf(", %d skipped by scope/static filters", out.Skipped)
+	}
+	if out.Failed > 0 {
+		return fmt.Sprintf("%s %s (%.1fs)",
+			terminal.ErrorSymbol(),
+			terminal.Red(fmt.Sprintf("Ingestion incomplete: %d of %d records stored, %d failed%s",
+				out.Stored, out.Stored+out.Failed, out.Failed, suffix)),
+			elapsed.Seconds())
+	}
+	return fmt.Sprintf("%s %s (%.1fs)",
+		terminal.SuccessSymbol(),
+		terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested%s", out.Stored, suffix)),
+		elapsed.Seconds())
+}
+
+// reportRemoteIngest keeps remote mode's established output shape — it counts
+// HTTP submissions, not rows, because the server owns the store — while still
+// emitting exactly one document for the whole invocation.
+func reportRemoteIngest(out ingestOutcome, failedSources, totalSources int, elapsed time.Duration) error {
+	if globalJSON {
+		// The envelope around the counters remote mode always reported: total is
+		// the submissions, and changed says whether the server accepted any.
+		env := newAgentEnvelope("ingest", "", []any{}, out.Submitted, 0, 0).
+			asMutation(out.Submitted > 0, "submit", false)
+		env.With("records_submitted", out.Submitted).
+			With("errors", out.Errors).
+			With("duration_ms", elapsed.Milliseconds())
+		if err := writeAgentJSON(env); err != nil {
+			return err
+		}
+	} else {
+		rate := float64(0)
+		if secs := elapsed.Seconds(); secs > 0 {
+			rate = float64(out.Submitted) / secs
+		}
+		fmt.Printf("\nSubmitted: %d | Errors: %d | Elapsed: %.1fs | Rate: %.1f/s\n",
+			out.Submitted, out.Errors, elapsed.Seconds(), rate)
+	}
+	if failedSources > 0 {
+		return fmt.Errorf("%d of %d ingest source(s) failed", failedSources, totalSources)
+	}
+	return nil
 }
 
 // runRemoteIngest sends requests to a remote vigolium server (existing behavior).
-func runRemoteIngest(_ *cobra.Command, _ []string) error {
+func runRemoteIngest(_ *cobra.Command, _ []string) (ingestOutcome, error) {
+	var outcome ingestOutcome
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -133,38 +453,27 @@ func runRemoteIngest(_ *cobra.Command, _ []string) error {
 	}()
 
 	stats, err := ingestor.Run(ctx, ingestOpts)
-	if err != nil {
-		return err
-	}
-
-	if globalJSON {
-		out := map[string]interface{}{
-			"records_submitted": stats.Submitted,
-			"errors":            stats.Errors,
-			"duration_ms":       stats.Elapsed.Milliseconds(),
-		}
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(out)
-	}
-
-	elapsed := stats.Elapsed.Seconds()
-	rate := float64(0)
-	if elapsed > 0 {
-		rate = float64(stats.Submitted) / elapsed
-	}
-	fmt.Printf("\nSubmitted: %d | Errors: %d | Elapsed: %.1fs | Rate: %.1f/s\n",
-		stats.Submitted, stats.Errors, elapsed, rate)
-	return nil
+	// Stats first: Run reports what it submitted even when an input source
+	// failed, and the caller adds this outcome to its total before it looks
+	// at the error.
+	outcome.Submitted = stats.Submitted
+	outcome.Errors = stats.Errors
+	return outcome, err
 }
 
-// runLocalIngest fetches HTTP responses and stores request/response pairs in the database.
-func runLocalIngest(cmd *cobra.Command, _ []string) error {
-	startTime := time.Now()
+// runLocalIngest fetches HTTP responses and stores request/response pairs in
+// the database, and reports what it actually stored. The caller owns the
+// summary; see reportIngest.
+func runLocalIngest(cmd *cobra.Command, _ []string) (outcome ingestOutcome, err error) {
+	// Unknown until the store is open and counted; see the deferred count below.
+	outcome.Written = -1
 
 	// --- 1. Auto-detect format ---
+	// -I given: the operator's format stands (no sniffing, even for -I urls).
+	formatExplicit := cmd.Flags().Changed("input-mode")
+	ingestInputFormatExplicit = formatExplicit
 	inputFormat := ingestOpts.InputFormat
-	if inputFormat == "urls" && ingestOpts.Input != "-" {
+	if inputFormat == "urls" && ingestOpts.Input != "-" && !formatExplicit {
 		if detected := detectInputFormat(ingestOpts.Input); detected != "" {
 			inputFormat = detected
 			zap.L().Info("Auto-detected input format", zap.String("format", inputFormat))
@@ -192,7 +501,28 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	var preloadedItems []*httpmsg.HttpRequestResponse
 	var detectedFormat detect.StdinFormat
 	if !cmd.Flags().Changed("input-mode") && inputFormat == "urls" {
-		preloadedItems, detectedFormat = tryPreloadAutoDetect(useStdin, filePath)
+		var preloadErr error
+		preloadedItems, detectedFormat, preloadErr = tryPreloadAutoDetect(useStdin, filePath)
+		// Stdin is consumed here for good; there is no second read to fall back
+		// to. A read that failed must stop the run and say why, not continue to
+		// a streaming source that can only report an empty pipe.
+		if preloadErr != nil {
+			return outcome, fmt.Errorf("failed to read ingest input: %w", preloadErr)
+		}
+	}
+	outcome.noteFormat(reportedIngestFormat(inputFormat, filePath, formatExplicit))
+	if detectedFormat != "" {
+		outcome.Formats = []string{string(detectedFormat)}
+	}
+
+	// A raw request (or Burp pair) with -t is rebased onto -t: the -t names
+	// where the captured request goes, not a second input.
+	if len(globalTargets) > 0 && (detectedFormat == detect.FormatRawHTTP || detectedFormat == detect.FormatBurpPair) {
+		items, err := rebaseRawRequests(preloadedItems, globalTargets[0])
+		if err != nil {
+			return outcome, err
+		}
+		preloadedItems = items
 	}
 
 	if len(preloadedItems) > 0 && detectedFormat != detect.FormatURLs {
@@ -211,40 +541,67 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 		// directly below so the response the user pasted is preserved.
 		inputSource = source.NewSliceSource(preloadedNeedFetch, ingestOpts.EnableModules)
 	} else {
+		targets := globalTargets
+		if rawRequestFormat(inputFormat) && (filePath != "" || useStdin) {
+			// -t is the base the raw request is rebased onto (burpraw
+			// SetBaseURL via ApplySpecOptions), not a target of its own.
+			targets = nil
+		}
 		built, err := source.NewInputSource(source.SourceConfig{
-			Targets:    globalTargets,
-			FilePath:   filePath,
-			Format:     inputFormat,
-			UseStdin:   useStdin,
-			BufferSize: 100,
+			Targets:        targets,
+			FilePath:       filePath,
+			FilePaths:      globalTargetFiles,
+			Format:         inputFormat,
+			FormatExplicit: formatExplicit,
+			UseStdin:       useStdin,
+			BufferSize:     100,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to create input source: %w", err)
+			return outcome, fmt.Errorf("failed to create input source: %w", err)
 		}
 		inputSource = built
 	}
+	// If raw-HTTP/burp/curl was preloaded from stdin or -i but -T target files
+	// were also supplied, fold those URL-list files in so they aren't dropped
+	// (the preloaded branch above builds a slice source that ignores them).
+	if len(preloadedItems) > 0 && len(globalTargetFiles) > 0 {
+		tfSrc, tfErr := source.NewInputSource(source.SourceConfig{
+			FilePaths:      globalTargetFiles,
+			Format:         inputFormat,
+			FormatExplicit: formatExplicit,
+			BufferSize:     100,
+		})
+		if tfErr != nil {
+			return outcome, fmt.Errorf("failed to create target-file source: %w", tfErr)
+		}
+		inputSource = source.NewMultiSource(inputSource, tfSrc)
+	}
 	defer func() { _ = inputSource.Close() }()
 
-	// Configure OpenAPI options if applicable (same pattern as runner.go)
-	if inputFormat == "openapi" || inputFormat == "swagger" {
-		if fs, ok := inputSource.(*source.FileSource); ok {
-			if openapiFormat, ok := fs.Format().(*openapi.Format); ok {
-				openapiFormat.SetOpenAPIOptions(openapi.Options{
-					BaseURL:              ingestOpts.TargetURL,
-					UseSpecServers:       ingestOpts.UseSpecServers,
-					Headers:              ingestParseHeaders(ingestOpts.Headers),
-					Variables:            ingestParseVariables(ingestOpts.Variables),
-					DefaultFallbackValue: ingestOpts.DefaultParam,
-				})
-			}
-		}
+	// Configure spec-format options (OpenAPI, WSDL, Postman) on the file
+	// parser — the same source.ApplySpecOptions scan and the runner use, so it
+	// lands even when -t/-T is combined with -i and covers a sniffed spec.
+	source.ApplySpecOptions(inputSource, source.SpecOptions{
+		BaseURL:              ingestOpts.TargetURL,
+		UseSpecServers:       ingestOpts.UseSpecServers,
+		Headers:              ingestParseHeaders(ingestOpts.Headers),
+		Variables:            ingestParseVariables(ingestOpts.Variables),
+		DefaultFallbackValue: ingestOpts.DefaultParam,
+	})
+	// Count what the input yields, so a file that parses to nothing is told
+	// apart from one whose records were all filtered.
+	ingestItemsRead.Add(int64(len(preloadedWithResp)))
+	inputSource = countingInputSource{InputSource: inputSource}
+	if ingestDryRun {
+		return outcome, drainIngestDryRun(inputSource, len(preloadedWithResp))
 	}
 
 	// --- 4. Initialize database ---
-	settings, err := config.LoadSettings(globalConfig)
+	// Global → the resolved project's overlay: the scope judged below (static
+	// filtering, --scan-on-receive admission) is the project's, as for `scan`.
+	settings, err := loadProjectSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return outcome, err
 	}
 
 	// Override scope origin mode if --scope-origin flag is set
@@ -258,12 +615,12 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	}
 
 	if err := settings.Database.Validate(); err != nil {
-		return fmt.Errorf("invalid database configuration: %w", err)
+		return outcome, fmt.Errorf("invalid database configuration: %w", err)
 	}
 
 	db, err := database.NewDB(&settings.Database)
 	if err != nil {
-		return fmt.Errorf("failed to create database connection: %w", err)
+		return outcome, fmt.Errorf("failed to create database connection: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
@@ -271,7 +628,7 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 
 	if err := db.CreateSchema(ctx); err != nil {
-		return fmt.Errorf("failed to create database schema: %w", err)
+		return outcome, fmt.Errorf("failed to create database schema: %w", err)
 	}
 
 	repo := database.NewRepository(db)
@@ -279,39 +636,14 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 
 	// --- 5. Initialize HTTP stack ---
 	opts := types.DefaultOptions()
+	globalFlagsToOptions(opts)
 	opts.Concurrency = ingestOpts.Concurrency
-	opts.Timeout = globalTimeout
-	opts.ProxyURL = globalProxy
-	opts.Verbose = globalVerbose
-	opts.Debug = globalDebug
-	opts.DumpTraffic = globalDumpTraffic
-	opts.MaxPerHost = globalMaxPerHost
-
-	if err := network.Init(opts); err != nil {
-		return fmt.Errorf("failed to initialize network: %w", err)
-	}
-
-	dedupMgr := dedup.NewManager()
-	defer dedupMgr.Close()
-
-	svc := &services.Services{
-		Options:      opts,
-		DedupManager: dedupMgr,
-	}
-
-	hostLimiter := hostlimit.NewHostRateLimiter(hostlimit.HostRateLimiterConfig{
-		MaxPerHost:    opts.MaxPerHost,
-		MaxEntries:    1000,
-		EvictAfter:    30 * time.Second,
-		EvictInterval: 10 * time.Second,
-	})
-	defer func() { _ = hostLimiter.Close() }()
-	svc.HostLimiter = hostLimiter
-
-	httpRequester, err := http.NewRequester(opts, svc)
+	stack, err := httpstack.New(httpstack.Config{Options: opts})
 	if err != nil {
-		return fmt.Errorf("failed to create HTTP requester: %w", err)
+		return outcome, err
 	}
+	defer stack.Close()
+	svc, httpRequester := stack.Services, stack.Requester
 
 	// --- 6. Signal handling ---
 	sigChan := make(chan os.Signal, 1)
@@ -326,145 +658,94 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	// Always create a matcher for static file filtering (unconditional)
 	staticMatcher := config.NewScopeMatcher(settings.Scope, globalTargets...)
 
+	// Every record this function writes — the direct-save paths below and the
+	// executor further down — belongs to the same project, so resolve it once.
+	// Without it records fall through to the default project and become
+	// invisible to every project-scoped read (scan feed, findings, exports).
+	ingestProjectUUID, projErr := resolveProjectUUID()
+	if projErr != nil {
+		return outcome, projErr
+	}
+
+	// Rows written is the store's count before and after, not the number of
+	// saves: a save of an exchange already stored returns the existing row,
+	// so a re-ingest of the same URLs stores everything and writes nothing.
+	if before, cerr := countIngestRecords(ctx, db, ingestProjectUUID); cerr == nil {
+		defer func() {
+			if after, aerr := countIngestRecords(context.Background(), db, ingestProjectUUID); aerr == nil {
+				outcome.Written = max(after-before, 0)
+			}
+		}()
+	}
+
+	// One saver for every record that arrives with its response already
+	// attached, whichever path it came in on: the auto-detected preload below,
+	// and — through preloadedResponseSource — the format parsers, which used to
+	// hand their captured responses to the executor to be discarded and
+	// re-fetched.
+	saver := &ingestSaver{
+		repo:          repo,
+		projectUUID:   ingestProjectUUID,
+		staticMatcher: staticMatcher,
+	}
+	if settings.Scope.AppliedOnIngest {
+		saver.scopeMatcher = config.NewScopeMatcher(settings.Scope, globalTargets...)
+	}
+
 	// Auto-skip refetch: items that already carry a response (Burp pair, etc.)
 	// are written straight to the database so the user-supplied response is
 	// preserved verbatim.
-	directSaved := 0
-	if len(preloadedWithResp) > 0 {
-		ingestProjectUUID, projErr := resolveProjectUUID()
-		if projErr != nil {
-			return projErr
-		}
-		var ingestScopeMatcher *config.ScopeMatcher
-		if settings.Scope.AppliedOnIngest {
-			ingestScopeMatcher = config.NewScopeMatcher(settings.Scope, globalTargets...)
-		}
-		for _, rr := range preloadedWithResp {
-			if staticMatcher.IsStaticFile(rr.Request().Path()) {
-				continue
-			}
-			if ingestScopeMatcher != nil {
-				if !ingestScopeMatcher.InScopeRequest(
-					rr.Service().Host(),
-					rr.Request().Path(),
-					rr.Request().Header("Content-Type"),
-					string(rr.Request().Raw()),
-				) {
-					continue
-				}
-			}
-			if _, saveErr := repo.SaveRecord(ctx, rr, "ingest-cli", ingestProjectUUID); saveErr != nil {
-				zap.L().Debug("Failed to save preloaded record", zap.Error(saveErr))
-				continue
-			}
-			directSaved++
-		}
-		if !globalSilent && directSaved > 0 {
-			fmt.Fprintf(os.Stderr, "%s Saved %d record(s) with attached response (no refetch)\n",
-				terminal.InfoSymbol(), directSaved)
-		}
+	for _, rr := range preloadedWithResp {
+		saver.save(ctx, rr)
 	}
 
 	// If everything was preloaded with responses, there is nothing left for
 	// the executor or the no-fetch branch to do.
 	if len(preloadedItems) > 0 && len(preloadedNeedFetch) == 0 {
-		if globalJSON {
-			out := map[string]interface{}{
-				"records_ingested": directSaved,
-				"duration_ms":      time.Since(startTime).Milliseconds(),
-				"source":           string(detectedFormat),
-			}
-			encoder := json.NewEncoder(os.Stdout)
-			encoder.SetIndent("", "  ")
-			return encoder.Encode(out)
-		}
-		elapsed := time.Since(startTime).Seconds()
-		if !globalSilent {
-			fmt.Fprintf(os.Stderr, "\n%s %s (%.1fs)\n",
-				terminal.SuccessSymbol(),
-				terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested", directSaved)),
-				elapsed)
-		}
+		outcome.add(saver.result())
+		noteIngestNoRefetch(outcome.Stored)
 		if globalScanOnReceive {
-			return runLocalIngestScan(settings, db, repo, "")
+			return outcome, runLocalIngestScan(settings, db, repo, "")
 		}
-		return nil
+		return outcome, nil
 	}
 
 	if globalDisableFetchResponse {
-		// Save requests directly without fetching responses
-		var scopeMatcher *config.ScopeMatcher
-		if settings.Scope.AppliedOnIngest {
-			scopeMatcher = config.NewScopeMatcher(settings.Scope, globalTargets...)
-		}
-
-		ingestProjectUUID, projErr := resolveProjectUUID()
-		if projErr != nil {
-			return projErr
-		}
-
-		var count int
+		// Store what the input carries without fetching anything: the same
+		// filters and the same accounting as the direct-save path, because it
+		// is the same write.
 		for {
 			item, nextErr := inputSource.Next(ctx)
 			if nextErr != nil {
 				break
 			}
-			// Always filter static files
-			if staticMatcher.IsStaticFile(item.Request.Request().Path()) {
+			if item == nil || item.Request == nil {
 				continue
 			}
-			// Request-only scope check (no response available)
-			if scopeMatcher != nil {
-				rr := item.Request
-				if !scopeMatcher.InScopeRequest(
-					rr.Service().Host(),
-					rr.Request().Path(),
-					rr.Request().Header("Content-Type"),
-					string(rr.Request().Raw()),
-				) {
-					continue
-				}
-			}
-			if _, saveErr := repo.SaveRecord(ctx, item.Request, "ingest-cli", ingestProjectUUID); saveErr != nil {
-				zap.L().Debug("Failed to save record", zap.Error(saveErr))
-				continue
-			}
-			count++
+			saver.save(ctx, item.Request)
+			item.Complete()
 		}
-
-		total := count + directSaved
-		if globalJSON {
-			out := map[string]interface{}{
-				"records_ingested": total,
-				"duration_ms":      time.Since(startTime).Milliseconds(),
-				"source":           inputFormat,
-			}
-			encoder := json.NewEncoder(os.Stdout)
-			encoder.SetIndent("", "  ")
-			return encoder.Encode(out)
-		}
-
-		elapsed := time.Since(startTime).Seconds()
-		if !globalSilent {
-			fmt.Fprintf(os.Stderr, "\n%s %s (%.1fs)\n",
-				terminal.SuccessSymbol(),
-				terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested (no response fetch)", total)),
-				elapsed)
-		}
-
+		outcome.add(saver.result())
+		noteIngestNoRefetch(outcome.Stored)
 		if globalScanOnReceive {
-			return runLocalIngestScan(settings, db, repo, "")
+			return outcome, runLocalIngestScan(settings, db, repo, "")
 		}
-		return nil
+		return outcome, nil
 	}
 
 	executorCfg := core.ExecutorConfig{
+		// The records an ingest fetches are ingest records, the same label
+		// the direct-save path writes and the -j document reports.
+		RecordSource:      database.RecordSourceIngestCLI,
 		Workers:           opts.Concurrency,
 		Services:          svc,
 		HTTPRequester:     httpRequester,
 		Repository:        repo,
 		ScanUUID:          ingestScanUUID,
+		ProjectUUID:       ingestProjectUUID,
 		StaticFileMatcher: staticMatcher, // always filter static files
+		KeepBlocked:       ingestKeepBlocked,
+		OnRecordStored:    saver.noteStored,
 	}
 
 	if settings.Scope.AppliedOnIngest {
@@ -472,42 +753,92 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 		executorCfg.ScopeOnIngest = true
 	}
 
-	executor := core.NewExecutor(executorCfg, inputSource, nil, nil)
+	// Records that already carry a response never reach the executor: a capture
+	// is ingested as captured, so ingesting one does not require every origin in
+	// it to still resolve.
+	executor := core.NewExecutor(executorCfg,
+		&preloadedResponseSource{inner: inputSource, save: saver.save}, nil, nil)
 	_, err = executor.Execute(ctx)
 	if err != nil {
-		return fmt.Errorf("ingestion failed: %w", err)
+		outcome.add(saver.result())
+		return outcome, fmt.Errorf("ingestion failed: %w", err)
 	}
 
-	// --- 8. Print summary ---
-	totalIngested := executor.Processed() + int64(directSaved)
-	summarySource := inputFormat
-	if detectedFormat != "" {
-		summarySource = string(detectedFormat)
-	}
-	if globalJSON {
-		out := map[string]interface{}{
-			"records_ingested": totalIngested,
-			"duration_ms":      time.Since(startTime).Milliseconds(),
-			"source":           summarySource,
-		}
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(out)
-	}
-
-	elapsed := time.Since(startTime).Seconds()
-	if !globalSilent {
-		fmt.Fprintf(os.Stderr, "\n%s %s (%.1fs)\n",
-			terminal.SuccessSymbol(),
-			terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested", totalIngested)),
-			elapsed)
-	}
+	// --- 8. Account for what was stored ---
+	outcome.add(saver.result())
+	noteIngestNoRefetch(outcome.Stored)
+	outcome.add(executorIngestOutcome(executor))
 
 	if globalScanOnReceive {
-		return runLocalIngestScan(settings, db, repo, "")
+		return outcome, runLocalIngestScan(settings, db, repo, "")
 	}
 
-	return nil
+	return outcome, nil
+}
+
+// executorIngestOutcome reads one executor's run as rows rather than attempts.
+//
+// Stored and StoreFailed are the executor's own tallies. The rest is a
+// partition of what it processed: an item that never got a response stored
+// nothing and is a failure; one that answered and was neither stored nor
+// refused was dropped by a policy filter (static-asset carve-out, body-size
+// gate, out-of-scope) and is a skip. Items the executor's PRE-fetch filters
+// dropped never reach a worker, so they are outside this accounting entirely.
+func executorIngestOutcome(executor *core.Executor) ingestOutcome {
+	stored := executor.Stored()
+	storeFailed := executor.StoreFailed()
+	unreached := nonNegative(executor.Processed() - executor.Responded())
+	out := ingestOutcome{
+		Stored:  stored,
+		Failed:  storeFailed + unreached,
+		Skipped: nonNegative(executor.Responded() - stored - storeFailed),
+	}
+	if reasons := executor.DropReasons(); len(reasons) > 0 {
+		out.Reasons = reasons
+		out.Failures = executor.DropSamples()
+	}
+	return out
+}
+
+func nonNegative(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// noteIngestNoRefetch reports how many records were stored with the response
+// they arrived with. Written once per source, on stderr, and only when it
+// happened.
+func noteIngestNoRefetch(stored int64) {
+	if globalSilent || stored <= 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s Saved %d record(s) with attached response (no refetch)\n",
+		terminal.InfoSymbol(), stored)
+}
+
+// spoolIngestStdin copies stdin (bounded by the stdin limit and
+// --input-read-timeout) into a scratch file and returns its path and a cleanup.
+// The copy streams, so a large capture is never held in memory.
+func spoolIngestStdin() (string, func(), error) {
+	f, err := scratch.CreateTemp("ingest-stdin-*")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("spool stdin: %w", err)
+	}
+	cleanup := func() { _ = os.Remove(f.Name()) }
+	err = clicommon.CopyBounded(f, os.Stdin, "stdin", clicommon.DefaultStdinLimit, stdinReadTimeout())
+	if err != nil {
+		err = fmt.Errorf("failed to read ingest input from stdin: %w", err)
+	}
+	if cerr := f.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("spool stdin: %w", cerr)
+	}
+	if err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return f.Name(), cleanup, nil
 }
 
 // tryPreloadAutoDetect peeks at stdin or file content to recognize a single
@@ -517,47 +848,57 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 // only preloaded when the content looks like raw HTTP / burp-pair / curl —
 // URL/HAR/OpenAPI files keep streaming through the existing FileSource. The
 // file branch caps the peek at 4 MiB.
-func tryPreloadAutoDetect(useStdin bool, filePath string) ([]*httpmsg.HttpRequestResponse, detect.StdinFormat) {
+//
+// A stdin read FAILURE is returned rather than folded into the empty result.
+// The old code turned every error into "nothing detected" and let the run
+// continue to the streaming source, which then read an already-exhausted pipe
+// and reported zero items — so a deadline that fired and a genuinely empty pipe
+// were indistinguishable, and the one that needed reporting was the one that
+// looked like success.
+func tryPreloadAutoDetect(useStdin bool, filePath string) ([]*httpmsg.HttpRequestResponse, detect.StdinFormat, error) {
 	const maxPeekBytes = 4 * 1024 * 1024
 
 	var content string
 	switch {
 	case useStdin:
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil || len(data) == 0 {
-			return nil, ""
+		data, err := readStdin()
+		if err != nil {
+			return nil, "", err
+		}
+		if len(data) == 0 {
+			return nil, "", nil
 		}
 		content = string(data)
 	case filePath != "":
 		f, err := os.Open(filePath)
 		if err != nil {
-			return nil, ""
+			return nil, "", err
 		}
 		defer func() { _ = f.Close() }()
 		buf, err := io.ReadAll(io.LimitReader(f, maxPeekBytes+1))
 		if err != nil || len(buf) == 0 || len(buf) > maxPeekBytes {
-			return nil, ""
+			return nil, "", nil
 		}
 		content = string(buf)
 	default:
-		return nil, ""
+		return nil, "", nil
 	}
 
 	format := detect.DetectStdinFormat(content)
 	// File mode only preloads HTTP-shaped content; URL lists keep streaming.
 	if !useStdin && format == detect.FormatURLs {
-		return nil, ""
+		return nil, "", nil
 	}
 
 	items, err := detect.ParseStdinContent(content, format)
 	if err != nil {
 		zap.L().Debug("ingest: auto-detect parse failed, falling back",
 			zap.String("format", string(format)), zap.Error(err))
-		return nil, ""
+		return nil, "", nil
 	}
 	zap.L().Info("Auto-detected ingest input",
 		zap.String("format", string(format)), zap.Int("records", len(items)))
-	return items, format
+	return items, format, nil
 }
 
 // partitionPreloaded splits items into those carrying an attached response
@@ -640,19 +981,55 @@ func formatIngestPreviewLine(idx int, rr *httpmsg.HttpRequestResponse) string {
 	return fmt.Sprintf("  [%d] %s %s  (request only, req cl=%d)", idx, method, url, reqLen)
 }
 
-// detectInputFormat auto-detects the input format from the file extension and content.
+// detectInputFormat names the format of an -i input given with the URL-list
+// default when the caller must know it before the source is built: OpenAPI
+// (--spec-url is auto-enabled without -t) and WSDL (including a WCF/ASMX URL).
+// Files are classified by source.DetectFormat, the one content detector.
+//
+// Every other format is left to NewFileSource, which runs the same detector
+// per file. Returning it here would pin the format for the -T target files
+// built alongside -i, and would bypass ingest's preload path that keeps the
+// response of a pasted Burp request/response pair.
 func detectInputFormat(input string) string {
-	ext := strings.ToLower(filepath.Ext(input))
-	if ext == ".json" || ext == ".yaml" || ext == ".yml" {
-		data, err := os.ReadFile(input)
-		if err != nil {
-			return ""
+	// URL convenience: a bare WCF/ASMX service endpoint (or an explicit ?wsdl
+	// URL) is a WSDL source. The wsdl loader fetches ?singleWsdl / ?WSDL for the
+	// bare .svc/.asmx forms. A remote input has no file head to sniff, so decide
+	// by URL shape here.
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		lower := strings.ToLower(input)
+		pathPart := lower
+		if i := strings.IndexByte(pathPart, '?'); i >= 0 {
+			pathPart = pathPart[:i]
 		}
-		if openapi.IsOpenAPISpec(data) {
-			return "openapi"
+		if strings.HasSuffix(pathPart, ".svc") || strings.HasSuffix(pathPart, ".asmx") ||
+			strings.Contains(lower, "?wsdl") || strings.Contains(lower, "?singlewsdl") {
+			return "wsdl"
 		}
+		return ""
+	}
+
+	det, err := source.DetectFormat(input)
+	if err != nil {
+		return ""
+	}
+	switch det.Format {
+	case "openapi", "wsdl":
+		return det.Format
 	}
 	return ""
+}
+
+// reportedIngestFormat names the format an ingest input was read as. With
+// the URL-list default and no -I, a file's format is decided per file by the
+// file source; the same detector names it here, so a HAR reports "har".
+func reportedIngestFormat(inputFormat, filePath string, explicit bool) string {
+	if explicit || inputFormat != "urls" || filePath == "" {
+		return inputFormat
+	}
+	if det, err := source.DetectFormat(filePath); err == nil && det.Format != "" {
+		return det.Format
+	}
+	return inputFormat
 }
 
 // ingestParseHeaders parses header strings in "Name: Value" format.
@@ -688,28 +1065,25 @@ func runLocalIngestScan(settings *config.Settings, db *database.DB, repo *databa
 
 	// Build scan options from global flags
 	opts := types.DefaultOptions()
-	opts.Concurrency = globalConcurrency
-	opts.Timeout = globalTimeout
-	opts.ProxyURL = globalProxy
-	opts.Verbose = globalVerbose
-	opts.Silent = globalSilent
-	opts.Debug = globalDebug
-	opts.DumpTraffic = globalDumpTraffic
-	opts.JSONOutput = globalJSON
-	opts.MaxPerHost = globalMaxPerHost
-	opts.MaxHostError = globalMaxHostError
-	opts.MaxFindingsPerModule = globalMaxFindingsPerModule
-	opts.ConfigPath = globalConfig
+	globalScanFlagsToOptions(opts)
 
 	// Modules are already resolved via resolveModules()
 	opts.Modules = ingestOpts.EnableModules
-	opts.NoTechFilter = globalNoTechFilter
 
 	// Create a Scan record if none provided
 	ingestScanProjectUUID, err := resolveProjectUUID()
 	if err != nil {
 		return err
 	}
+	// The runner must scan under the same project the Scan row below is created
+	// with: the record feed resolves its project from that row, so leaving this
+	// empty makes the executor write findings to the default project while the
+	// feed reads this one — the scan then streams findings that its own project
+	// can never see.
+	opts.ProjectUUID = ingestScanProjectUUID
+	// A capture names many hosts; scan only its primary one unless -t or
+	// --scope-origin all says otherwise.
+	opts.ScopeTargets, opts.ScopeCensus = ingestScanScope(settings)
 	if scanUUID == "" {
 		scan := &database.Scan{
 			UUID:        fmt.Sprintf("scan-%d", time.Now().UnixNano()),
@@ -750,4 +1124,44 @@ func runLocalIngestScan(settings *config.Settings, db *database.DB, repo *databa
 	}
 
 	return nil
+}
+
+// ingestInputFormatExplicit records whether -I was typed for the current
+// ingest (the derived scan scope must judge the format the parser used).
+var ingestInputFormatExplicit bool
+
+// countIngestRecords counts a project's http_records rows.
+func countIngestRecords(ctx context.Context, db *database.DB, projectUUID string) (int64, error) {
+	n, err := db.NewSelect().Model((*database.HTTPRecord)(nil)).
+		Where("project_uuid = ?", projectUUID).Count(ctx)
+	return int64(n), err
+}
+
+// rawRequestFormat reports whether format names a single captured request
+// (burpraw and its aliases), which -t rebases rather than adds to.
+func rawRequestFormat(format string) bool {
+	info, ok := source.LookupFormat(format)
+	return ok && info.Name == "burpraw"
+}
+
+// rebaseRawRequests re-parses each captured request against target (scheme,
+// host and port from target; request line and headers kept), keeping any
+// captured response.
+func rebaseRawRequests(items []*httpmsg.HttpRequestResponse, target string) ([]*httpmsg.HttpRequestResponse, error) {
+	out := make([]*httpmsg.HttpRequestResponse, 0, len(items))
+	for _, rr := range items {
+		if rr == nil || rr.Request() == nil {
+			continue
+		}
+		parsed, _ := requestinput.Normalize(string(rr.Request().Raw()))
+		next, err := httpmsg.ParseRawRequestWithURL(parsed, target)
+		if err != nil {
+			return nil, usageErrorf("-t %s: cannot rebase the captured request: %v", target, err)
+		}
+		if rr.Response() != nil {
+			next = next.WithResponse(rr.Response())
+		}
+		out = append(out, next)
+	}
+	return out, nil
 }

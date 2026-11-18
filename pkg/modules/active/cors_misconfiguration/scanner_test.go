@@ -7,21 +7,24 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/modules/modtest"
 	"github.com/vigolium/vigolium/pkg/types/severity"
-	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	// The end-to-end scan tests drive a real requester via modtest, which starts
+	// process-lifetime infra goroutines; ignore those so leak detection still
+	// covers this module's own code.
+	modtest.VerifyNoLeaks(m)
 }
 
 func TestNew(t *testing.T) {
 	m := New()
 	assert.Equal(t, "cors-misconfiguration", m.ID())
 	assert.Equal(t, "CORS Misconfiguration", m.Name())
-	assert.Equal(t, severity.Medium, m.Severity())
+	assert.Equal(t, severity.Low, m.Severity())
 	assert.Equal(t, severity.Firm, m.Confidence())
-	assert.Equal(t, modkit.ScanScopeHost, m.ScanScopes())
+	assert.Equal(t, modkit.ScanScopeRequest, m.ScanScopes())
 }
 
 func TestCanProcess(t *testing.T) {
@@ -58,7 +61,7 @@ func TestProbeChecks(t *testing.T) {
 	t.Run("reflected origin", func(t *testing.T) {
 		p := probes[0]
 		assert.Equal(t, "Reflected Origin", p.name)
-		assert.Equal(t, severity.High, p.sev)
+		assert.Equal(t, severity.Low, p.sev)
 
 		// Positive: ACAO matches evil origin
 		assert.True(t, p.check("https://evil.example.com", ""))
@@ -73,7 +76,7 @@ func TestProbeChecks(t *testing.T) {
 	t.Run("null origin", func(t *testing.T) {
 		p := probes[1]
 		assert.Equal(t, "Null Origin", p.name)
-		assert.Equal(t, severity.Medium, p.sev)
+		assert.Equal(t, severity.Low, p.sev)
 
 		// Positive: ACAO is null
 		assert.True(t, p.check("null", ""))
@@ -88,7 +91,7 @@ func TestProbeChecks(t *testing.T) {
 	t.Run("wildcard with credentials", func(t *testing.T) {
 		p := probes[2]
 		assert.Equal(t, "Wildcard with Credentials", p.name)
-		assert.Equal(t, severity.Medium, p.sev)
+		assert.Equal(t, severity.Low, p.sev)
 
 		// Positive: ACAO is * and ACAC is true
 		assert.True(t, p.check("*", "true"))
@@ -104,7 +107,7 @@ func TestProbeChecks(t *testing.T) {
 	t.Run("subdomain bypass check function", func(t *testing.T) {
 		p := probes[3]
 		assert.Equal(t, "Subdomain Bypass", p.name)
-		assert.Equal(t, severity.High, p.sev)
+		assert.Equal(t, severity.Low, p.sev)
 
 		// The check function just verifies ACAO is non-empty
 		// (actual origin matching is done by the caller in runProbe)
@@ -122,7 +125,36 @@ func TestProbeChecks(t *testing.T) {
 }
 
 func TestProbeCount(t *testing.T) {
-	assert.Len(t, probes, 8, "expected exactly 8 CORS probes")
+	assert.Len(t, probes, 10, "expected exactly 10 CORS probes")
+}
+
+func TestOriginDotMutations(t *testing.T) {
+	cases := []struct {
+		host        string
+		replaceLast string
+		deleteFirst string
+	}{
+		{"sub.example.com", "sub.examplexcom", "subexample.com"},
+		{"example.com", "examplexcom", "examplecom"},
+		{"a.b.c.d.com", "a.b.c.dxcom", "ab.c.d.com"},
+		// not applicable -> ""
+		{"localhost", "", ""},
+		{"127.0.0.1", "", ""},
+		{"10.0.0.1", "", ""},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.replaceLast, replaceLastDot(c.host), "replaceLastDot(%q)", c.host)
+		assert.Equal(t, c.deleteFirst, deleteFirstDot(c.host), "deleteFirstDot(%q)", c.host)
+	}
+}
+
+func TestIsIPv4(t *testing.T) {
+	for _, ip := range []string{"127.0.0.1", "10.0.0.1", "255.255.255.255", "1.2.3.4"} {
+		assert.True(t, isIPv4(ip), "%q should be IPv4", ip)
+	}
+	for _, notIP := range []string{"example.com", "sub.example.com", "1.2.3", "1.2.3.4.5", "a.b.c.d", "1.2.3.x"} {
+		assert.False(t, isIPv4(notIP), "%q should not be IPv4", notIP)
+	}
 }
 
 func TestProbeOrigins(t *testing.T) {

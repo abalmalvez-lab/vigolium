@@ -10,11 +10,11 @@ func TestDefaultOptions(t *testing.T) {
 	if o == nil {
 		t.Fatal("DefaultOptions returned nil")
 	}
-	if o.Concurrency != 50 {
-		t.Errorf("Concurrency = %d, want 50", o.Concurrency)
+	if o.Concurrency != 25 {
+		t.Errorf("Concurrency = %d, want 25", o.Concurrency)
 	}
-	if o.MaxPerHost != 50 {
-		t.Errorf("MaxPerHost = %d, want 50", o.MaxPerHost)
+	if o.MaxPerHost != 40 {
+		t.Errorf("MaxPerHost = %d, want 40", o.MaxPerHost)
 	}
 	if o.Timeout != 15*time.Second {
 		t.Errorf("Timeout = %v, want 15s", o.Timeout)
@@ -22,8 +22,8 @@ func TestDefaultOptions(t *testing.T) {
 	if o.MaxHostError != 30 {
 		t.Errorf("MaxHostError = %d, want 30", o.MaxHostError)
 	}
-	if o.MaxFindingsPerModule != 10 {
-		t.Errorf("MaxFindingsPerModule = %d, want 10", o.MaxFindingsPerModule)
+	if o.MaxFindingsPerModule != 50 {
+		t.Errorf("MaxFindingsPerModule = %d, want 50", o.MaxFindingsPerModule)
 	}
 	if !o.ClusterRequests {
 		t.Error("ClusterRequests = false, want true")
@@ -111,6 +111,17 @@ func TestStripFormatExtension(t *testing.T) {
 		{"report.txt", "report.txt"},    // unknown ext preserved
 		{"report", "report"},            // no ext
 		{"my.report.html", "my.report"}, // only last ext stripped
+		{"str-host.sqlite", "str-host"}, // sqlite stripped
+		{"run.sqlite3", "run"},          // sqlite3 alias stripped
+		{"run.db", "run"},               // db alias stripped
+		{"report.md", "report"},         // markdown stripped
+		{"report.markdown", "report"},   // markdown long form stripped
+		{"run.sarif", "run"},            // sarif stripped
+		// Archive extensions are two-part: filepath.Ext sees only ".gz", so
+		// stripping through it would leave "run.tar" and derive "run.tar.html".
+		{"run.tar.gz", "run"},
+		{"run.TAR.GZ", "run"},
+		{"run.tgz", "run"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
@@ -132,7 +143,14 @@ func TestFormatOutputPath(t *testing.T) {
 		{"report", "html", "report.html"},
 		{"report", "report", "report.report.html"},
 		{"report", "pdf", "report.pdf"},
-		{"report", "console", "report"}, // unknown format -> base unchanged
+		{"str-host", "sqlite", "str-host.sqlite"}, // sqlite format extension
+		{"report", "console", "report"},           // unknown format -> base unchanged
+		{"report", "markdown", "report.md"},       // export-only formats
+		{"report", "md", "report.md"},             // alias
+		{"report", "sarif", "report.sarif"},
+		{"report", "bundle", "report.tar.gz"},
+		{"report", "gz", "report.tar.gz"}, // alias
+		{"report", "fs", "report"},        // fs names a directory base, not a file
 	}
 	for _, tt := range tests {
 		t.Run(tt.base+"_"+tt.format, func(t *testing.T) {

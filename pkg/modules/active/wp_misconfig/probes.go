@@ -96,16 +96,33 @@ var wpProbes = []wpProbe{
 	},
 	// Installer/repair endpoints
 	{
-		path:    "/wp-admin/install.php",
-		name:    "WordPress Installer",
-		markers: []string{"wp-install", "installation", "WordPress"},
-		sev:     severity.Critical,
-		desc:    "WordPress installer endpoint accessible — site may be in an unfinished installation state",
+		path: "/wp-admin/install.php",
+		name: "WordPress Installer",
+		// Require installer-page tokens, not the bare "WordPress" brand string (every
+		// WP page carries it). The "Already Installed" screen is the same endpoint
+		// returning a benign 200, so anti-marker it out.
+		//
+		// "installation" was removed: markers are matched case-sensitively against the
+		// raw body, so the lowercase word never matched WordPress's own
+		// "WordPress &rsaquo; Installation" title — it only ever matched incidental
+		// English prose, and it awarded Critical for it (an Apache "after installation
+		// on Ubuntu systems" default page on a host that 200s every path). The
+		// replacements are unique to install.php and cover both of its steps: the
+		// installer stylesheet is loaded by the language chooser AND the setup form,
+		// and weblog_title is the setup form's site-title field.
+		markers:     []string{"wp-install", "weblog_title", "wp-admin/css/install"},
+		antiMarkers: []string{"Already Installed", "already installed", "already been installed"},
+		sev:         severity.Critical,
+		desc:        "WordPress installer endpoint accessible — site may be in an unfinished installation state",
 	},
 	{
-		path:    "/wp-admin/maint/repair.php",
-		name:    "WordPress DB Repair",
-		markers: []string{"repair", "Repair Database", "WP_ALLOW_REPAIR"},
+		path: "/wp-admin/maint/repair.php",
+		name: "WordPress DB Repair",
+		// "Repair Database" is the action button shown only when WP_ALLOW_REPAIR is
+		// actually enabled. The bare word "repair" AND the constant name itself both
+		// appear on the instructions page that renders when the feature is OFF (it
+		// tells you to define WP_ALLOW_REPAIR), so neither can gate this finding.
+		markers: []string{"Repair Database", "Repair and Optimize Database"},
 		sev:     severity.High,
 		desc:    "WordPress database repair endpoint is accessible, indicating WP_ALLOW_REPAIR is enabled",
 	},

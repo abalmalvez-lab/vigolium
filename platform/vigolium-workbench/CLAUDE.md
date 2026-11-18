@@ -57,7 +57,7 @@ App Router, `[[...id]]` optional catch-alls for detail views:
 
 ## Tech Stack
 
-Next.js 16 (App Router, Turbopack dev), React 19, TypeScript 5.9, TailwindCSS 4, React Query 5, ag-grid, Lucide React icons.
+Next.js 16 (App Router, Turbopack dev), React 19, TypeScript 7 (`tsc`; the `typescript` package is aliased to the TS 6 API for typescript-eslint, see `eslint.config.mjs`), TailwindCSS 4, React Query 5, ag-grid, Lucide React icons.
 
 ## Key patterns
 
@@ -74,3 +74,13 @@ make update-ui   # from repo root
 ```
 
 That target runs `bun run build` here and copies `dist/*` → `public/ui/`.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

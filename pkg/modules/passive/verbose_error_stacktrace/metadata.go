@@ -9,26 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects verbose stack traces in HTTP responses that expose internal file paths,
-line numbers, and function names. Unlike the generic error-message-detect module,
-this module specifically targets multi-line stack trace patterns with file system
-paths, providing higher confidence findings for each technology stack.
+	ModuleDesc = `**What it means:** The application returned a full multi-line stack trace, leaking internal file system paths, line numbers, and function or class names. This information-disclosure flaw comes from unhandled exceptions or debug mode left on.
 
-Covers Go, Java, Python, Ruby, Node.js, .NET/C#, and PHP stack traces.
+**How it's exploited:** An attacker triggers errors and reads the trace to map the directory layout, framework, and language stack (Go, Java, Python, Node.js, .NET, Ruby, PHP), then targets version-specific exploits, locates sensitive files, and crafts follow-on attacks like path traversal or injection.
 
-## Notes
-- Uses multiline-aware regex patterns to detect structured stack traces
-- Each technology stack has its own detection pattern and severity
-- Requires at least one file path with line number to confirm a stack trace
-- Deduplicates by host+path to avoid redundant findings
+**Fix:** Disable debug and verbose errors in production, catch exceptions to return generic error pages, and log full stack traces server-side only.`
 
-## References
-- https://owasp.org/www-community/Improper_Error_Handling
-- https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html
-- https://cwe.mitre.org/data/definitions/209.html`
-
-	ModuleConfirmation = "Confirmed when response body contains a structured stack trace with file paths and line numbers from a known technology stack"
+	ModuleConfirmation = "Candidate when a structured stack trace occurs in an HTTP error response; successful-response matches remain observations to account for documentation and examples"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"info-disclosure", "light"}

@@ -2,40 +2,49 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
 
+	fileutil "github.com/projectdiscovery/utils/file"
+	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"go.uber.org/zap"
 )
 
-// stdinIsPiped returns true if stdin is a pipe (not a terminal).
-func stdinIsPiped() bool {
-	fi, err := os.Stdin.Stat()
+// readStdinIfPiped reads stdin when something is actually piped into it, for
+// the commands that fall back to stdin only when no other input was given
+// (autopilot, replay, swarm, fuzz).
+//
+// fileutil.HasStdin is the one "is stdin piped" test. It is true for any stdin
+// that is not a terminal, including a pipe a parent process opened and never
+// writes to, so the read is implicit: it gets the short first-byte window
+// (implicitStdinWait) and nothing within it, or an empty pipe, is reported as
+// not piped — ("", false, nil). A producer that starts and then fails (a stall
+// past --input-read-timeout, input over the size limit, a read error) is an
+// error. That used to be swallowed into "no target", which pointed the caller
+// at the wrong problem.
+func readStdinIfPiped() (data string, ok bool, err error) {
+	if !fileutil.HasStdin() {
+		return "", false, nil
+	}
+	raw, err := readImplicitStdin()
 	if err != nil {
-		return false
+		if errors.Is(err, clicommon.ErrStdinNoData) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("failed to read stdin: %w", err)
 	}
-	return (fi.Mode() & os.ModeCharDevice) == 0
-}
-
-// readStdinIfPiped reads all data from stdin if it's a pipe.
-// Returns the data and true if stdin was piped, or empty string and false otherwise.
-func readStdinIfPiped() (string, bool) {
-	if !stdinIsPiped() {
-		return "", false
+	if len(raw) == 0 {
+		return "", false, nil
 	}
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil || len(data) == 0 {
-		return "", false
-	}
-	return strings.TrimRight(string(data), "\n\r"), true
+	return strings.TrimRight(string(raw), "\n\r"), true, nil
 }
 
 // resolveInstruction returns the instruction text from either --instruction or --instruction-file.
@@ -56,17 +65,13 @@ func resolveInstruction(instruction, instructionFile string) (string, error) {
 //
 // --plan-file is the single-file front end for "prose guidance + raw
 // request(s)". It owns both the instruction and the seed input, so combining
-// it with the flags that would otherwise supply those is rejected up front to
-// avoid ambiguity over which value wins. Returns an error if the file is
-// missing/unreadable or yields neither an instruction nor a request.
-func resolvePlanFile(path, input, instruction, instructionFile string) (planInstruction string, requests []string, err error) {
-	switch {
-	case input != "":
-		return "", nil, fmt.Errorf("--plan-file cannot be combined with --input")
-	case instruction != "":
-		return "", nil, fmt.Errorf("--plan-file cannot be combined with --instruction")
-	case instructionFile != "":
-		return "", nil, fmt.Errorf("--plan-file cannot be combined with --instruction-file")
+// it with --input (which would supply the seed) is rejected up front to avoid
+// ambiguity over which value wins; combining it with a prompt (--prompt /
+// positional) is rejected earlier in resolveRawPrompt. Returns an error if the
+// file is missing/unreadable or yields neither an instruction nor a request.
+func resolvePlanFile(path, input string) (planInstruction string, requests []string, err error) {
+	if input != "" {
+		return "", nil, usageErrorf("--plan-file cannot be combined with --input")
 	}
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
@@ -138,13 +143,17 @@ type ResolvedInput struct {
 func resolveInputAndTarget(target, input string, repo *database.Repository) (*ResolvedInput, error) {
 	inputData := input
 	if inputData == "-" {
-		data, err := io.ReadAll(os.Stdin)
+		data, err := readStdin()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read from stdin: %w", err)
 		}
 		inputData = string(data)
 	} else if inputData == "" && target == "" {
-		if data, ok := readStdinIfPiped(); ok {
+		data, ok, err := readStdinIfPiped()
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			inputData = data
 		}
 	}
@@ -166,25 +175,40 @@ func resolveInputAndTarget(target, input string, repo *database.Repository) (*Re
 	}, nil
 }
 
-// printIntentDryRun prints the parsed ScanIntent as JSON and exits.
-func printIntentDryRun(intent *agent.ScanIntent) error {
-	data, err := json.MarshalIndent(intent, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal intent: %w", err)
+// promptDryRunView is the --dry-run document for a natural-language prompt.
+type promptDryRunView struct {
+	Raw         string            `json:"raw"`
+	ModelParsed bool              `json:"model_parsed"`
+	Apps        []agent.AppIntent `json:"apps"`
+	Note        string            `json:"note"`
+}
+
+// printPromptDryRun previews a natural-language agent prompt without the
+// model: a prompt that is already a URL resolves offline; anything else is
+// reported unparsed, since parsing it is a provider call.
+func printPromptDryRun(cmd *cobra.Command, prompt string) error {
+	view := promptDryRunView{Raw: strings.TrimSpace(prompt), Apps: []agent.AppIntent{}}
+	if intent := agent.StructuredIntent(prompt); intent != nil {
+		view.Apps = intent.Apps
+		view.Note = "dry run: the prompt is a structured input and resolved without the model; nothing was sent"
+	} else {
+		view.Note = "dry run: a natural-language prompt is parsed by the model at run time, which --dry-run does not call; pass -t/--source to preview the rendered prompts"
 	}
-	fmt.Println(string(data))
+	if globalJSON {
+		return emitObject(cmd, ".", view, withDryRun())
+	}
+	for _, app := range view.Apps {
+		fmt.Printf("target: %s\n", firstNonEmptyString(app.Target, app.SourcePath))
+	}
+	fmt.Fprintf(os.Stderr, "%s %s\n", terminal.InfoSymbol(), view.Note)
 	return nil
 }
 
 // loadCLISettings loads settings, falling back to defaults on error so the
 // CLI can keep working with reasonable behavior even if the YAML is unreadable.
+// The fallback is announced rather than logged — see settingsOrDefaults.
 func loadCLISettings() *config.Settings {
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		return config.DefaultSettings()
-	}
-	return settings
+	return settingsOrDefaults()
 }
 
 // parsePromptIntent is the shared scaffold for both runAutopilotFromPrompt and
@@ -214,6 +238,58 @@ func parsePromptIntent(settings *config.Settings, prompt string) (*agent.ScanInt
 	}
 
 	return intent, engine, repo, nil
+}
+
+// parsePromptFirstApp runs the LLM intent parser on prompt purely to recover its
+// first AppIntent — used by autopilot/swarm on the explicit-flag path to pull
+// auth/browser signals out of a prompt that is otherwise forwarded verbatim.
+// Unlike parsePromptIntent it uses ParseScanIntent (no target resolution) and
+// the already-open repo.
+//
+// The intent parser is instructed to return {"apps":[]} when it finds no target
+// or source in the text, so a credential-only prompt (e.g. "log in as
+// admin/admin123, focus on /admin") on an explicit -t/--source run would yield
+// nothing and the credentials would be silently dropped. targetHint/sourceHint
+// (the already-resolved explicit-flag target/source) are woven in as an anchor
+// so the parser still emits an app carrying the extracted auth/browser signals;
+// only those signals are consumed by the caller — the target/source stay owned
+// by the explicit flags. Returns ok=false for an empty prompt, a parse error
+// (logged under label), or when no apps were extracted.
+func parsePromptFirstApp(settings *config.Settings, repo *database.Repository, prompt, label, targetHint, sourceHint string) (agent.AppIntent, bool) {
+	if strings.TrimSpace(prompt) == "" {
+		return agent.AppIntent{}, false
+	}
+	engine := agent.NewEngine(settings, repo)
+	intent, err := agent.ParseScanIntent(context.Background(), engine, anchorIntentPrompt(prompt, targetHint, sourceHint),
+		agent.WithSessionsDir(settings.Agent.EffectiveSessionsDir()))
+	if err != nil || intent == nil || len(intent.Apps) == 0 {
+		if err != nil {
+			zap.L().Debug(label+": prompt auth extraction failed", zap.Error(err))
+		}
+		return agent.AppIntent{}, false
+	}
+	return intent.Apps[0], true
+}
+
+// anchorIntentPrompt prefixes prompt with the resolved target/source so the
+// intent parser has a target to anchor on and does not bail with {"apps":[]}
+// for a credential-only prompt. The "Scan target:"/"Source path:" labels keep
+// the combined text from tripping ParseScanIntent's structured-input fast path
+// (DetectInputType only matches a bare URL/curl/HTTP/base64 prefix).
+func anchorIntentPrompt(prompt, targetHint, sourceHint string) string {
+	var b strings.Builder
+	if t := strings.TrimSpace(targetHint); t != "" {
+		b.WriteString("Scan target: ")
+		b.WriteString(t)
+		b.WriteByte('\n')
+	}
+	if s := strings.TrimSpace(sourceHint); s != "" {
+		b.WriteString("Source path: ")
+		b.WriteString(s)
+		b.WriteByte('\n')
+	}
+	b.WriteString(prompt)
+	return b.String()
 }
 
 // guardOrRefuseFromPrompt loads settings and runs the prompt-safety classifier
@@ -271,29 +347,64 @@ func runMultiAppFanOut(ctx context.Context, intent *agent.ScanIntent, runFn func
 	var errs []string
 	for r := range results {
 		if r.err != nil {
-			app := intent.Apps[r.index]
-			label := app.SourcePath
-			if label == "" {
-				label = app.Target
-			}
-			errs = append(errs, fmt.Sprintf("[%s] %v", label, r.err))
-			fmt.Fprintf(os.Stderr, "%s App %q failed: %v\n",
-				terminal.ErrorSymbol(), label, r.err)
+			errs = recordAppError(errs, intent.Apps[r.index], r.err)
 		}
 	}
+	return summarizeMultiAppResults(errs, len(intent.Apps))
+}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("%d/%d apps failed:\n  %s", len(errs), len(intent.Apps), strings.Join(errs, "\n  "))
+// runMultiAppSequential runs runFn for each app in the intent one at a time,
+// aggregating errors the same way runMultiAppFanOut does. Unlike the parallel
+// fan-out, this never runs two apps concurrently — callers that override shared
+// package-level flags per app (autopilot) require serialization to avoid a race
+// that would cross-contaminate targets/sources. Stops launching new apps once
+// the context is cancelled/timed out.
+func runMultiAppSequential(ctx context.Context, intent *agent.ScanIntent, runFn func(ctx context.Context, idx int, app agent.AppIntent) error) error {
+	var errs []string
+	for i, app := range intent.Apps {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Sprintf("[app %d] skipped: %v", i+1, err))
+			continue
+		}
+		if err := runFn(ctx, i, app); err != nil {
+			errs = recordAppError(errs, app, err)
+		}
 	}
+	return summarizeMultiAppResults(errs, len(intent.Apps))
+}
 
-	fmt.Fprintf(os.Stderr, "\n%s All %d runs complete\n",
-		terminal.SuccessSymbol(), len(intent.Apps))
+// appLabel is the operator-facing name for an app in multi-app output —
+// its source path if any, else its target URL.
+func appLabel(app agent.AppIntent) string {
+	if app.SourcePath != "" {
+		return app.SourcePath
+	}
+	return app.Target
+}
+
+// recordAppError prints a per-app failure line and appends a labeled entry to
+// errs, returning the extended slice. Shared by the parallel and sequential
+// multi-app schedulers.
+func recordAppError(errs []string, app agent.AppIntent, err error) []string {
+	label := appLabel(app)
+	fmt.Fprintf(os.Stderr, "%s App %q failed: %v\n", terminal.ErrorSymbol(), label, err)
+	return append(errs, fmt.Sprintf("[%s] %v", label, err))
+}
+
+// summarizeMultiAppResults renders the final multi-app outcome: an aggregate
+// error when any app failed, otherwise an "all complete" line and nil.
+func summarizeMultiAppResults(errs []string, total int) error {
+	if len(errs) > 0 {
+		return fmt.Errorf("%d/%d apps failed:\n  %s", len(errs), total, strings.Join(errs, "\n  "))
+	}
+	fmt.Fprintf(os.Stderr, "\n%s All %d runs complete\n", terminal.SuccessSymbol(), total)
 	return nil
 }
 
-// mergeIntentInstruction merges base instruction with app-specific instruction.
-func mergeIntentInstruction(base, instructionFile string, app agent.AppIntent) string {
-	instruction, _ := resolveInstruction(base, instructionFile)
+// mergeIntentInstruction merges the base instruction with the app-specific
+// instruction extracted by the natural-language intent parser.
+func mergeIntentInstruction(base string, app agent.AppIntent) string {
+	instruction := base
 	if app.Instruction != "" {
 		if instruction != "" {
 			instruction += "\n\n"
@@ -305,8 +416,8 @@ func mergeIntentInstruction(base, instructionFile string, app agent.AppIntent) s
 
 // prependVerbatimPrompt puts the verbatim natural-language prompt in front of
 // the resolved instruction. The verbatim prompt comes first because it carries
-// the user's primary intent (and any exploitation hints they wrote); explicit
-// --instruction / --instruction-file content layers on top of that.
+// the user's primary intent (and any exploitation hints they wrote); the
+// resolved instruction (--plan-file / intent-parsed) layers on top of that.
 func prependVerbatimPrompt(instruction, verbatim string) string {
 	if verbatim == "" {
 		return instruction
@@ -315,4 +426,51 @@ func prependVerbatimPrompt(instruction, verbatim string) string {
 		return verbatim
 	}
 	return verbatim + "\n\n" + instruction
+}
+
+// resolveRawPrompt returns the single free-text task-guidance string shared by
+// `agent autopilot` and `agent swarm`. The guidance can come from the positional
+// [prompt] argument, the --prompt flag, or the --prompt-file flag (three
+// spellings of the same input — --prompt-file just reads the file for you so a
+// long/complex prompt needn't be shell-escaped); supplying more than one is an
+// error. It rejects combining a prompt with --plan-file, which owns the
+// instruction channel. Returns the trimmed prompt ("" when none). The caller
+// decides — from its own hasExplicitFlags — whether the prompt drives the run
+// through the natural-language intent parser or is preserved verbatim as
+// instruction context (a non-empty planFile always implies explicit flags, so
+// the guard fires only in the explicit-flags branch).
+//
+// --prompt-file is deliberately the SAME channel as --prompt, not a --plan-file
+// alias: its contents flow through the intent parser + credential extraction, so
+// role-tagged accounts in the file are stood up as primary/compare sessions.
+// --plan-file skips that extraction (it owns a different, seed-request channel).
+func resolveRawPrompt(args []string, promptFlag, promptFile, planFile string) (string, error) {
+	prompt := strings.TrimSpace(promptFlag)
+	if len(args) > 0 {
+		if pos := strings.TrimSpace(args[0]); pos != "" {
+			if prompt != "" {
+				return "", usageErrorf("pass the task guidance once: use the positional [prompt] or --prompt, not both")
+			}
+			prompt = pos
+		}
+	}
+	if pf := strings.TrimSpace(promptFile); pf != "" {
+		if prompt != "" {
+			return "", usageErrorf("pass the task guidance once: use --prompt-file or the positional [prompt]/--prompt, not both")
+		}
+		data, rerr := os.ReadFile(config.ExpandPath(pf))
+		if rerr != nil {
+			//vigolium:not-usage file read failure
+			return "", fmt.Errorf("--prompt-file %q: %w", pf, rerr)
+		}
+		prompt = strings.TrimSpace(string(data))
+		if prompt == "" {
+			//vigolium:not-usage decided from file contents, after I/O
+			return "", fmt.Errorf("--prompt-file %q is empty", pf)
+		}
+	}
+	if prompt != "" && planFile != "" {
+		return "", usageErrorf("--plan-file cannot be combined with a prompt (--prompt / --prompt-file / positional): the plan file owns the instruction channel; fold the guidance into the plan file instead")
+	}
+	return prompt, nil
 }

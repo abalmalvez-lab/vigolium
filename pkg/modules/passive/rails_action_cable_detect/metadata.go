@@ -9,19 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects Rails Action Cable (WebSocket) usage by scanning response bodies for
-Action Cable meta tags, JavaScript configuration, and WebSocket endpoint references.
+	ModuleDesc = `**What it means:** The application exposes Rails Action Cable, its WebSocket layer for real-time messaging, identified passively via Action Cable meta tags, JS references, channel subscriptions, or endpoint paths such as /cable. An informational fingerprint that reveals a WebSocket attack surface worth reviewing.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects action-cable-url meta tags in HTML
-- Identifies Action Cable JavaScript references and channel subscriptions
-- Scans for WebSocket endpoint paths (/cable, /websocket, /ws)
-- Deduplicates by host
+**How it's exploited:** If origin checks (allowed_request_origins) or per-channel authorization are weak, an attacker connects cross-origin (Cross-Site WebSocket Hijacking) using a victim's session cookies to subscribe to channels or push unauthorized messages.
 
-## References
-- https://guides.rubyonrails.org/action_cable_overview.html`
+**Fix:** Restrict Action Cable to trusted origins via allowed_request_origins and enforce authentication and authorization in connection and channel subscribe logic.`
 
 	ModuleConfirmation = "Confirmed when Action Cable meta tags, JS references, or WebSocket endpoint patterns are found"
 	ModuleSeverity     = severity.Info

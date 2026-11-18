@@ -1,8 +1,15 @@
 package database
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/vigolium/vigolium/pkg/anomaly/htmlutils"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -115,6 +122,20 @@ func TestExtractHTMLTitle(t *testing.T) {
 		{"simple title", "<html><head><title>Hello World</title></head></html>", "Hello World"},
 		{"title trimmed", "<title>   spaced   </title>", "spaced"},
 		{"plain text not html", "just some text", ""},
+		{"empty element", "<html><head><title></title></head></html>", ""},
+		{"uppercase tag", "<HTML><HEAD><TITLE>Shouty</TITLE></HEAD></HTML>", "Shouty"},
+		{"unicode", "<head><title>Ünïcödé — ✓</title></head>", "Ünïcödé — ✓"},
+		// The cases that separate a tokenizer from a DOM walk. <title> is
+		// RCDATA, so inner markup stays literal text and a <title> written
+		// inside a comment or a script is never a start tag at all — the same
+		// answers the parser gave.
+		{"markup inside stays literal", "<head><title>a<b>bold</b>c</title></head>", "a<b>bold</b>c"},
+		{"commented title ignored", "<!-- <title>commented</title> --><head><title>real</title>", "real"},
+		{"title inside script ignored", `<head><script>var x = "<title>fake</title>";</script><title>after</title></head>`, "after"},
+		{"svg title", "<body><svg><title>svg title</title></svg></body>", "svg title"},
+		{"unclosed element", "<html><head><title>Unclosed", "Unclosed"},
+		{"first title wins", "<head><title>first</title><title>second</title></head>", "first"},
+		{"title in body", "<html><body><p>x</p><title>late</title></body></html>", "late"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -136,6 +157,57 @@ func TestExtractHTMLTitle_CapsAt512(t *testing.T) {
 	got := extractHTMLTitle(long)
 	if len(got) != 512 {
 		t.Errorf("expected title capped at 512 chars, got %d", len(got))
+	}
+}
+
+// TestExtractHTMLTitle_MatchesDOMParse holds the tokenizer to the full DOM walk
+// it replaced. The parser stays here, in the test, as the specification: the
+// tokenizer is only worth its speed if it reads the same title out of real
+// markup, including the malformed markup a scanner actually meets.
+func TestExtractHTMLTitle_MatchesDOMParse(t *testing.T) {
+	domExtractHTMLTitle := func(body []byte) string {
+		if len(body) == 0 {
+			return ""
+		}
+		doc, err := htmlutils.FastParse(bytes.NewReader(body))
+		if err != nil {
+			return ""
+		}
+		tags := htmlutils.GetElementsByTagName(doc, "title")
+		if len(tags) == 0 {
+			return ""
+		}
+		title := strings.TrimSpace(htmlutils.TextContent(tags[0]))
+		if len(title) > 512 {
+			title = title[:512]
+		}
+		return title
+	}
+
+	bodies := []string{
+		"",
+		"just some text",
+		"<html><head><title>Hello World</title></head><body>x</body></html>",
+		"<title>   spaced   </title>",
+		"<HTML><HEAD><TITLE>Shouty</TITLE></HEAD></HTML>",
+		"<head><meta charset=utf-8><title>Ünïcödé — ✓</title></head>",
+		"<head><title>a<b>bold</b>c</title></head>",
+		"<!-- <title>commented</title> --><head><title>real</title>",
+		`<head><script>var x = "<title>fake</title>";</script><title>after</title></head>`,
+		"<body><svg><title>svg title</title></svg><p>hi</p></body>",
+		"<html><head><title>Unclosed",
+		"<head><title>first</title><title>second</title></head>",
+		"<html><body><p>x</p><title>late</title></body></html>",
+		"<html><head></head><body>no title here</body></html>",
+		"<html><head><title></title></head></html>",
+		"<div><p>unclosed tags<span>everywhere<title>still found</title>",
+		"<html><head><title>entity &amp; ref</title></head>",
+		"\x00\xff\xfe<head><title>after binary</title></head>",
+	}
+	for _, body := range bodies {
+		if got, want := extractHTMLTitle([]byte(body)), domExtractHTMLTitle([]byte(body)); got != want {
+			t.Errorf("extractHTMLTitle(%q) = %q, DOM parse = %q", body, got, want)
+		}
 	}
 }
 
@@ -180,24 +252,36 @@ func TestResolveHostnameIP_LiteralIP(t *testing.T) {
 
 func TestResolveHostnameIP_CachesResult(t *testing.T) {
 	// Use a clearly-invalid hostname so the DNS lookup fails and an empty
-	// result is cached. The second call must observe the cached empty value
-	// (we can't easily assert the lack of a lookup, but we assert consistency).
+	// result is cached. Resolution is now asynchronous (it must not block the
+	// write path), so the first call returns "" immediately and schedules a
+	// background resolve; the cache entry appears once that completes.
 	host := "definitely-not-a-real-host.invalid-tld-xyz"
-	first := resolveHostnameIP(host)
-	second := resolveHostnameIP(host)
-	if first != second {
-		t.Errorf("resolveHostnameIP not stable across calls: %q vs %q", first, second)
+	if first := resolveHostnameIP(host); first != "" {
+		t.Errorf("first resolveHostnameIP should return %q (async), got %q", "", first)
 	}
 
-	// Verify the failed lookup landed in the cache.
-	dnsCache.RLock()
-	cached, found := dnsCache.m[host]
-	dnsCache.RUnlock()
-	if !found {
-		t.Fatalf("expected %q to be cached after lookup", host)
+	// Wait for the background resolve (a failed lookup) to land in the cache.
+	deadline := time.Now().Add(5 * time.Second)
+	var cached dnsEntry
+	var found bool
+	for time.Now().Before(deadline) {
+		cached, found = dnsCache.Get(host)
+		if found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if cached != first {
-		t.Errorf("cached value %q != returned value %q", cached, first)
+	if !found {
+		t.Fatalf("expected %q to be cached after background lookup", host)
+	}
+	// A failed lookup gets the short negative TTL, not a permanent entry.
+	if cached.ip != "" {
+		t.Errorf("expected empty (negative) cache entry for %q, got %q", host, cached.ip)
+	}
+
+	// Once cached, the value is returned consistently.
+	if got := resolveHostnameIP(host); got != cached.ip {
+		t.Errorf("resolveHostnameIP not stable: cached %q vs returned %q", cached.ip, got)
 	}
 }
 
@@ -233,6 +317,10 @@ func TestResolveFindingHostname(t *testing.T) {
 		want    string
 	}{
 		{"explicit host wins", "api.example.com", "https://other.com/x", "", "api.example.com"},
+		{"explicit host port stripped", "localhost:3000", "https://other.com/x", "", "localhost"},
+		{"explicit host port stripped non-default", "api.example.com:8443", "", "", "api.example.com"},
+		{"explicit ipv6 host port stripped", "[::1]:3000", "", "", "::1"},
+		{"explicit host no port unchanged", "localhost", "", "", "localhost"},
 		{"parse from url", "", "https://example.com/path?q=1", "", "example.com"},
 		{"parse from matched when no url", "", "", "https://matched.example.org/p", "matched.example.org"},
 		{"url preferred over matched", "", "https://from-url.com/a", "https://from-matched.com/b", "from-url.com"},
@@ -459,5 +547,335 @@ func TestFinding_FromResultEvent_NilGuard(t *testing.T) {
 	var f Finding
 	if err := f.FromResultEvent(nil); err == nil {
 		t.Error("expected error for nil ResultEvent")
+	}
+}
+
+// buildRawResponse renders a raw HTTP response with the given content type and body.
+func buildRawResponse(contentType, body string) string {
+	return "HTTP/1.1 200 OK\r\nContent-Type: " + contentType + "\r\n\r\n" + body
+}
+
+func TestFinding_FromResultEvent_StaticResponseWindowed(t *testing.T) {
+	marker := "new Function("
+	var sb strings.Builder
+	for i := 0; i < 600; i++ {
+		fmt.Fprintf(&sb, "var x%d = %d; // padding padding padding padding\n", i, i)
+	}
+	sb.WriteString("eval(" + marker + "'return 1'));\n")
+	for i := 0; i < 600; i++ {
+		fmt.Fprintf(&sb, "var y%d = %d; // padding padding padding padding\n", i, i)
+	}
+	jsBody := sb.String()
+	raw := buildRawResponse("application/javascript", jsBody)
+
+	event := &output.ResultEvent{
+		ModuleID:         "unsafe-html-sink",
+		Info:             output.Info{Name: "Unsafe HTML Sink", Severity: severity.Medium},
+		URL:              "https://app.example.com/static/bundle.js",
+		ExtractedResults: []string{"eval(new Function('return 1'))"},
+		Response:         raw,
+	}
+	var f Finding
+	if err := f.FromResultEvent(event); err != nil {
+		t.Fatalf("FromResultEvent: %v", err)
+	}
+
+	if !strings.HasPrefix(f.Response, "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\n\r\n") {
+		t.Errorf("windowed response must keep the full head; got prefix %q", f.Response[:min(80, len(f.Response))])
+	}
+	if !strings.Contains(f.Response, marker) {
+		t.Error("windowed response must include the matched sink")
+	}
+	if !strings.Contains(f.Response, "bytes truncated") {
+		t.Error("large static body must be truncated")
+	}
+	if len(f.Response) >= len(raw) {
+		t.Errorf("windowed response (%d) must be smaller than full (%d)", len(f.Response), len(raw))
+	}
+	// event.Response must be left intact so the linked http_record keeps the full body.
+	if event.Response != raw {
+		t.Error("event.Response must not be mutated by conversion")
+	}
+}
+
+func TestFinding_FromResultEvent_SourceMapWindowedByExtension(t *testing.T) {
+	// Source maps are commonly served as application/json — the URL extension must
+	// still classify them as static.
+	body := strings.Repeat("{\"x\":\"mappings data padding padding padding\"},\n", 400)
+	raw := buildRawResponse("application/json", body)
+	event := &output.ResultEvent{
+		ModuleID: "secret-detect",
+		Info:     output.Info{Name: "Secret", Severity: severity.High},
+		URL:      "https://app.example.com/static/bundle.js.map",
+		Response: raw,
+	}
+	var f Finding
+	if err := f.FromResultEvent(event); err != nil {
+		t.Fatalf("FromResultEvent: %v", err)
+	}
+	if len(f.Response) >= len(raw) || !strings.Contains(f.Response, "bytes truncated") {
+		t.Errorf("source map (.map) should be windowed by URL extension; len got=%d full=%d", len(f.Response), len(raw))
+	}
+}
+
+func TestFinding_FromResultEvent_NonStaticResponseStoredWhole(t *testing.T) {
+	body := strings.Repeat("<div>error trace line padding padding padding padding</div>\n", 400)
+	raw := buildRawResponse("text/html; charset=utf-8", body)
+	event := &output.ResultEvent{
+		ModuleID: "error-message-detect",
+		Info:     output.Info{Name: "Debug Page in Response", Severity: severity.Low},
+		URL:      "https://app.example.com/account",
+		Response: raw,
+	}
+	var f Finding
+	if err := f.FromResultEvent(event); err != nil {
+		t.Fatalf("FromResultEvent: %v", err)
+	}
+	if f.Response != raw {
+		t.Error("non-static (HTML) response must be stored whole")
+	}
+}
+
+func TestFinding_FromResultEvent_SmallStaticResponseUnchanged(t *testing.T) {
+	raw := buildRawResponse("text/css", "body{color:red}\n")
+	event := &output.ResultEvent{
+		ModuleID: "x",
+		Info:     output.Info{Name: "X", Severity: severity.Info},
+		URL:      "https://app.example.com/static/app.css",
+		Response: raw,
+	}
+	var f Finding
+	if err := f.FromResultEvent(event); err != nil {
+		t.Fatalf("FromResultEvent: %v", err)
+	}
+	if f.Response != raw {
+		t.Errorf("small static body must be stored whole, got %q", f.Response)
+	}
+}
+
+// TestLookupHostnameSplitsFamilies covers the split that makes the a/aaaa
+// columns distinct from the single `ip`: an IPv4-only name must not populate
+// aaaa, a literal must resolve to itself in its own family, and `ip` must be
+// the first A when one exists (the dialer's near-certain choice on a dual-stack
+// host, so the column keeps describing where the request actually went).
+func TestLookupHostnameSplitsFamilies(t *testing.T) {
+	t.Run("ipv4 literal", func(t *testing.T) {
+		e := literalIPEntry("192.0.2.1")
+		if e.ip != "192.0.2.1" {
+			t.Errorf("ip = %q, want the literal", e.ip)
+		}
+		if len(e.a) != 1 || e.a[0] != "192.0.2.1" {
+			t.Errorf("a = %v, want the literal in the v4 family", e.a)
+		}
+		if len(e.aaaa) != 0 {
+			t.Errorf("aaaa = %v, want empty for a v4 literal", e.aaaa)
+		}
+		if len(e.cname) != 0 {
+			t.Errorf("cname = %v, want empty — a literal is not aliased", e.cname)
+		}
+	})
+
+	t.Run("ipv6 literal", func(t *testing.T) {
+		e := literalIPEntry("2001:db8::1")
+		if len(e.aaaa) != 1 || e.aaaa[0] != "2001:db8::1" {
+			t.Errorf("aaaa = %v, want the literal in the v6 family", e.aaaa)
+		}
+		if len(e.a) != 0 {
+			t.Errorf("a = %v, want empty for a v6 literal", e.a)
+		}
+	})
+
+	t.Run("unresolvable name is negative, not empty-positive", func(t *testing.T) {
+		e := lookupHostname(context.Background(), "definitely-not-a-real-host.invalid-tld-xyz", true)
+		if e.ip != "" || len(e.a) != 0 || len(e.aaaa) != 0 {
+			t.Errorf("got ip=%q a=%v aaaa=%v, want an empty (negative) entry", e.ip, e.a, e.aaaa)
+		}
+		// The short negative TTL is what lets a briefly-dead host be retried
+		// instead of being pinned unresolved for the process lifetime.
+		if ttl := time.Until(e.expiry); ttl > dnsNegativeTTL {
+			t.Errorf("negative entry TTL = %v, want <= the negative TTL %v", ttl, dnsNegativeTTL)
+		}
+	})
+}
+
+// TestMeasuredMillisFloor pins the one rule every response-time column depends
+// on: 0 means "never measured", so a real measurement can never report 0.
+func TestMeasuredMillisFloor(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want int64
+	}{
+		{"unmeasured", 0, 0},
+		{"negative is unmeasured", -5 * time.Millisecond, 0},
+		{"sub-millisecond floors to 1", 120 * time.Microsecond, 1},
+		{"exactly 1ns floors to 1", time.Nanosecond, 1},
+		{"whole milliseconds pass through", 250 * time.Millisecond, 250},
+		{"truncates rather than rounds", 1999 * time.Microsecond, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := httpmsg.MeasuredMillis(tt.in); got != tt.want {
+				t.Errorf("MeasuredMillis(%v) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHostFactsAreOutputOnlyNotPersistedAndNotImplicit pins two decisions at
+// once: the full DNS/TLS answer is never a column, AND it is never attached by
+// HTTPRecord.MarshalJSON.
+//
+// The second half is the one that bites. Attaching inside MarshalJSON reads as
+// convenient — every JSON path gets it free — but the caches are process-global
+// and hostname-keyed, so the ingest server (which marshals []*HTTPRecord
+// straight to its HTTP response) would decorate one project's rows with a name
+// resolved at an unknown time while ingesting another's. Emit sites that know
+// this process probed opt in through WithFacts instead.
+func TestHostFactsAreOutputOnlyNotPersistedAndNotImplicit(t *testing.T) {
+	const host = "dns-view.example.invalid"
+	dnsCache.Add(host, dnsEntry{
+		ip:     "192.0.2.10",
+		a:      []string{"192.0.2.10", "192.0.2.11"},
+		aaaa:   []string{"2001:db8::a"},
+		cname:  []string{"origin.example.invalid"},
+		expiry: time.Now().Add(time.Hour),
+	})
+	t.Cleanup(func() { dnsCache.Remove(host) })
+
+	rec := &HTTPRecord{UUID: "u1", Hostname: host, URL: "https://" + host + "/", Method: "GET"}
+
+	// Marshaling the record ALONE must not reach into the cache.
+	bare := marshalToMap(t, rec)
+	for _, key := range []string{"a", "aaaa", "cname", "tls"} {
+		if _, ok := bare[key]; ok {
+			t.Errorf("%q attached by MarshalJSON; host facts must be an explicit opt-in", key)
+		}
+	}
+	// The struct carries no DNS arrays either — that is what keeps them out of
+	// the database, since bun persists fields, not the JSON view.
+	for _, col := range []string{"dns_a", "dns_aaaa", "dns_cname"} {
+		if _, ok := bare[col]; ok {
+			t.Errorf("%q leaked into the record; the full answer must not become a column", col)
+		}
+	}
+
+	// Opting in merges the fact keys into the record's own object, so a consumer
+	// reads them next to the record's fields rather than under a wrapper.
+	decorated := marshalToMap(t, WithFacts(nil, rec))
+	for _, key := range []string{"a", "aaaa", "cname"} {
+		if _, ok := decorated[key]; !ok {
+			t.Errorf("WithFacts did not attach %q", key)
+		}
+	}
+	if decorated["uuid"] != "u1" {
+		t.Errorf("uuid = %v, want the record's own fields preserved alongside the facts", decorated["uuid"])
+	}
+
+	// A host this process never observed opts in to nothing: "unknown" and "no
+	// records" stay different answers, and the bare record is returned unchanged.
+	other := &HTTPRecord{UUID: "u2", Hostname: "never-resolved.example.invalid", Method: "GET"}
+	for key, v := range marshalToMap(t, WithFacts(nil, other)) {
+		if key == "a" || key == "aaaa" || key == "cname" || key == "tls" {
+			t.Errorf("%q = %v present for a host that was never observed", key, v)
+		}
+	}
+}
+
+func marshalToMap(t *testing.T, v any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return out
+}
+
+// TestResolveHostnameNowRejectsAddressOnlyCacheEntry covers the completeness
+// hole behind the cnameChecked flag: the write path's background resolver asks
+// for addresses only, and its entry is fresh and address-complete. Before the
+// flag it was indistinguishable from a fully collected answer, so the sweep's
+// ResolveHostnameNow accepted it and the host's CNAME silently vanished from the
+// output - on exactly the mixed-phase runs where an earlier phase had already
+// written records for the host.
+func TestResolveHostnameNowRejectsAddressOnlyCacheEntry(t *testing.T) {
+	const host = "addr-only.example.invalid"
+	dnsCache.Add(host, dnsEntry{
+		ip:     "192.0.2.20",
+		a:      []string{"192.0.2.20"},
+		expiry: time.Now().Add(time.Hour),
+		// cnameChecked deliberately false: this is what scheduleHostnameResolve
+		// leaves behind.
+	})
+	t.Cleanup(func() { dnsCache.Remove(host) })
+
+	// A .invalid name cannot resolve, so the forced re-lookup returns nothing and
+	// caches a negative entry. That is the point: the stale address-only entry
+	// must NOT have been served as a complete answer.
+	ResolveHostnameNow(context.Background(), host)
+
+	e, ok := dnsCache.Get(host)
+	if !ok {
+		t.Fatal("entry disappeared from the cache")
+	}
+	if !e.cnameChecked {
+		t.Error("ResolveHostnameNow returned without collecting the chain; " +
+			"an address-only entry was accepted as complete")
+	}
+}
+
+// TestAddressOnlyResolveKeepsObservedCNAME is the other direction: a background
+// address refresh must not unlearn a chain this process already observed. It
+// asked a narrower question, so it has no answer to overwrite the wider one with.
+func TestAddressOnlyResolveKeepsObservedCNAME(t *testing.T) {
+	const host = "keep-chain.example.invalid"
+	dnsCache.Add(host, dnsEntry{
+		ip:           "192.0.2.30",
+		a:            []string{"192.0.2.30"},
+		cname:        []string{"origin.example.invalid"},
+		expiry:       time.Now().Add(time.Hour),
+		cnameChecked: true,
+	})
+	t.Cleanup(func() { dnsCache.Remove(host) })
+
+	if _, err := resolveAndCache(context.Background(), host, false); err != nil {
+		t.Fatalf("resolveAndCache: %v", err)
+	}
+
+	_, _, cname := CachedDNS(host)
+	if len(cname) != 1 || cname[0] != "origin.example.invalid" {
+		t.Errorf("CachedDNS cname = %v, want the previously observed chain", cname)
+	}
+}
+
+// TestResolveHostnameNowHonoursContext covers the cancellation half of the
+// prefetch stage. Resolution used to be uninterruptible: the semaphore send
+// blocked with no context, and net.LookupHost took no deadline, so a cancelled
+// sweep still had to wait out every in-flight lookup at whatever pace the system
+// resolver chose.
+//
+// The caller's wait is what ctx cancels - not the lookup, which is shared with
+// every other caller asking the same question and runs to completion on a
+// detached context.
+func TestResolveHostnameNowHonoursContext(t *testing.T) {
+	// Already cancelled: the lookup still has to reach a resolver, so the
+	// ctx.Done() arm is ready long before the answer is.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ResolveHostnameNow(ctx, "blocked.example.invalid")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ResolveHostnameNow ignored a cancelled context")
 	}
 }

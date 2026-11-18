@@ -1,5 +1,77 @@
 package config
 
+import (
+	"strings"
+	"sync"
+
+	"go.uber.org/zap"
+)
+
+// DefaultCLIOriginMode is the origin-scope mode a scan uses when nothing sets
+// one. Referenced by the config default, the matcher's empty-string fallback,
+// and the banner renderers so the value is spelled once — it used to be a
+// literal in five places, and a change that missed one printed a mode the scan
+// was not running in.
+const DefaultCLIOriginMode = "balanced"
+
+// ResolveCLIOriginMode normalizes a configured scope.cli_origin_mode into the
+// mode a scan actually runs in, falling back to DefaultCLIOriginMode. Never
+// returns "".
+//
+// It takes the MERGED ScopeConfig value, not the raw --scope-origin flag, because
+// settings.Scope is the only thing that applies: NewScopeMatcher and
+// InScopeHosts read it and nothing else. The CLI entry points merge the flag into
+// it first (runner.ApplyScanSettingOverrides for scan; pkg/cli scan_url.go,
+// scan_admission.go and ingest.go), so by the time anything
+// reports the mode there is one value to report. Resolving from the raw override
+// instead would let a reporter claim a mode the matcher never used — a confident
+// lie about which hosts a scan was allowed to touch, which is worse than the
+// blank it replaced.
+//
+// Every caller that renders or persists the mode routes through here: the scan
+// banner, the run summary, the scan-config snapshot, and the scans row. The
+// snapshot used to write the raw override, which is "" on any run that took the
+// default, so a scan that ran in "balanced" was recorded as having run in "".
+func ResolveCLIOriginMode(configured string) string {
+	if m := strings.ToLower(strings.TrimSpace(configured)); m != "" {
+		if ValidCLIOriginMode(m) {
+			return m
+		}
+		// An unknown mode used to admit every host. The CLI and the
+		// REST API reject one up front; a value that still reaches here (a
+		// config file, a library caller) runs as the default, loudly.
+		warnUnknownOriginMode(m)
+		return DefaultCLIOriginMode
+	}
+	return DefaultCLIOriginMode
+}
+
+// CLIOriginModes lists every accepted scope.cli_origin_mode / --scope-origin
+// value, most permissive first. Error messages derive from it.
+var CLIOriginModes = []string{"all", "relaxed", "balanced", "strict"}
+
+// ValidCLIOriginMode reports whether s names an origin mode (case-insensitive).
+func ValidCLIOriginMode(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	for _, m := range CLIOriginModes {
+		if s == m {
+			return true
+		}
+	}
+	return false
+}
+
+var unknownOriginModeWarned sync.Map
+
+func warnUnknownOriginMode(m string) {
+	if _, dup := unknownOriginModeWarned.LoadOrStore(m, struct{}{}); dup {
+		return
+	}
+	zap.L().Warn("Unknown scope.cli_origin_mode; using the default",
+		zap.String("mode", m), zap.String("default", DefaultCLIOriginMode),
+		zap.Strings("valid", CLIOriginModes))
+}
+
 // ScopeConfig defines which HTTP records are in scope for scanning.
 // Each rule is evaluated independently; all must pass (AND logic).
 // Exclude takes priority over include.
@@ -10,13 +82,27 @@ type ScopeConfig struct {
 	// out-of-scope records are skipped during scanning.
 	AppliedOnIngest bool `yaml:"applied_on_ingest" json:"applied_on_ingest"`
 
+	// Methods is the HTTP method allow-list for scan traffic. Empty
+	// means every method. [GET, HEAD] (what --safe writes) is read-only: module
+	// traffic, discovery and the browser crawl send nothing else, and the
+	// crawler submits no forms, attempts no logins and uploads nothing.
+	Methods []string `yaml:"methods,omitempty" json:"methods,omitempty"`
+
 	// CLIOriginMode restricts which hosts are in scope based on CLI target origins.
 	// Modes:
-	//   "relaxed"  — host must contain the target's keyword (e.g. "example") (default)
+	//   "balanced" — host must share the target's eTLD+1 (e.g. *.example.com) (default)
 	//   "all"      — no origin restriction
-	//   "balanced" — host must share the target's eTLD+1 (e.g. *.example.com)
+	//   "relaxed"  — host must contain the target's keyword (e.g. "example")
 	//   "strict"   — host must exactly match the target host
 	// IP targets always use exact match regardless of mode.
+	//
+	// The default is "balanced" rather than "relaxed" because relaxed matches the
+	// keyword against the *candidate's* registrable label, which admits every
+	// brand domain on every TLD: a scan of app.example.net pulls in example.com,
+	// example.io and anything else whose registrable label contains "example".
+	// In practice the hosts that lands on are an organization's SSO/IdP and
+	// marketing estate — someone else's infrastructure, never the thing under
+	// test. Relaxed stays available for deliberate brand-wide recon.
 	CLIOriginMode       string    `yaml:"cli_origin_mode" json:"cli_origin_mode"`
 	Host                ScopeRule `yaml:"host" json:"host"`
 	Path                ScopeRule `yaml:"path" json:"path"`
@@ -66,7 +152,7 @@ type ScopeRule struct {
 func DefaultScopeConfig() *ScopeConfig {
 	return &ScopeConfig{
 		AppliedOnIngest:         false,
-		CLIOriginMode:           "relaxed",
+		CLIOriginMode:           DefaultCLIOriginMode,
 		Host:                    ScopeRule{Include: []string{"*"}, Exclude: []string{}},
 		Path:                    ScopeRule{Include: []string{"*"}, Exclude: []string{}},
 		StatusCode:              ScopeRule{Include: []string{"*"}, Exclude: []string{}},

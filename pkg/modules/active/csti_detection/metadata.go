@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Client-Side Template Injection vulnerabilities by injecting template expressions
-(e.g., {{7*7}}) and checking if the expression is reflected literally (not HTML-encoded)
-in the response body within a client-side template framework scope.
+	ModuleDesc = `**What it means:** User input is reflected unescaped into a page running a client-side template framework (AngularJS, Vue.js, Svelte, Alpine.js), which evaluates expressions like {{7*7}} in the browser - a Client-Side Template Injection flaw leading to cross-site scripting.
 
-## Notes
-- Different from server-side SSTI: checks for literal reflection, not evaluation
-- Fingerprints AngularJS and Vue.js frameworks per-host (cached)
-- Only scans hosts where a client-side template framework is detected
-- Verifies the expression is not HTML-encoded (which would prevent exploitation)
-- Uses double confirmation with random anchors to reduce false positives
+**How it's exploited:** An attacker crafts a link with a template expression that runs arbitrary JavaScript in the victim's browser, often bypassing a Content Security Policy, enabling session theft and account takeover. Confirmed when a unique {{N*M}} expression reflects literally in the framework's DOM scope.
 
-## References
-- https://portswigger.net/research/xss-without-html-client-side-template-injection-with-angularjs
-- https://portswigger.net/web-security/cross-site-scripting/contexts/client-side-template-injection`
+**Fix:** Treat user input as untrusted data, never interpolate it into templates, and HTML-encode reflected values.`
 
 	ModuleConfirmation = "Confirmed when injected template expressions (e.g., {{7*7}}) are reflected literally in the HTML response within a client-side framework scope"
 	ModuleSeverity     = severity.Medium

@@ -9,21 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects WebSocket endpoints that accept upgrade requests without proper origin validation.
-Tests whether the server enforces origin checks by sending upgrade requests with matching,
-evil, and missing Origin headers.
+	ModuleDesc = `**What it means:** This is the legacy alias for the canonical ws-cswsh implementation. It distinguishes reproduced WebSocket origin-policy behavior from a credential-dependent browser handshake and does not infer an authenticated session from a 101 response alone.
 
-## Notes
-- Runs once per host+path with internal deduplication
-- Sends up to 3 WebSocket upgrade probes per unique endpoint
-- Low false-positive rate due to strict 101 status code matching
+**Evidence tiers:** Missing Origin acceptance is an observation, arbitrary Origin acceptance is a candidate, and a finding requires a known browser-sendable session cookie plus rejection by the credential-free control. The default registry registers only ws-cswsh to avoid duplicate output.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/11-Client-side_Testing/10-Testing_WebSockets
-- https://portswigger.net/web-security/websockets`
+**Fix:** Validate the Origin header on the upgrade, reject unexpected or missing origins, and bind the connection to a per-session CSRF-style token.`
 
-	ModuleConfirmation = "Confirmed when the server accepts a WebSocket upgrade request from an unauthorized or missing origin, indicating missing origin validation"
+	ModuleConfirmation = "Delegates to ws-cswsh, which uses fresh RFC-bound handshakes, repeated origin variants, and a credential-free negative control"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"misconfiguration", "session", "light"}

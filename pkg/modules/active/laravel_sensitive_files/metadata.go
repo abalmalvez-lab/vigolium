@@ -9,27 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Laravel-specific sensitive files not covered by generic file discovery
-modules: PHPUnit configuration (phpunit.xml), exposed SQLite databases, storage
-framework internals (sessions, views, cache), vendor PHPUnit eval-stdin.php
-(CVE-2017-9841), and wrong document root indicators (artisan, server.php,
-routes/web.php, config/app.php, bootstrap/app.php).
+	ModuleDesc = `**What it means:** A Laravel-specific sensitive file is reachable over the web that should never be served - leaked config and dependency versions, a downloadable database, listable session storage, or PHP source served outside public/.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Complements the generic sensitive_file_discovery and php_composer_exposure modules
-- Validates responses with content markers and anti-markers to reduce false positives
-- Fingerprints 404 responses to detect custom error pages
-- Wrong document root detection is critical severity
+**How it's exploited:** An attacker downloads the asset directly: a SQLite database dumps all application data, a listable sessions directory enables session hijacking, and a vendor PHPUnit eval-stdin.php is an RCE candidate under CVE-2017-9841. composer installed.json reveals exact versions for CVE targeting.
 
-## References
-- https://laravel.com/docs/structure
-- https://nvd.nist.gov/vuln/detail/CVE-2017-9841
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Serve only the public/ directory as web root and block direct access to artisan, storage/, database files, vendor/, and config source.`
 
 	ModuleConfirmation = "Confirmed when probed Laravel file paths return 200 with expected content markers"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"laravel", "php", "sensitive-file", "probe", "light"}
 )

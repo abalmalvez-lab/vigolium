@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"strings"
@@ -34,14 +35,22 @@ func NewOliumClient(cfg *config.OliumConfig) (Client, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("olium config is nil")
 	}
-	prov, _, model, err := olium.ResolveProvider(oliumOptions(cfg))
+	opts, err := oliumOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+	prov, _, model, err := olium.ResolveProvider(opts)
 	if err != nil {
 		return nil, fmt.Errorf("olium provider: %w", err)
 	}
 	return &oliumClient{cfg: cfg, prov: prov, model: model}, nil
 }
 
-func oliumOptions(cfg *config.OliumConfig) olium.Options {
+func oliumOptions(cfg *config.OliumConfig) (olium.Options, error) {
+	effectiveExtraBody, err := cfg.CustomProvider.EffectiveExtraBody()
+	if err != nil {
+		return olium.Options{}, fmt.Errorf("olium custom_provider: %w", err)
+	}
 	return olium.Options{
 		Provider:            cfg.Provider,
 		OAuthCredPath:       cfg.OAuthCredPath,
@@ -53,9 +62,10 @@ func oliumOptions(cfg *config.OliumConfig) olium.Options {
 		ReasoningEffort:     cfg.ReasoningEffort,
 		CustomBaseURL:       cfg.CustomProvider.BaseURL,
 		CustomModelID:       cfg.CustomProvider.ModelID,
-		CustomAPIKey:        firstNonEmpty(cfg.CustomProvider.APIKey, cfg.LLMAPIKey),
+		CustomAPIKey:        cmp.Or(cfg.CustomProvider.APIKey, cfg.LLMAPIKey),
 		CustomExtraHeaders:  cfg.CustomProvider.ExtraHeadersMap(),
-	}
+		CustomExtraBody:     effectiveExtraBody,
+	}, nil
 }
 
 // Complete runs one tool-less olium turn and returns the model's text. The
@@ -74,10 +84,15 @@ func (c *oliumClient) Complete(ctx context.Context, req CompletionRequest) (*Com
 		system = appendJSONInstruction(system, req.JSONSchema)
 	}
 
+	model := cmp.Or(strings.TrimSpace(req.Model), c.model)
 	eng := oengine.New(oengine.Config{
 		Provider: c.prov,
-		Model:    c.model,
+		Model:    model,
 		System:   system,
+		// req.MaxTokens reaches the wire via engine.Config; req.Temperature
+		// does not — current Claude models reject sampling parameters, and
+		// olium exposes no per-provider sampling knob. See CompletionRequest.
+		MaxTokens: req.MaxTokens,
 		// No tools registered → the model answers in a single assistant turn;
 		// MaxTurns is left at the engine default since the loop terminates as
 		// soon as there are no pending tool calls.
@@ -100,8 +115,9 @@ func (c *oliumClient) Complete(ctx context.Context, req CompletionRequest) (*Com
 	}
 
 	return &CompletionResponse{
-		Content:   out.String(),
-		Model:     c.model,
+		Content: out.String(),
+		// The model actually used, which a per-request override changes.
+		Model:     model,
 		TokensIn:  tokensIn,
 		TokensOut: tokensOut,
 	}, nil
@@ -150,13 +166,4 @@ func appendJSONInstruction(system, schema string) string {
 		return instr
 	}
 	return system + "\n\n" + instr
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }

@@ -9,13 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Web Cache Deception vulnerabilities where appending static file extensions (e.g., .css, .js, .png)
-to authenticated URLs causes reverse proxies or CDNs to cache sensitive responses. An attacker can trick
-a victim into visiting a crafted URL, causing their authenticated response to be cached and subsequently
-accessible to the attacker.`
-	ModuleConfirmation = "Confirmed when a path-confused request returns the same authenticated content as the original and cache indicators (Age, X-Cache, CF-Cache-Status) suggest the response was cached"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleDesc = `**What it means:** A static-looking path mutation returned protected content with cache-hit evidence. A same-session hit is a candidate; two separate credential-free replays receiving the protected content form a finding. Unique query keys protect the normal URL.
+
+**How it's exploited:** An attacker primes a cache with a victim's personalized response, then retrieves it without the victim's credentials.
+
+**Fix:** Never cache authenticated dynamic paths, and key caching on the origin's real route and content type.`
+	ModuleConfirmation = "Candidate on protected same-session cache hit; confirmed only when two credential-free attacker replays receive the protected cached content"
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"cache-poisoning", "auth-bypass", "moderate"}
 )

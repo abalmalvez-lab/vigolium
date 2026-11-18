@@ -2,21 +2,26 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent"
+	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/olium"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"go.uber.org/zap"
 )
+
+// oliumProviderFlagUsage is the shared --provider help text for every agent
+// subcommand, generated from olium.ProviderNames so the advertised provider set
+// always matches exactly what the runtime accepts (no per-command drift).
+var oliumProviderFlagUsage = "Olium provider override: " + olium.ProviderNamesString(" | ") + " (default: agent.olium.provider; auto-detected when unset)"
 
 // Agent command flags
 var (
@@ -51,6 +56,7 @@ var (
 	agentQueryOliumGCPProject  string
 	agentQueryOliumGCPLocation string
 	agentQueryOliumBaseURL     string
+	agentQueryPreflight        agentPreflightFlags
 )
 
 var agentCmd = &cobra.Command{
@@ -65,26 +71,31 @@ Use a subcommand to select the agentic scan mode:
   olium      Interactive olium agent (TUI or headless prompt)
   audit      Unified security audit (vigolium-audit and/or piolium)
 
+` + agentSetupHelpLine + `
 Docs: https://docs.vigolium.com`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		defer syncLogger()
 
-		settings, err := config.LoadSettings(globalConfig)
+		settings, err := clicommon.LoadSettings(globalConfig)
 		if err != nil {
-			zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-			settings = config.DefaultSettings()
+			return err
 		}
 
 		// Handle --list-agents
 		if agentListAgents {
-			return printAgentList(settings)
+			return printAgentList(cmd, settings)
 		}
 
 		// Handle --list-templates
 		if agentListTemplates {
-			return printTemplateList(settings)
+			return printTemplateList(cmd, settings)
 		}
 
+		// Help is text; under -j it would be the one thing on stdout that is
+		// not a document.
+		if globalJSON {
+			return usageErrorf("agent -j needs a subcommand (agent query, agent session, …) or --list-agents / --list-templates")
+		}
 		return cmd.Help()
 	},
 }
@@ -133,17 +144,21 @@ func init() {
 	rf.StringVar(&agentInstruction, "instruction", "", "Custom instruction to guide the agent (appended to prompt)")
 	rf.StringVar(&agentInstructionFile, "instruction-file", "", "Path to a file containing custom instructions")
 	rf.BoolVar(&agentUploadResults, "upload-results", false, "Upload session bundle to cloud storage after completion (requires storage config)")
-	rf.StringVar(&agentQueryOliumProvider, "provider", "", "Olium provider override: openai-codex-oauth | openai-api-key | anthropic-api-key | anthropic-oauth | anthropic-cli | anthropic-vertex | google-vertex | openai-compatible (falls back to agent.olium.provider config)")
+	registerOliumProviderFlag(rf, &agentQueryOliumProvider, oliumProviderFlagUsage)
 	rf.StringVar(&agentQueryOliumModel, "model", "", "Olium model id override (falls back to agent.olium.model)")
 	rf.StringVar(&agentQueryOliumOAuthCred, "oauth-cred", "", "Olium OAuth/SA credential file (openai-codex-oauth, anthropic-vertex, or google-vertex; falls back to agent.olium.oauth_cred_path or $GOOGLE_APPLICATION_CREDENTIALS)")
 	rf.StringVar(&agentQueryOliumOAuthToken, "oauth-token", "", "Olium Anthropic OAuth bearer token (anthropic-oauth provider; falls back to agent.olium.oauth_token or $ANTHROPIC_API_KEY)")
 	rf.StringVar(&agentQueryOliumLLMAPIKey, "llm-api-key", "", "Olium API key for key-based providers (falls back to agent.olium.llm_api_key or provider env var)")
 	rf.StringVar(&agentQueryOliumGCPProject, "gcp-project", "", "GCP project for Vertex providers (else $GOOGLE_CLOUD_PROJECT, then YAML, then SA file's project_id)")
 	rf.StringVar(&agentQueryOliumGCPLocation, "gcp-location", "", "GCP region for Vertex providers (else $GOOGLE_CLOUD_LOCATION, then YAML, then us-central1)")
+	registerAgentPreflightFlags(agentQueryCmd, &agentQueryPreflight)
 	rf.StringVar(&agentQueryOliumBaseURL, "base-url", "", "Endpoint URL for openai-compatible provider (e.g. http://localhost:11434/v1); falls back to agent.olium.custom_provider.base_url")
 }
 
 func runAgentQuery(cmd *cobra.Command, args []string) error {
+	// The bash tool's children run against this process's binary, database,
+	// project and config (agent_child_env.go).
+	installAgentChildEnv()
 	defer syncLogger()
 	defer closeDatabaseOnExit()
 
@@ -157,13 +172,21 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
 	hasInline := agentPromptInline != "" || agentStdin
 
 	if !hasTemplate && !hasInline {
-		return fmt.Errorf("either a prompt (argument, --prompt/-p, --stdin) or a template (--prompt-template, --prompt-file) is required")
+		return usageErrorf("either a prompt (argument, --prompt/-p, --stdin) or a template (--prompt-template, --prompt-file) is required")
+	}
+	// --stdin is read here, so an empty pipe is refused before anything
+	// is built or sent; the engine then takes it as an inline prompt.
+	if agentStdin && agentPromptInline == "" {
+		text, err := readNonEmptyStdin("--stdin")
+		if err != nil {
+			return err
+		}
+		agentPromptInline, agentStdin = text, false
 	}
 
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// Per-run olium overrides — only applied when the operator passed an
@@ -194,16 +217,16 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
 	if agentQueryOliumBaseURL != "" {
 		settings.Agent.Olium.CustomProvider.BaseURL = agentQueryOliumBaseURL
 	}
+	agentQueryPreflight.apply(settings)
 
 	// Open DB for ingestion (optional)
 	var repo *database.Repository
-	db, dbErr := getDB()
+	// Write intent: the opener makes the schema ready, so no CreateSchema here.
+	db, dbErr := getDBFor(clicommon.IntentWrite)
 	if dbErr == nil {
-		ctx := context.Background()
-		if schemaErr := db.CreateSchema(ctx); schemaErr != nil {
-			zap.L().Warn("Failed to create schema", zap.Error(schemaErr))
-		}
 		repo = database.NewRepository(db)
+	} else {
+		zap.L().Warn("Database unavailable; continuing without persistence", zap.Error(dbErr))
 	}
 
 	instruction, err := resolveInstruction(agentInstruction, agentInstructionFile)
@@ -213,9 +236,22 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
 
 	engine := agent.NewEngine(settings, repo)
 
-	// Preflight: validate agent backend is available before building prompts
-	if err := engine.Preflight(agentLabel); err != nil {
-		return fmt.Errorf("agent preflight failed: %w", err)
+	ctx := context.Background()
+	if cmd != nil && cmd.Context() != nil {
+		ctx = cmd.Context()
+	}
+
+	// Preflight: validate the provider before building prompts. A dry run
+	// renders the prompt only and never calls the provider.
+	if !agentDryRun {
+		if err := agent.ProviderDialCheck(ctx, &settings.Agent.Olium); err != nil {
+			return err
+		}
+	}
+	if !agentDryRun && !agentQueryPreflight.skip {
+		if err := engine.Preflight(ctx); err != nil {
+			return err
+		}
 	}
 
 	opts := agent.Options{
@@ -237,10 +273,9 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
 		Verbose:        agentVerbose,
 	}
 	if settings.Agent.StreamEnabled() {
-		opts.StreamWriter = os.Stdout
+		opts.StreamWriter = agentStreamSink()
 	}
 
-	ctx := context.Background()
 	if agentMaxDuration > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, agentMaxDuration)
@@ -249,22 +284,74 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
 
 	// Create session directory for agent artifacts. Created before engine.Run
 	// so we can tee the stream into {sessionDir}/runtime.log for `vigolium log`.
-	queryAgenticScanUUID := uuid.New().String()
-	sessionDir, sdErr := agent.EnsureSessionDir(settings.Agent.EffectiveSessionsDir(), queryAgenticScanUUID)
-	if sdErr != nil {
-		zap.L().Warn("Failed to create session dir", zap.Error(sdErr))
+	queryAgenticScanUUID := pinnedOrNewUUID(globalScanUUID)
+	var sessionDir string
+	if !agentDryRun {
+		var sdErr error
+		sessionDir, sdErr = agent.EnsureSessionDir(settings.Agent.EffectiveSessionsDir(), queryAgenticScanUUID)
+		if sdErr != nil {
+			zap.L().Warn("Failed to create session dir", zap.Error(sdErr))
+		}
+		opts.SessionDir = sessionDir
 	}
 	if tee, closer := teeToRuntimeLog(opts.StreamWriter, sessionDir); closer != nil {
 		opts.StreamWriter = tee
 		defer func() { _ = closer.Close() }()
 	}
 
+	// The query's own agentic_scans row, so `agent session`, `log ls` and
+	// `finding --agentic-scan` find it like any other agent run. A dry run
+	// renders a prompt only and records nothing.
+	projectUUID, _ := resolveProjectUUID()
+	startedAt := time.Now()
+	if !agentDryRun {
+		_, model := settings.Agent.BackendMeta()
+		startAgenticScanRow(ctx, repo, &database.AgenticScan{
+			UUID:        queryAgenticScanUUID,
+			ProjectUUID: projectUUID,
+			ScanUUID:    globalScanUUID,
+			Mode:        "query",
+			AgentName:   firstNonEmptyString(agentLabel, "olium"),
+			Protocol:    config.AgentProtocolLabel,
+			Model:       model,
+			TemplateID:  agentPromptTemplate,
+			SourcePath:  agentSourcePath,
+			SessionDir:  sessionDir,
+			StartedAt:   startedAt,
+		})
+		printAgentRunHandle(queryAgenticScanUUID, sessionDir)
+		var stopCancelWatch func()
+		ctx, stopCancelWatch = watchAgentCancel(ctx, repo, sessionDir, queryAgenticScanUUID)
+		defer stopCancelWatch()
+	}
+
 	result, err := engine.Run(ctx, opts)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("agent timed out after %s (use --max-duration to adjust or set to 0 to disable)", agentMaxDuration)
+	if !agentDryRun {
+		end := database.AgenticRunEnd{
+			Err:       err,
+			TimedOut:  err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded),
+			Cancelled: err != nil && errors.Is(ctx.Err(), context.Canceled),
 		}
-		return fmt.Errorf("agent run failed: %w", err)
+		if end.TimedOut {
+			end.Err = nil
+		}
+		dbStatus, _ := agentRunStatus(end)
+		fin := agenticScanRowFinish{Status: dbStatus}
+		if err != nil {
+			fin.ErrorMessage = err.Error()
+		}
+		if result != nil {
+			fin.FindingCount = len(result.Findings)
+			fin.SavedCount = result.SavedCount
+			fin.Usage = agentRunUsage{InputTokens: int64(result.TokenUsage.InputTokens), OutputTokens: int64(result.TokenUsage.OutputTokens)}
+		}
+		finishAgenticScanRow(repo, queryAgenticScanUUID, startedAt, fin)
+	}
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return incompleteErrorf(apicontract.CodeTimedOut, "agent timed out after %s (use --max-duration to adjust or set to 0 to disable)", agentMaxDuration)
+		}
+		return agentRunFailure(ctx, err)
 	}
 
 	// Save raw output to session directory
@@ -274,49 +361,69 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if agentUploadResults && sessionDir != "" {
+		uploadAgenticScanResults(settings, projectUUID, queryAgenticScanUUID, sessionDir, repo)
+	}
+
+	// -j: one read envelope carrying the result (items[0]) and the run's
+	// handle. The streamed text went to stderr (or nowhere), never stdout.
+	if globalJSON {
+		var runUUID string
+		if !agentDryRun {
+			runUUID = queryAgenticScanUUID
+		}
+		return emitObject(cmd, ".", result,
+			withExtra("agentic_scan_uuid", runUUID),
+			withExtra("session_dir", sessionDir),
+			withProjectScope(projectUUID))
+	}
+
 	// For inline runs without a template, print raw output (skip if already streamed)
 	if !hasTemplate && opts.StreamWriter == nil {
 		fmt.Print(result.RawOutput)
-		if agentUploadResults && sessionDir != "" {
-			projectUUID, _ := resolveProjectUUID()
-			uploadAgenticScanResults(settings, projectUUID, queryAgenticScanUUID, sessionDir, repo)
-		}
 		return nil
 	}
 
 	printAgentResult(result)
-
-	if agentUploadResults && sessionDir != "" {
-		projectUUID, _ := resolveProjectUUID()
-		uploadAgenticScanResults(settings, projectUUID, queryAgenticScanUUID, sessionDir, repo)
-	}
 	return nil
 }
 
-// printAgentList prints the olium providers configured for this install.
-// With the subprocess backend system removed, the "list" now reflects the
-// four olium providers plus the active default from agent.olium.provider.
-func printAgentList(settings *config.Settings) error {
+// printAgentList prints the olium providers the runtime accepts and which one
+// a run would use: agent.olium.provider when set, else the auto-detected one
+// (decision D25: "auto-detect; set agent.olium.provider", the same words the
+// README and the preflight error use).
+func printAgentList(cmd *cobra.Command, settings *config.Settings) error {
 	type providerEntry struct {
 		Name        string
 		Model       string
 		Auth        string
 		Description string
 	}
-	defaults := []providerEntry{
-		{"openai-codex-oauth", "gpt-5.5", "~/.codex/auth.json", "OpenAI Codex via ChatGPT OAuth (default)"},
-		{"openai-api-key", "gpt-5.5", "$OPENAI_API_KEY", "OpenAI chat API via API key"},
-		{"anthropic-api-key", "claude-opus-4-7", "$ANTHROPIC_API_KEY", "Anthropic Claude via API key"},
-		{"anthropic-oauth", "claude-opus-4-7", "$ANTHROPIC_API_KEY", "Anthropic Claude via OAuth bearer token (claude setup-token)"},
-		{"anthropic-cli", "claude-opus-4-7", "claude binary in PATH", "Anthropic Claude via local claude CLI"},
-		{"anthropic-vertex", "claude-opus-4-6", "GCP service-account JSON", "Anthropic Claude on Google Vertex AI"},
-		{"google-vertex", "gemini-2.5-pro", "GCP service-account JSON", "Google Gemini on Vertex AI"},
+	// Display metadata keyed by provider name. The rendered list is driven by
+	// olium.ProviderNames (the runtime's source of truth), so every accepted
+	// provider always appears — a provider added to the runtime without metadata
+	// here still shows up with a generic row rather than silently disappearing.
+	meta := map[string]providerEntry{
+		"openai-codex-oauth":          {Model: olium.DefaultOpenAIModel, Auth: "~/.codex/auth.json", Description: "OpenAI Codex via ChatGPT OAuth (the auto-detect fallback)"},
+		"openai-api-key":              {Model: olium.DefaultOpenAIModel, Auth: "$OPENAI_API_KEY", Description: "OpenAI chat API via API key"},
+		"openai-responses":            {Model: olium.DefaultOpenAIModel, Auth: "$OPENAI_API_KEY", Description: "OpenAI Responses API (/v1/responses) via API key"},
+		"anthropic-api-key":           {Model: olium.DefaultAnthropicModel, Auth: "$ANTHROPIC_API_KEY", Description: "Anthropic Claude via API key"},
+		"anthropic-oauth":             {Model: olium.DefaultAnthropicModel, Auth: "$ANTHROPIC_API_KEY", Description: "Anthropic Claude via OAuth bearer token (claude setup-token)"},
+		"anthropic-cli":               {Model: olium.DefaultAnthropicModel, Auth: "claude binary in PATH", Description: "Anthropic Claude via local claude CLI (alias: anthropic-claude-cli)"},
+		"anthropic-claude-sdk-bridge": {Model: "(claude default)", Auth: "Claude Code subscription", Description: "Claude Code via Agent SDK (vigolium-audit bridge)"},
+		"anthropic-vertex":            {Model: olium.DefaultAnthropicModel, Auth: "GCP service-account JSON", Description: "Anthropic Claude on Google Vertex AI"},
+		"google-vertex":               {Model: olium.DefaultGoogleModel, Auth: "GCP service-account JSON", Description: "Google Gemini on Vertex AI"},
+		"openai-compatible":           {Model: "custom_provider.model_id", Auth: "custom_provider.base_url", Description: "OpenAI-compatible endpoint (local Ollama/vLLM/gateway)"},
+		"anthropic-compatible":        {Model: "custom_provider.model_id", Auth: "custom_provider.base_url", Description: "Anthropic Messages-compatible gateway"},
+	}
+	defaults := make([]providerEntry, 0, len(olium.ProviderNames))
+	for _, name := range olium.ProviderNames {
+		e := meta[name]
+		e.Name = name
+		defaults = append(defaults, e)
 	}
 
-	activeProvider := settings.Agent.Olium.Provider
-	if activeProvider == "" {
-		activeProvider = "openai-codex-oauth"
-	}
+	activeProvider, activeSource := activeOliumProvider(settings)
 
 	if globalJSON {
 		type apiEntry struct {
@@ -336,13 +443,10 @@ func printAgentList(settings *config.Settings) error {
 				IsActive:    p.Name == activeProvider,
 			})
 		}
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(map[string]interface{}{
-			"providers": entries,
-			"total":     len(entries),
-			"active":    activeProvider,
-		})
+		return emitRead(cmd, "providers", entries, int64(len(entries)), 0, len(entries),
+			withExtra("active", activeProvider),
+			withExtra("active_source", activeSource),
+			withExtra("setup_hint", agent.ProviderSetupHint))
 	}
 
 	tbl := terminal.NewTableWithMaxWidth(globalWidth, "PROVIDER", "MODEL", "AUTH", "DESCRIPTION", "ACTIVE")
@@ -354,22 +458,38 @@ func printAgentList(settings *config.Settings) error {
 		tbl.AddRow(terminal.Cyan(p.Name), p.Model, p.Auth, p.Description, active)
 	}
 	tbl.Print()
+	// The AUTH column names *what* each provider needs; the guide explains how
+	// to obtain and wire it. Printed only on the human table (the JSON branch
+	// above returns early) so machine consumers stay unaffected.
+	if activeSource == "auto-detect" {
+		fmt.Printf("\n%s Active: %s (auto-detected; agent.olium.provider is unset)\n", terminal.InfoSymbol(), terminal.Cyan(activeProvider))
+	} else {
+		fmt.Printf("\n%s Active: %s (agent.olium.provider)\n", terminal.InfoSymbol(), terminal.Cyan(activeProvider))
+	}
+	fmt.Printf("%s Provider: auto-detected unless agent.olium.provider is set — %s\n", terminal.InfoSymbol(),
+		terminal.Cyan("vigolium config set agent.olium.provider <name>"))
+	fmt.Printf("%s Setup guide: %s\n", terminal.InfoSymbol(), terminal.Cyan(olium.SetupDocsURL))
 	return nil
 }
 
-func printTemplateList(settings *config.Settings) error {
+// activeOliumProvider is the provider a run would use and where that answer
+// comes from: "config" (agent.olium.provider, or --provider folded into it) or
+// "auto-detect" (unset: the runtime picks, see olium.AutoDetectedProvider).
+func activeOliumProvider(settings *config.Settings) (name, source string) {
+	if p := olium.CanonicalProviderName(settings.Agent.Olium.Provider); p != "" {
+		return p, "config"
+	}
+	return olium.AutoDetectedProvider(), "auto-detect"
+}
+
+func printTemplateList(cmd *cobra.Command, settings *config.Settings) error {
 	templates, err := agent.ListTemplates(settings.Agent.TemplatesDir)
 	if err != nil {
 		return fmt.Errorf("failed to list templates: %w", err)
 	}
 
 	if globalJSON {
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(map[string]interface{}{
-			"templates": templates,
-			"total":     len(templates),
-		})
+		return emitRead(cmd, "templates", templates, int64(len(templates)), 0, len(templates))
 	}
 
 	if len(templates) == 0 {
@@ -387,13 +507,6 @@ func printTemplateList(settings *config.Settings) error {
 }
 
 func printAgentResult(result *agent.Result) {
-	if globalJSON {
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		_ = encoder.Encode(result)
-		return
-	}
-
 	if result.DryRun {
 		fmt.Print(result.RawOutput)
 		return

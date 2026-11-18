@@ -9,21 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-The MCP ` + "`completion/complete`" + ` primitive is intended for IDE-style argument
-autocomplete, but in practice it is an enumeration oracle: empty/short
-prefixes return back the full list of values the server considers valid for a
-given resource URI placeholder or prompt argument.
+	ModuleDesc = `**What it means:** A Model Context Protocol (MCP) server answers unauthenticated completion/complete queries by returning the full set of valid values for its prompt arguments and resource-template placeholders, turning autocomplete into an enumeration oracle that leaks usernames, identifiers, or file paths.
 
-This module sends a series of empty + short-prefix completion queries against
-every resource template placeholder and every prompt argument and reports the
-returned values verbatim. Use the output to seed exploitation in
-` + "`resources/read`" + ` (URI placeholders) and ` + "`prompts/get`" + `.
+**How it's exploited:** An attacker initializes a session and sends empty-prefix completion/complete requests against each argument and placeholder; the server replies with the value lists verbatim, seeding follow-on access via resources/read and prompts/get.
 
-## References
-- https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion`
+**Fix:** Require authentication for completion/complete and avoid returning sensitive value sets; restrict completions to non-sensitive hints or disable the capability where it leaks private data.`
 
-	ModuleConfirmation = "Confirmed when completion/complete returns at least one value (the server is willing to disclose its valid value set without authentication)"
+	ModuleConfirmation = "Observation when completion/complete returns ordinary values; candidate only for identity, credential, or sensitive-path shapes, without inferring anonymous access or downstream authorization impact"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"mcp", "info-disclosure", "enumeration", "light"}

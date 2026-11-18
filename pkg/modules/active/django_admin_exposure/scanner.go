@@ -9,6 +9,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
@@ -18,7 +19,7 @@ import (
 type probe struct {
 	path        string
 	name        string
-	markers     []string
+	markers     [][]string
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
@@ -26,20 +27,30 @@ type probe struct {
 
 var probes = []probe{
 	{
-		path:        "/admin/",
-		name:        "Django Admin Index",
-		markers:     []string{"Django administration", "django-admin", "Log in", "id_username", "id_password"},
+		path: "/admin/",
+		name: "Django Admin Index",
+		// Django-specific markers only — the bare "Log in" matched any login wall.
+		// "id_username"/"id_password" are Django's default admin form field IDs.
+		markers: [][]string{
+			{"Django administration", "django-admin", "/static/admin/"},
+			{"id_username", "id_password", "csrfmiddlewaretoken"},
+		},
 		antiMarkers: []string{"404 Not Found", "Page not found"},
-		sev:         severity.Medium,
-		desc:        "Django admin panel is publicly accessible, exposing the administration interface",
+		sev:         severity.Low,
+		desc:        "The Django administration login interface is reachable without credentials. This is an attack-surface observation; no authentication bypass or administrative access was demonstrated.",
 	},
 	{
-		path:        "/admin/login/",
-		name:        "Django Admin Login",
-		markers:     []string{"Django administration", "Log in", "id_username", "csrfmiddlewaretoken"},
+		path: "/admin/login/",
+		name: "Django Admin Login",
+		// Drop generic "Log in"; require Django-unique markers (the admin title, the
+		// form field IDs, or the Django CSRF field name).
+		markers: [][]string{
+			{"Django administration", "django-admin", "/static/admin/"},
+			{"id_username", "id_password", "csrfmiddlewaretoken"},
+		},
 		antiMarkers: []string{"404 Not Found", "Page not found"},
-		sev:         severity.Medium,
-		desc:        "Django admin login page is publicly accessible, confirming Django admin is installed and enabling brute force attacks",
+		sev:         severity.Low,
+		desc:        "The Django administration login interface is reachable without credentials. This is an attack-surface observation; no credential weakness or administrative access was demonstrated.",
 	},
 }
 
@@ -96,21 +107,48 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	cleanRaw, err := modkit.StripCredentialHeaders(ctx.Request().Raw())
+	if err != nil {
+		return nil, nil
+	}
+	anonymousClient, err := httpClient.CloneWithoutCredentials()
+	if err != nil {
+		return nil, nil
+	}
+	anonymousCtx := httpmsg.NewHttpRequestResponse(
+		httpmsg.NewHttpRequestWithService(service, cleanRaw),
+		ctx.Response(),
+	)
+
+	urlx, err := anonymousCtx.URL()
+	if err != nil {
 		return nil, nil
 	}
 
-	fp := m.fingerprint404(ctx, httpClient)
+	// Walk the web root plus any context-path prefixes of the observed URL so a
+	// known endpoint mounted under a context path (e.g. /myapp/<endpoint>) is
+	// reached, not just the root. Claim each (host, base) pair up front so a
+	// fully-deduped request issues no traffic — including the soft-404 fingerprint.
+	var diskSet *dedup.DiskSet
+	if scanCtx != nil {
+		diskSet = m.ds.Get(scanCtx.DedupMgr())
+	}
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
+		return nil, nil
+	}
 
-	var results []*output.ResultEvent
-	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p, fp); result != nil {
-			results = append(results, result)
+	fp := m.fingerprint404(anonymousCtx, anonymousClient)
+
+	for _, base := range bases {
+		for _, p := range probes {
+			if result := m.probeEndpoint(anonymousCtx, anonymousClient, p, base+p.path, fp); result != nil {
+				return []*output.ResultEvent{result}, nil
+			}
 		}
 	}
 
-	return results, nil
+	return nil, nil
 }
 
 func (m *Module) fingerprint404(
@@ -128,17 +166,17 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
-	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
+	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
 		return nil
 	}
 	defer resp.Close()
+	if resp.Response() == nil || infra.IsBlockedResponse(resp) {
+		return nil
+	}
 
 	body := resp.Body().String()
 	return &notFoundFingerprint{
@@ -151,30 +189,28 @@ func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	p probe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, p.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
-	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
+	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true, NoClustering: true})
 	if err != nil {
 		return nil
 	}
 	defer resp.Close()
 
-	if resp.Response() == nil {
+	if resp.Response() == nil || infra.IsBlockedResponse(resp) {
 		return nil
 	}
 
@@ -206,6 +242,13 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Catch-all / shell guard: a body textually equivalent to the originally
+	// observed page means the app served its standard shell for /admin/ too, not a
+	// distinct Django admin — "the same body with or without the probe".
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
 			return nil
@@ -216,34 +259,35 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
-	}
-	if !matched {
+	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, body, p.markers)
+	if !ok {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
+		ModuleID:         ModuleID,
+		RecordKind:       output.RecordKindObservation,
+		EvidenceGrade:    output.EvidenceGradeObservation,
 		URL:              targetURL,
 		Matched:          targetURL,
 		Request:          string(modifiedRaw),
 		Response:         resp.FullResponseString(),
 		ExtractedResults: matchedMarkers,
 		Info: output.Info{
-			Name:        fmt.Sprintf("Django Admin Exposure: %s", p.name),
+			Name:        fmt.Sprintf("Django Admin Interface Observed: %s", p.name),
 			Description: p.desc,
 			Severity:    p.sev,
 			Confidence:  ModuleConfidence,
 			Tags:        []string{"python", "django", "admin", "exposure"},
 			Reference:   []string{"https://docs.djangoproject.com/en/stable/ref/contrib/admin/"},
+		},
+		Metadata: map[string]any{
+			"credential_free":         true,
+			"authentication_bypassed": false,
+			"admin_access_confirmed":  false,
 		},
 	}
 }

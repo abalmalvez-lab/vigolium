@@ -9,21 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects insecure deserialization vulnerabilities by injecting serialized object payloads
-and analyzing responses for deserialization error messages across multiple frameworks.
+	ModuleDesc = `**What it means:** An inert Java, PHP, Python, Ruby, or .NET wire-format probe reproducibly introduced a matching server-side deserialization exception while a plain malformed-value control stayed clean.
 
-## Notes
-- Tests for Java, PHP, Python, Ruby, and .NET deserialization patterns
-- Uses error-based detection to identify deserialization endpoints
-- Analyzes response bodies for framework-specific error messages
-- OWASP Top 10 2021: A08
+**How it's exploited:** Deserializer reachability is a high-priority candidate because a compatible gadget chain may lead to code execution or other impact. This module sends no gadget and does not label an exception as RCE; execution requires an OAST callback or safe side effect.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/16-Testing_for_HTTP_Incoming_Requests
-- https://portswigger.net/web-security/deserialization`
+**Fix:** Never deserialize untrusted input; use safe formats like JSON with strict schemas, and if unavoidable enforce type allow-lists and payload integrity checks.`
 
-	ModuleConfirmation = "Confirmed when injected serialized payloads trigger deserialization error messages in the response"
+	ModuleConfirmation = "Candidate requires a framework-matched error absent from baseline/control and reproduced by a second inert probe; findings require separate execution or side-effect proof"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"deserialization", "rce", "moderate"}

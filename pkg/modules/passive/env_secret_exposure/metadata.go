@@ -5,35 +5,18 @@ import "github.com/vigolium/vigolium/pkg/types/severity"
 const (
 	ModuleID    = "env-secret-exposure"
 	ModuleName  = "Environment Secret Exposure"
-	ModuleShort = "Detects secrets exposed through public environment variables"
+	ModuleShort = "Detects credential-shaped values in public environment variables and served dotenv files"
 )
 
 var (
-	ModuleDesc = `## Description
-Scans response bodies for secrets accidentally exposed through public environment
-variable mechanisms in modern JS frameworks. Next.js (NEXT_PUBLIC_), Vite (VITE_),
-and Create React App (REACT_APP_) all expose prefixed environment variables to the
-client bundle. When developers store secret keys, tokens, or passwords in these
-public variables, they are shipped to every browser that loads the application.
-Also detects .env files served directly with embedded secrets.
+	ModuleDesc = `**What it means:** A successful response contains a credential-shaped value in a browser-visible framework variable or directly served dotenv file. Publishable identifiers, placeholders, weak examples, and documentation are filtered; the remainder is still a candidate until validated.
 
-## Notes
-- Passive only -- does not send any HTTP requests
-- Scans JS, HTML, JSON, and plain text responses
-- Detects NEXT_PUBLIC_, VITE_, REACT_APP_ prefixed secret variables
-- Detects raw .env file content with secret indicators (sk_live_, AKIA, ghp_, etc.)
-- Minimum value length of 8 characters to reduce false positives
-- Deduplicates by host
+**How it's exploited:** An attacker extracts an exposed live credential and uses its provider permissions. Public framework variables are not secret merely because their names look sensitive.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/configuring/environment-variables
-- https://vitejs.dev/guide/env-and-mode.html
-- https://create-react-app.dev/docs/adding-custom-environment-variables/
-- https://cwe.mitre.org/data/definitions/200.html
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/05-Enumerate_Infrastructure_and_Application_Admin_Interfaces`
+**Fix:** Validate and rotate live credentials, keep secrets server-side, and block dotenv files.`
 
-	ModuleConfirmation = "Confirmed when response body contains public environment variables with secret values or .env file content with credential indicators"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleConfirmation = "Candidate when a successful response exposes a non-placeholder, credential-shaped value in a public framework variable or directly served dotenv file; live-secret validation is required"
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"info-disclosure", "file-exposure", "light"}
 )

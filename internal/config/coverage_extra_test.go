@@ -455,6 +455,20 @@ func TestDiscoveryConfig_Validate(t *testing.T) {
 		{"engine timeout out of range", func(c *DiscoveryConfig) { c.Engine.Timeout = "500s" }, true},
 		{"engine timeout invalid", func(c *DiscoveryConfig) { c.Engine.Timeout = "bogus" }, true},
 		{"bad case_sensitivity", func(c *DiscoveryConfig) { c.Engine.CaseSensitivity = "weird" }, true},
+		{"bad jstangle replay mode", func(c *DiscoveryConfig) { c.JSTangle.ReplayMode = "mutation" }, true},
+		{"too few AST nodes", func(c *DiscoveryConfig) { c.JSTangle.MaxASTNodes = 10 }, true},
+		{"too many jstangle workers", func(c *DiscoveryConfig) { c.JSTangle.WorkerCount = 99 }, true},
+		{"jstangle memory below deparos floor", func(c *DiscoveryConfig) { c.JSTangle.MemoryBudgetMB = 64 }, true},
+		{"jstangle memory zero is the RAM-derived default", func(c *DiscoveryConfig) { c.JSTangle.MemoryBudgetMB = 0 }, false},
+		{"jstangle memory negative", func(c *DiscoveryConfig) { c.JSTangle.MemoryBudgetMB = -1 }, true},
+		{"jstangle unpack above hard", func(c *DiscoveryConfig) { c.JSTangle.MaxUnpackInputMB = 32 }, true},
+		{"jstangle pre-unpack-tier config (hard 10, unpack unset)", func(c *DiscoveryConfig) { c.JSTangle.HardInputMB = 10 }, false},
+		{"jstangle hard below ast", func(c *DiscoveryConfig) { c.JSTangle.HardInputMB = 2 }, true},
+		{"low jstangle memory ok when jstangle disabled", func(c *DiscoveryConfig) {
+			off := false
+			c.JSTangle.Enabled = &off
+			c.JSTangle.MemoryBudgetMB = 0
+		}, false},
 		{"valid in-range timeout", func(c *DiscoveryConfig) { c.Engine.Timeout = "30s" }, false},
 	}
 	for _, tt := range cases {

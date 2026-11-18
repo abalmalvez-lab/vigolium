@@ -2,26 +2,70 @@ package oast_probe
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
-// Headers to inject OAST URLs into for blind detection.
-var oastHeaders = []string{
-	"Referer",
-	"X-Forwarded-For",
-	"X-Forwarded-Host",
-	"Origin",
-	"X-Original-URL",
-	"Authorization",
+// shapeKind selects how an OAST host is rendered into a header value. Different
+// headers expect different forms: a URL, a bare host (IP-style routing headers
+// that trigger a DNS lookup), a UAProf XML URL, or an RFC 7239 "for=" token.
+type shapeKind int
+
+const (
+	shapeURL       shapeKind = iota // http://<host>
+	shapeBare                       // <host>           (DNS-pingback routing headers)
+	shapeWAP                        // http://<host>/wap.xml
+	shapeForwarded                  // for=<host>       (RFC 7239 Forwarded)
+)
+
+func (k shapeKind) render(host string) string {
+	switch k {
+	case shapeBare:
+		return host
+	case shapeWAP:
+		return "http://" + host + "/wap.xml"
+	case shapeForwarded:
+		return "for=" + host
+	default:
+		return "http://" + host
+	}
+}
+
+// oastHeader is a header to inject an OAST callback into, plus how to shape it.
+type oastHeader struct {
+	name string
+	kind shapeKind
+}
+
+// oastHeaders is the "Collaborator Everywhere" header fan-out (PortSwigger,
+// "Cracking the lens"): routing, analytics, and proxy headers that backends behind
+// a reverse proxy commonly fetch or resolve. The first six are the original set
+// (URL-shaped, unchanged); the rest add the True-Client-IP / X-WAP-Profile /
+// Forwarded family that the research found especially productive.
+var oastHeaders = []oastHeader{
+	{"Referer", shapeURL},
+	{"X-Forwarded-For", shapeURL},
+	{"X-Forwarded-Host", shapeURL},
+	{"Origin", shapeURL},
+	{"X-Original-URL", shapeURL},
+	{"Authorization", shapeURL},
+	// Collaborator-Everywhere additions:
+	{"True-Client-IP", shapeBare},
+	{"CF-Connecting-IP", shapeBare},
+	{"X-Client-IP", shapeBare},
+	{"X-ProxyUser-Ip", shapeBare},
+	{"Forwarded", shapeForwarded},
+	{"X-WAP-Profile", shapeWAP},
+	{"Profile", shapeWAP},
 }
 
 // Module implements the OAST probe active scanner.
@@ -87,25 +131,35 @@ func (m *Module) ScanPerRequest(
 
 	requestHash := ctx.Request().ID()
 
+	// Cache-Control: no-transform discourages intermediaries from mangling the
+	// injected payload before it reaches the backend (the "Cracking the lens"
+	// trick). It is identical for every probe, so build the base once instead of
+	// re-inserting (and re-parsing the raw) on each header iteration.
+	base, err := httpmsg.AddOrReplaceHeader(ctx.Request().Raw(), "Cache-Control", "no-transform")
+	if err != nil {
+		return nil, nil
+	}
+
 	for _, header := range oastHeaders {
-		oastURL := oast.GenerateURL(urlx.String(), header, "header", ModuleID, requestHash)
+		oastURL := modkit.OASTURLFor(oast, oastclass.HeaderHarvest, urlx.String(), header.name, "header", ModuleID, requestHash)
 		if oastURL == "" {
 			continue
 		}
 
-		// Wrap in http:// for headers that expect URLs
-		payload := "http://" + oastURL
+		// Shape the OAST host for this header (URL / bare host / wap.xml / for=).
+		payload := header.kind.render(oastURL)
+		// Record the shaped value so the finding reconstructs the real header
+		// (a bare host / "for=<host>" / wap.xml URL), not a generic http://<host>.
+		oast.RecordPayload(oastURL, payload)
 
-		modifiedRaw, err := httpmsg.AddOrReplaceHeader(ctx.Request().Raw(), header, payload)
+		modifiedRaw, err := httpmsg.AddOrReplaceHeader(base, header.name, payload)
 		if err != nil {
 			continue
 		}
 
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-		if err != nil {
-			continue
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
+		// modifiedRaw is internally built (well-formed), so wrap directly
+		// instead of re-parsing on this hot path.
+		fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 		if err != nil {
@@ -149,24 +203,23 @@ func (m *Module) ScanPerInsertionPoint(
 	}
 
 	// Only test parameters that look like they might accept URLs
-	if !looksLikeURLParam(ip.Name(), ip.BaseValue()) {
+	if !looksLikeURLParam(ip.Type(), ip.Name(), ip.BaseValue()) {
 		return nil, nil
 	}
 
 	requestHash := ctx.Request().ID()
-	oastURL := oast.GenerateURL(urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
+	oastURL := modkit.OASTURLFor(oast, oastclass.SSRF, urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
 	if oastURL == "" {
 		return nil, nil
 	}
 
 	payload := "http://" + oastURL
+	oast.RecordPayload(oastURL, payload)
 	fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return nil, nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest produces well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -181,21 +234,9 @@ func (m *Module) ScanPerInsertionPoint(
 	return nil, nil
 }
 
-// looksLikeURLParam checks if a parameter name or value suggests URL input.
-func looksLikeURLParam(name, value string) bool {
-	nameLower := strings.ToLower(name)
-	urlParamNames := []string{
-		"url", "uri", "link", "src", "href", "dest", "redirect",
-		"path", "file", "page", "target", "callback", "endpoint",
-		"resource", "fetch", "load", "proxy", "request",
-	}
-	for _, n := range urlParamNames {
-		if strings.Contains(nameLower, n) {
-			return true
-		}
-	}
-	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "//") {
-		return true
-	}
-	return false
+// looksLikeURLParam reports whether a parameter looks like a URL sink. It delegates
+// to the shared infra helper so the standard-request-header exclusion stays
+// consistent across the SSRF/OAST family.
+func looksLikeURLParam(typ httpmsg.InsertionPointType, name, value string) bool {
+	return infra.LooksLikeURLParamAt(typ, name, value)
 }

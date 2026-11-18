@@ -28,19 +28,17 @@ import (
 func (h *Handlers) HandleAgentAutopilot(c fiber.Ctx) error {
 	var req AgentAutopilotRequest
 	if err := c.Bind().JSON(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "invalid request body: " + err.Error(),
-		})
+		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 	}
 
 	// Natural language prompt: resolve when explicit fields are empty
 	if req.Prompt != "" && req.Target == "" && req.Input == "" && req.SourcePath == "" && req.Diff == "" && req.LastCommits == 0 {
-		if refused := h.refuseIfGuardrailBlocks(c, req.Prompt); refused != nil {
-			return refused
+		if refused, err := h.refuseIfGuardrailBlocks(c, req.Prompt); refused {
+			return err
 		}
-		resolved, resolveErr := h.resolvePromptIntent(c, req.Prompt)
-		if resolveErr != nil {
-			return resolveErr // already sent HTTP response
+		resolved, answered, resolveErr := h.resolvePromptIntent(c, req.Prompt)
+		if answered {
+			return resolveErr // error response already written
 		}
 		if req.DryRun {
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{"intent": resolved})
@@ -65,6 +63,9 @@ func (h *Handlers) HandleAgentAutopilot(c fiber.Ctx) error {
 				} else {
 					req.AuditDriverMode = app.Audit
 				}
+			}
+			if app.Piolium != "" && req.Piolium == "" {
+				req.Piolium = app.Piolium
 			}
 			if app.Diff != "" && req.Diff == "" {
 				req.Diff = app.Diff
@@ -109,38 +110,42 @@ func (h *Handlers) HandleAgentAutopilot(c fiber.Ctx) error {
 	if req.Target == "" && req.Input != "" {
 		targetURL, err := agent.TargetURLFromInput(context.Background(), req.Input, "", h.repo)
 		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-				Error: "could not extract target URL from input: " + err.Error(),
-			})
+			return respondError(c, fiber.StatusBadRequest, fmt.Errorf("could not extract target URL from input: %w", err))
 		}
 		req.Target = targetURL
 	}
 
 	if req.Target == "" && req.SourcePath == "" && req.Diff == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "target, source, or diff is required (use target, input, source, diff, or prompt field)",
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "target, source, or diff is required (use target, input, source, diff, or prompt field)")
 	}
 
 	// Validate audit_mode if provided
 	if mode := req.ResolvedAuditDriverMode(); mode != "lite" && mode != "balanced" && mode != "scan" && mode != "deep" && mode != "mock" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: fmt.Sprintf("invalid audit_mode %q: must be lite, balanced, deep, or mock", mode),
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, fmt.Sprintf("invalid audit_mode %q: must be lite, balanced, deep, or mock", mode))
+	}
+
+	// The nested audit harness (a claude/codex or pi CLI run before the
+	// operator) is off unless the request asks for one — audit / audit_mode /
+	// piolium, or the prompt's intent — as `vigolium agent autopilot` has it
+	// (--audit defaults off). Neither the intensity preset nor an installed
+	// piolium turns it on.
+	if !autopilotAuditRequested(req) {
+		req.NoAudit = true
 	}
 
 	// Resolve intensity preset
 	intensity, intensityErr := agent.ValidateIntensity(req.Intensity)
 	if intensityErr != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{Error: intensityErr.Error()})
+		return respondError(c, fiber.StatusBadRequest, intensityErr)
 	}
 	{
 		changed := map[string]bool{
 			"max-commands": req.MaxCommands != 0,
 			"timeout":      req.Timeout != "",
-			"audit-mode":   req.AuditDriverMode != "",
-			"no-audit":     req.NoAudit || req.Audit == "off",
-			"browser":      req.Browser || req.RequiresBrowser,
+			// The preset's audit mode is never applied (see above).
+			"audit-mode": true,
+			"no-audit":   req.NoAudit || req.Audit == "off",
+			"browser":    req.Browser || req.RequiresBrowser,
 		}
 		result := agent.ResolveAutopilotIntensity(intensity, agent.AutopilotIntensityPreset{
 			MaxCommands:     req.MaxCommands,
@@ -154,9 +159,6 @@ func (h *Handlers) HandleAgentAutopilot(c fiber.Ctx) error {
 		if req.Timeout == "" {
 			req.Timeout = result.Timeout.String()
 		}
-		if req.AuditDriverMode == "" && req.Audit == "" {
-			req.AuditDriverMode = result.AuditDriverMode
-		}
 		if !req.Browser {
 			req.Browser = result.Browser
 		}
@@ -166,9 +168,7 @@ func (h *Handlers) HandleAgentAutopilot(c fiber.Ctx) error {
 
 	eng, cleanup, byokErr := h.engineForRequest(req.AgentBYOK)
 	if byokErr != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "byok: " + byokErr.Error(),
-		})
+		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("byok: %w", byokErr))
 	}
 
 	return h.startAutopilotRun(c, req, timeout, eng, cleanup)
@@ -191,7 +191,7 @@ func (h *Handlers) startAutopilotRun(c fiber.Ctx, req AgentAutopilotRequest, tim
 		return nil // 429 already sent
 	}
 
-	agenticScanUUID, err := h.registerRunningAgenticScan("autopilot", req.Agent, req.ScanUUID)
+	agenticScanUUID, err := h.registerRunningAgenticScan("autopilot", req.Agent, req.ScanUUID, projectUUID)
 	if err != nil {
 		h.releaseHeavyAgentSlotForProject(projectUUID)
 		if byokCleanup != nil {
@@ -223,31 +223,34 @@ func (h *Handlers) startAutopilotRun(c fiber.Ctx, req AgentAutopilotRequest, tim
 	})
 }
 
-// resolveAutopilotAuditCfgServer mirrors the CLI's audit-harness auto-pick
-// for the server's autopilot endpoint. When the request leaves both `audit`
-// and `piolium` empty, piolium wins if the server has pi+piolium installed,
-// otherwise audit's existing auto-on-source default applies. An explicit
-// `piolium` value disables audit (one harness per scan).
-func (h *Handlers) resolveAutopilotAuditCfgServer(req AgentAutopilotRequest, sourcePath string) (*config.AuditAgentConfig, agent.HarnessSpec) {
-	pioliumMode := req.Piolium
-	if sourcePath != "" && pioliumMode == "" {
-		auditExplicit := req.Audit != "" || req.AuditDriverMode != "" || req.NoAudit
-		if !auditExplicit && h.pioliumAvailableCached() {
-			pioliumMode = req.ResolvedAuditDriverMode()
-		}
+// autopilotAuditRequested reports whether an autopilot request asks for a
+// nested audit harness: an audit / audit_mode other than "off", or a piolium
+// mode.
+func autopilotAuditRequested(req AgentAutopilotRequest) bool {
+	if req.Piolium != "" && req.Piolium != "off" {
+		return true
 	}
-	return agent.PickAuditHarness(pioliumMode, req.ResolvedAuditDriverMode(), req.ResolvedNoAudit(), sourcePath, h.settings.Agent.Audit)
+	if req.Audit == "off" {
+		return false
+	}
+	return req.AuditDriverMode != "" || req.Audit != ""
 }
 
-// resolveSwarmAuditCfgServer is the swarm counterpart. Swarm audit is opt-in
-// (empty = nothing), so auto-pick fires only when both `audit` and `piolium`
-// are empty AND a source path is set.
+// resolveAutopilotAuditCfgServer picks the audit harness for the server's
+// autopilot endpoint: piolium when the request names a piolium mode, else
+// vigolium-audit when it names an audit mode, else none (off by default, as
+// on the CLI). An explicit piolium without an audit mode keeps audit off, so
+// the two harnesses never double-run.
+func (h *Handlers) resolveAutopilotAuditCfgServer(req AgentAutopilotRequest, sourcePath string) (*config.AuditAgentConfig, agent.HarnessSpec) {
+	auditMode := req.AuditDriverMode != "" || (req.Audit != "" && req.Audit != "off")
+	return agent.PickAuditHarness(req.Piolium, req.ResolvedAuditDriverMode(), req.ResolvedNoAudit() || !auditMode, sourcePath, h.settings.Agent.Audit)
+}
+
+// resolveSwarmAuditCfgServer is the swarm counterpart. Swarm audit is opt-in:
+// with `audit` and `piolium` both empty/"off" nothing runs, even when pi is
+// installed and a source path is set.
 func (h *Handlers) resolveSwarmAuditCfgServer(req AgentSwarmRequest, sourcePath string) (*config.AuditAgentConfig, agent.HarnessSpec) {
-	pioliumMode := req.Piolium
-	if pioliumMode == "" && req.Audit == "" && sourcePath != "" && h.pioliumAvailableCached() {
-		pioliumMode = "lite"
-	}
-	return agent.PickAuditHarness(pioliumMode, req.ResolvedAuditDriverMode(), req.ResolvedNoAudit(), sourcePath, h.settings.Agent.Audit)
+	return agent.PickAuditHarness(req.Piolium, req.ResolvedAuditDriverMode(), req.ResolvedNoAudit(), sourcePath, h.settings.Agent.Audit)
 }
 
 // buildAutopilotPipelineConfig creates an AutopilotPipelineConfig from an autopilot request.
@@ -310,6 +313,7 @@ func (h *Handlers) buildAutopilotPipelineConfig(req AgentAutopilotRequest, proje
 	}
 
 	cfg.BrowserEnabled = h.settings.Agent.Browser.IsEnabled()
+	cfg.BrowserBinaryPath = h.settings.Agent.Browser.BinaryPath
 	if req.Browser {
 		cfg.BrowserEnabled = true
 	}
@@ -338,8 +342,10 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 			defer byokCleanup()
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(h.runContext(), timeout)
 		defer cancel()
+		h.registerRunCancel(agenticScanUUID, cancel)
+		defer h.unregisterRunCancel(agenticScanUUID)
 
 		cfg := h.buildAutopilotPipelineConfig(req, projectUUID, agenticScanUUID)
 
@@ -363,16 +369,22 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 
 		// Set up stream writer pipe AND tee to runtime.log so the SSE
 		// client gets chunks live and disk-based consumers (logs / artifacts
-		// endpoints, agent_raw_output snapshot) see the same content.
+		// endpoints, agent_raw_output snapshot) see the same content. The log
+		// file is FIRST in the MultiWriter so the disk record is never gated on
+		// the SSE client — if the client disconnects, drainAgentPipeToSSE keeps
+		// reading pr so pw.Write never blocks and runtime.log keeps growing.
 		pr, pw := io.Pipe()
 		var streamWriter io.Writer = pw
 		var streamFile *os.File
 		if logFile := h.openSessionRuntimeLog(sessionDir, agenticScanUUID); logFile != nil {
 			streamFile = logFile
-			streamWriter = io.MultiWriter(pw, logFile)
+			streamWriter = io.MultiWriter(logFile, pw)
 			defer func() { _ = logFile.Close() }()
 		}
 		cfg.StreamWriter = streamWriter
+
+		// All SSE events for this run go through one sink (see sseSink).
+		sink := newSSESink(w)
 
 		type autopilotRunResult struct {
 			result *agent.AutopilotPipelineResult
@@ -387,21 +399,10 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 			done <- autopilotRunResult{result: result, err: runErr}
 		}()
 
-		// Stream chunks.
-		buf := make([]byte, 4096)
-		for {
-			n, readErr := pr.Read(buf)
-			if n > 0 {
-				if writeErr := writeSSE(w, sseEvent{Type: "chunk", Text: string(buf[:n])}); writeErr != nil {
-					_ = pr.Close()
-					<-done
-					return
-				}
-			}
-			if readErr != nil {
-				break
-			}
-		}
+		// Stream chunks. On client disconnect this keeps draining the pipe to
+		// EOF (so the agent never blocks and the finalization below still runs)
+		// rather than returning early.
+		clientConnected := drainAgentPipeToSSE(sink, pr, cancel)
 
 		res := <-done
 		now := time.Now()
@@ -409,21 +410,24 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 		status := h.agenticScanStatus[agenticScanUUID]
 
 		if res.err != nil {
+			runStatus := terminalStatusForRunErr(res.err)
 			if status != nil {
-				status.Status = "failed"
+				status.Status = runStatus
 				status.Error = res.err.Error()
 				status.CompletedAt = &now
 			}
 			h.agentMu.Unlock()
 
 			h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
-				run.Status = "failed"
+				run.Status = runStatus
 				run.ErrorMessage = res.err.Error()
 				run.CompletedAt = now
 				run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
 			})
 
-			_ = writeSSE(w, sseEvent{Type: "error", Error: res.err.Error()})
+			if clientConnected {
+				_ = sink.send(sseEvent{Type: "error", Error: res.err.Error()})
+			}
 			zap.L().Error("Autopilot run failed (streaming)",
 				zap.String("agentic_scan_uuid", agenticScanUUID),
 				zap.Error(res.err))
@@ -431,7 +435,7 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 		}
 
 		if status != nil && res.result != nil {
-			status.Status = "completed"
+			status.Status = database.CompletedAgenticScanStatus(res.result.Degraded)
 			status.CompletedAt = &now
 			status.FindingCount = res.result.FindingsCount
 			if res.result.VerifiedFindingCount > 0 {
@@ -448,7 +452,7 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 		// runBackgroundAutopilot.
 		rawOutput := snapshotAgentRawOutput(streamFile, sessionDir)
 		h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
-			run.Status = "completed"
+			run.Status = database.CompletedAgenticScanStatus(res.result != nil && res.result.Degraded)
 			run.CompletedAt = now
 			run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
 			if res.result != nil {
@@ -465,11 +469,17 @@ func (h *Handlers) handleAutopilotSSE(c fiber.Ctx, agenticScanUUID string, req A
 			}
 		})
 
-		_ = writeSSE(w, sseEvent{Type: "done", AutopilotResult: res.result})
+		if clientConnected {
+			_ = sink.send(sseEvent{Type: "done", AutopilotResult: res.result})
+		}
+		var auditFindings, verifiedFindings int
+		if res.result != nil {
+			auditFindings, verifiedFindings = res.result.FindingsCount, res.result.VerifiedFindingCount
+		}
 		zap.L().Info("Autopilot run completed (streaming)",
 			zap.String("agentic_scan_uuid", agenticScanUUID),
-			zap.Int("audit_findings", res.result.FindingsCount),
-			zap.Int("verified_findings", res.result.VerifiedFindingCount))
+			zap.Int("audit_findings", auditFindings),
+			zap.Int("verified_findings", verifiedFindings))
 	})
 }
 
@@ -480,8 +490,10 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 		defer byokCleanup()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(h.runContext(), timeout)
 	defer cancel()
+	h.registerRunCancel(agenticScanUUID, cancel)
+	defer h.unregisterRunCancel(agenticScanUUID)
 
 	cfg := h.buildAutopilotPipelineConfig(req, projectUUID, agenticScanUUID)
 
@@ -549,7 +561,7 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 		status.Error = runErr.Error()
 		status.CompletedAt = &now
 	} else {
-		status.Status = "completed"
+		status.Status = database.CompletedAgenticScanStatus(result != nil && result.Degraded)
 		status.CompletedAt = &now
 		if result != nil {
 			status.FindingCount = result.FindingsCount
@@ -590,7 +602,7 @@ func (h *Handlers) runBackgroundAutopilot(agenticScanUUID string, req AgentAutop
 	// Persist the completed state plus the artifacts the CLI would have shown
 	// live: a snapshot of runtime.log plus session dir summary fields.
 	h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
-		run.Status = "completed"
+		run.Status = database.CompletedAgenticScanStatus(result != nil && result.Degraded)
 		run.CompletedAt = now
 		run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
 		if result != nil {

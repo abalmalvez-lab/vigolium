@@ -15,10 +15,30 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
+// decoyRounds is how many same-directory/same-extension negative-control probes
+// the catch-all disproof issues per candidate. A host that answers every
+// /<dir>/<anything>.<ext> with the same 200 body (a reflecting/echo server, a
+// SPA fallback, a blanket rewrite) trips at least one round and the candidate is
+// dropped. Two rounds tolerate a single WAF/CDN flake without over-probing.
+const decoyRounds = 2
+
 type probe struct {
-	path        string
-	name        string
-	markers     []string
+	path string
+	name string
+	// markers is an AND-of-OR group set (see modkit.MatchAllGroups): the body must
+	// contain at least one substring from EVERY group. Composer JSON files share
+	// generic keys ("name","version") with almost any JSON payload, so each probe
+	// anchors on a Composer-specific key and corroborates with a second group.
+	markers [][]string
+	// htmlDoc marks a probe whose GENUINE hit is legitimately an HTML document (the
+	// /vendor/ directory listing). For every other probe the target is a JSON
+	// manifest, a raw PHP source file, or a plaintext LICENSE — none of which is
+	// ever served as an HTML *document* — so a text/html response is a catch-all /
+	// echo shell and is rejected outright by content-type (see probeFile). This
+	// content-type discipline is the decisive, zero-false-negative guard against the
+	// universal-catch-all FP even when a gzip/Content-Length-0 transport quirk leaves
+	// only a truncated body tail (the Content-Type header survives truncation).
+	htmlDoc     bool
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
@@ -27,17 +47,21 @@ type probe struct {
 var probes = []probe{
 	// Composer manifests
 	{
-		path:        "/composer.json",
-		name:        "Composer Manifest",
-		markers:     []string{`"require"`, `"name"`, `"autoload"`},
+		path: "/composer.json",
+		name: "Composer Manifest",
+		// "require"/"autoload"/"require-dev" are Composer-specific JSON keys; bare
+		// "name" matched any JSON object.
+		markers:     [][]string{{`"require"`, `"autoload"`, `"require-dev"`, `"minimum-stability"`}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Medium,
 		desc:        "Composer manifest exposed, revealing project dependencies and potentially private repository URLs",
 	},
 	{
-		path:        "/composer.lock",
-		name:        "Composer Lock File",
-		markers:     []string{`"packages"`, `"name"`, `"version"`, `"dist"`},
+		path: "/composer.lock",
+		name: "Composer Lock File",
+		// "_readme"/"content-hash" are unique to a composer.lock; require one of
+		// those plus a package-detail key so a generic JSON cannot match on "name".
+		markers:     [][]string{{`"_readme"`, `"content-hash"`, `"packages"`}, {`"dist"`, `"reference"`, `"source"`}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Medium,
 		desc:        "Composer lock file exposed, revealing exact dependency versions for CVE correlation",
@@ -46,30 +70,38 @@ var probes = []probe{
 	{
 		path:    "/vendor/",
 		name:    "Vendor Directory Listing",
-		markers: []string{"Index of", "Parent Directory", "autoload"},
+		markers: [][]string{{"Index of", "Parent Directory", "autoload"}},
+		// A directory listing is genuinely an HTML document, so the content-type
+		// gate must not reject it; the catch-all disproof (a random sibling under
+		// /vendor/ that also "lists") is what protects this probe instead.
+		htmlDoc: true,
 		sev:     severity.High,
 		desc:    "Composer vendor directory listing enabled, exposing all installed packages",
 	},
 	{
-		path:        "/vendor/autoload.php",
-		name:        "Vendor Autoload",
-		markers:     []string{"<?php", "autoload", "ComposerAutoloader", "getLoader"},
+		path: "/vendor/autoload.php",
+		name: "Vendor Autoload",
+		// ComposerAutoloader/getLoader are the disclosure; drop bare "<?php".
+		markers:     [][]string{{"ComposerAutoloader", "getLoader", "composerRequire", "autoload_real"}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.High,
 		desc:        "Composer autoload.php accessible, indicating vendor directory is web-reachable",
 	},
 	{
-		path:        "/vendor/composer/installed.json",
-		name:        "Composer Installed Metadata",
-		markers:     []string{`"packages"`, `"name"`, `"version"`},
+		path: "/vendor/composer/installed.json",
+		name: "Composer Installed Metadata",
+		// "dev-package-names" is unique to a Composer v2 installed.json; require a
+		// packages anchor plus a package-detail key.
+		markers:     [][]string{{`"dev-package-names"`, `"packages"`}, {`"version_normalized"`, `"install-path"`, `"dist"`}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Medium,
 		desc:        "Composer installed.json exposed, listing all packages with exact versions",
 	},
 	{
-		path:        "/vendor/composer/installed.php",
-		name:        "Composer Installed PHP",
-		markers:     []string{"<?php", "installed", "versions"},
+		path: "/vendor/composer/installed.php",
+		name: "Composer Installed PHP",
+		// The disclosure is the raw PHP returning Composer's metadata array.
+		markers:     [][]string{{"<?php"}, {"'pretty_version'", "'install_path'", "'reference'", "InstalledVersions"}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Medium,
 		desc:        "Composer installed.php exposed, listing all installed package versions",
@@ -77,7 +109,7 @@ var probes = []probe{
 	{
 		path:        "/vendor/composer/autoload_classmap.php",
 		name:        "Composer Classmap",
-		markers:     []string{"<?php", "return array", "vendor"},
+		markers:     [][]string{{"<?php"}, {"$vendorDir", "$baseDir", "return array"}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Medium,
 		desc:        "Composer autoload classmap exposed, revealing internal class structure and file paths",
@@ -86,7 +118,7 @@ var probes = []probe{
 	{
 		path:        "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
 		name:        "PHPUnit eval-stdin.php",
-		markers:     []string{"<?php", "eval", "php://stdin", "php://input"},
+		markers:     [][]string{{"php://stdin", "php://input", "eval-stdin"}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Critical,
 		desc:        "PHPUnit eval-stdin.php exposed, potentially allowing remote code execution (CVE-2017-9841)",
@@ -95,7 +127,7 @@ var probes = []probe{
 	{
 		path:        "/vendor/composer/LICENSE",
 		name:        "Composer License",
-		markers:     []string{"MIT License", "Composer", "Nils Adermann", "Jordi Boggiano"},
+		markers:     [][]string{{"Nils Adermann", "Jordi Boggiano"}, {"MIT License", "Composer"}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Low,
 		desc:        "Composer LICENSE file accessible, confirming vendor directory is web-reachable",
@@ -158,11 +190,8 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -194,11 +223,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -240,11 +267,9 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -272,6 +297,19 @@ func (m *Module) probeFile(
 		}
 	}
 
+	// Content-type discipline (survives body truncation — the header is intact even
+	// when a gzip/Content-Length-0 quirk leaves only a partial body tail): every
+	// probe except the /vendor/ directory listing targets a JSON manifest, a raw PHP
+	// source file, or a plaintext LICENSE, none of which is EVER served as an HTML
+	// *document*. A universal catch-all / reflecting host answers arbitrary paths
+	// with its themed text/html shell, and a weak marker (`"require"`, `<?php`,
+	// "autoload") that survives in that shell's truncated tail would otherwise forge
+	// a match. Rejecting text/html is the decisive, zero-false-negative guard for
+	// that class — a real Composer artifact simply never comes back as a document.
+	if !p.htmlDoc && modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
+		return nil
+	}
+
 	body := resp.Body().String()
 
 	// Check against 404 fingerprint
@@ -288,6 +326,12 @@ func (m *Module) probeFile(
 		}
 	}
 
+	// Catch-all / SPA shell guard: a themed app that returns the same shell for
+	// any path is a false positive even when a weak marker appears in that shell.
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	// Check anti-markers
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
@@ -300,15 +344,36 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
+	// Strip the reflected request from the body before marker matching: a host that
+	// echoes the requested path or the request body back into its response would
+	// otherwise let an echoed value satisfy a marker (the path /vendor/autoload.php
+	// echoing "autoload", or a request body carrying `"require"`). The original body
+	// is kept for anti-markers and stored evidence.
+	matchBody := modkit.StripReflectedProbePath(body, p.path)
+	if reqBody := ctx.Request().BodyToString(); reqBody != "" {
+		matchBody = modkit.StripReflected(matchBody, reqBody)
 	}
-	if !matched {
+
+	// Require every marker group (Composer-specific anchor + corroboration), so a
+	// generic JSON body sharing a key like "name"/"version" cannot match.
+	matchedMarkers, ok := modkit.MatchAllGroups(matchBody, p.markers)
+	if !ok {
+		return nil
+	}
+
+	// Multi-round catch-all disproof: probe several guaranteed-nonexistent siblings
+	// sharing this probe's directory AND extension (e.g. /vigolium-decoy-*.json for
+	// /composer.json, /vendor/vigolium-decoy-* for /vendor/). If a random same-shape
+	// path returns the same status and also satisfies the marker groups, the host
+	// serves this content for any path (a reflecting/echo server, a SPA fallback, an
+	// extension-scoped catch-all) and the match proves nothing. A genuinely exposed
+	// artifact has no such sibling (the decoy 404s), so this costs no true positives,
+	// and it is robust to the body-truncation quirk because the decoy is run through
+	// the same predicate rather than a body-similarity compare.
+	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+		_, sibOK := modkit.MatchAllGroups(b, p.markers)
+		return sibOK
+	}) {
 		return nil
 	}
 

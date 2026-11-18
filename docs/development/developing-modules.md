@@ -63,7 +63,7 @@ The executor calls the entry point that matches your declared `ScanScopes()`:
 |-------|---------------|
 | `ScanScopeInsertionPoint` | once per parameter/header/cookie/body insertion point |
 | `ScanScopeRequest` | once per unique request |
-| `ScanScopeHost` | once per unique host |
+| `ScanScopeHost` | once per eligible module and canonical `scheme://host:port` origin claim |
 
 > **Thread-safety:** scan methods are called concurrently from many worker
 > goroutines. Keep module state immutable after construction, or guard it.
@@ -86,6 +86,14 @@ modkit.NewBasePassiveModule(id, name, description, shortDesc, confirmation,
 `NewBaseActiveModule` / `NewBasePassiveModule` validate the ID (lowercase,
 kebab-case) at construction and panic on a bad ID — so registration fails fast
 during `init()` rather than silently.
+
+Reuse the shared small helpers instead of a private copy (a contract test,
+`pkg/modules/helper_dup_contract_test.go`, rejects new `func truncate(` /
+`randomString(` / `isBlockedResponse(` / `isBlockedOrThrottled(` declarations):
+`modkit.Truncate` / `TruncateWith` / `TruncateNoEllipsis` / `TruncateRunes`
+(UTF-8 safe), `modkit.RandomAlnum(n)` for markers and canaries, and
+`infra.IsBlockedResponse` / `infra.IsBlockedOrThrottled` to skip WAF, challenge
+and rate-limit pages before matching a body.
 
 ## A complete example
 
@@ -167,6 +175,22 @@ Key conventions visible in the example:
 - **Treat `hosterrors.ErrUnresponsiveHost` as "stop probing this host"**, not a
   scan error.
 
+## Preserve signals without overstating vulnerabilities
+
+Modules should keep useful security patterns visible while assigning the result kind that the evidence supports:
+
+| Evidence | `RecordKind` | `EvidenceGrade` | Typical proof |
+|---|---|---|---|
+| Primitive exists | `observation` | `E0` | Header, sink, console, schema, public identifier, or configuration marker |
+| Hypothesis supported | `candidate` | `E1` | Corroborated static context or a credential-shaped value |
+| Controlled differential | `candidate` | `E2` | Baseline and negative controls isolate attacker influence |
+| Bypass behavior | `candidate` unless impact is direct | `E3` | Authorization or validation behavior changes under a controlled probe |
+| Demonstrated impact | `finding` | `E4` | Unauthorized read/write, execution, durable state, OAST, or cross-user replay |
+
+The zero value remains a finding for backward compatibility. New heuristic modules should set `RecordKind` and `EvidenceGrade` explicitly. Status codes, generic strings, feature presence, or client-side code alone should not become findings. Active confirmation should use fresh canaries, clean and malformed controls, cache bypass, isolated credential-free clients, and repeated replay as appropriate.
+
+Candidates and observations are persisted and queryable, but the executor excludes them from confirmed-finding totals, notifications, finding caps, and cross-module confirmed-result suppression. This lets a stronger module continue toward impact proof without discarding reconnaissance.
+
 ## Register the module
 
 Add one line to the relevant registry wiring file:
@@ -193,11 +217,40 @@ picks it up automatically. None of them break the base interface.
 |-----------|---------|
 | `ContextualActiveModule` / `ContextualPassiveModule` | Receive a `context.Context` so HTTP calls cancel on phase deadline / scan shutdown |
 | `Prioritized` | `Priority() int` — lower runs first (default 100); high-priority modules get earlier rate-limit slots |
-| `VulnClassifier` | `VulnClass() string` — enables cross-module dedup (e.g. don't re-test XSS another module already confirmed) |
+| `VulnClassifier` | `VulnClass() string` — return a `modkit.VulnClass*` constant to join cross-module dedup: once any module of the class reports a parameter, the others skip it at that location (see below) |
+| `ClassPrioritized` | `ClassPriority() int` — order within a vuln class (`modkit.ClassCostInBand` < `Boolean` < `Timing` < `Browser` < `OAST`; default: tier rank × 10) so cheap in-band modules claim a parameter first |
+| `BodyDifferentialConfirmable` | Opt an active module into the executor's replay-and-baseline differential safety net; only for non-state-changing in-band body/header signals |
 | `TechAware` | `RequiredTechs() []string` — allowlist; module only runs when the host's fingerprint matches (fails open if no tech detected yet) |
+| `PerScanModule` | `Fresh() any` — return isolated mutable state for each scan when registry-singleton state cannot live in `ScanContext` |
+| `ContentClassAware` | `RequiredContentClasses() []string` — gate passive analyzers to structurally compatible HTML/JSON/XML/text/binary responses |
 | `TimeoutHinter` | `TimeoutHint() time.Duration` — raise the per-module timeout for legitimately slow analysis (e.g. timing-based DiffScan) |
 | `Flusher` / `BatchFlusher` | End-of-scan finalization; `BatchFlusher` returns deferred findings through the normal pipeline |
 | `ScopeAwareModule` | `ScopeAware() bool` — passive modules that should skip out-of-scope records |
+
+### Cross-module parameter dedup
+
+The executor keeps one finding per (location, parameter, vuln class). Location is
+`modkit.ParamFindingKey(item)` (`scheme://host/path`, host lowercased, query
+dropped); never build the key by hand. Per-insertion-point modules with a
+`VulnClass()` are skipped at dispatch and again when their queued task starts.
+Request-scope modules loop over insertion points themselves, so they must check
+in that loop:
+
+```go
+for _, ip := range points {
+    if scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
+        continue
+    }
+    // ... probe ip
+}
+```
+
+The executor marks every emitted finding that sets `FuzzingParameter`. Call
+`scanCtx.MarkParamFound(ctx, ip.Name(), class)` only when the finding's URL is
+not the scanned item's (for example a stored-XSS render page). Keep
+tech-specific probes (log4shell, struts OGNL, PDF generators) unclassified.
+`--no-param-dedup` turns the skip off for audit runs. The registry contract test
+in `pkg/modules/vulnclass_test.go` pins each injection module's class.
 
 ## Test the module without Docker
 
@@ -228,6 +281,13 @@ Helpers: `modtest.Requester(t)`, `modtest.Request(t, url)`,
 `modtest.RequestMethod(t, method, url, body)`, `modtest.Response(rr, ct, body)`
 (attach a synthetic baseline), and `modtest.InsertionPoint(t, rr, name)`.
 
+Passive modules read an already-captured exchange, so their tests need no
+server: `modtest.HTTPCtx(path, contentType, body)` (GET answered by a 200 with
+that Content-Type), `modtest.HTTPCtxMethod(method, path, contentType, body)`,
+`modtest.HTTPCtxHeaders(path, rawHeaders, body)` and
+`modtest.RawCtx(rawReq, rawResp)` build one against `https://example.com`.
+Use them instead of a private `makeHTTPCtx`.
+
 Run it:
 
 ```bash
@@ -243,6 +303,8 @@ go test -run TestCacheDeception ./pkg/modules/active/cache_deception/...
 - [ ] Close every HTTP response; bail out early on irrelevant inputs.
 - [ ] Register in `default_registry_active.go` / `default_registry_passive.go`.
 - [ ] Paired positive/negative `modtest` unit tests.
+- [ ] Heuristic results explicitly declare observation/candidate/finding kind and evidence grade.
+- [ ] Negative tests cover generic strings, status-only responses, reflection, wildcards, and normal public behavior relevant to the oracle.
 - [ ] `make fmt && make lint && make test-unit` is green.
 
 See also: [project-structure.md](project-structure.md) for where things live and

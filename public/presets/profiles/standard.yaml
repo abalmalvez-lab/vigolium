@@ -19,6 +19,13 @@ discovery:
   scope_mode: subdomain
   save_response_body: true
   enable_malformed_path_probe: false
+  # Fuzz each ancestor directory of the seed URL (e.g. /api/v1/auth/x ->
+  # /, /api/, /api/v1/, /api/v1/auth/) with the short file+dir lists and observed
+  # words. Long lists / FUZZ brute stay off at balanced intensity.
+  expand_seed_parents: true
+  # Keep scope to the seed's own path structure + live crawl breadcrumbs; do not
+  # re-seed discovery from paths prior phases wrote to the DB.
+  enrich_targets: false
   recursion:
     enabled: true
     max_depth: 5
@@ -39,11 +46,14 @@ discovery:
     max_consecutive_errors: 20
     max_consecutive_waf_blocks: 10
     observed_max_items: 4000
-    disable_kingfisher: true
+    disable_secret_scan: true
 
 spidering:
   max_depth: 0
-  max_states: 0
+  # Safety cap on distinct crawl states. Volatile content (clocks, nonces,
+  # cache-busters) is normalized out of state identity, so a real app rarely
+  # approaches this; it only bounds pathological state explosion. 0 = unlimited.
+  max_states: 2000
   max_duration: 30m
   max_consecutive_fails: 100
   headless: true

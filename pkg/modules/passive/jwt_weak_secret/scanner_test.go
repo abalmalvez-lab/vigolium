@@ -15,6 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/modules/modtest"
+	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
@@ -29,37 +31,27 @@ func signHS256(headerJSON, payload string, secret []byte) string {
 	return signingInput + "." + sig
 }
 
-// makeHTTPCtx builds a test HttpRequestResponse from raw request/response strings.
-func makeHTTPCtx(rawReq, rawResp string) *httpmsg.HttpRequestResponse {
-	req := httpmsg.NewHttpRequestWithService(
-		httpmsg.NewServiceSecure("example.com", 443, true),
-		[]byte(rawReq),
-	)
-	resp := httpmsg.NewHttpResponse([]byte(rawResp))
-	return httpmsg.NewHttpRequestResponse(req, resp)
-}
-
 const defaultReq = "GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n"
 const defaultResp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}"
 
 func makeHTTPCtxWithAuth(token string) *httpmsg.HttpRequestResponse {
 	rawReq := fmt.Sprintf("GET /api HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer %s\r\n\r\n", token)
-	return makeHTTPCtx(rawReq, defaultResp)
+	return modtest.RawCtx(rawReq, defaultResp)
 }
 
 func makeHTTPCtxWithResponseHeader(headerName, headerValue string) *httpmsg.HttpRequestResponse {
 	rawResp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%s: %s\r\n\r\n{}", headerName, headerValue)
-	return makeHTTPCtx(defaultReq, rawResp)
+	return modtest.RawCtx(defaultReq, rawResp)
 }
 
 func makeHTTPCtxWithResponseBody(body string) *httpmsg.HttpRequestResponse {
 	rawResp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s", body)
-	return makeHTTPCtx(defaultReq, rawResp)
+	return modtest.RawCtx(defaultReq, rawResp)
 }
 
 func makeHTTPCtxWithSetCookie(cookieName, cookieValue string) *httpmsg.HttpRequestResponse {
 	rawResp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: %s=%s; Path=/\r\n\r\n{}", cookieName, cookieValue)
-	return makeHTTPCtx(defaultReq, rawResp)
+	return modtest.RawCtx(defaultReq, rawResp)
 }
 
 // --- tryBruteForce unit tests ---
@@ -163,7 +155,7 @@ func TestFindJWTs_DeduplicatesAcrossLocations(t *testing.T) {
 	token := signHS256(`{"typ":"JWT","alg":"HS256"}`, `{"sub":"1"}`, []byte("secret"))
 	rawReq := fmt.Sprintf("GET /api HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer %s\r\n\r\n", token)
 	rawResp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"token\":\"%s\"}", token)
-	ctx := makeHTTPCtx(rawReq, rawResp)
+	ctx := modtest.RawCtx(rawReq, rawResp)
 
 	// findJWTs should return exactly one token despite appearing in two locations
 	tokens := findJWTs(ctx)
@@ -193,6 +185,8 @@ func TestScanPerRequest_RS256AlgConfusion(t *testing.T) {
 	assert.Contains(t, results[0].ExtractedResults[0], "RS256")
 	assert.Contains(t, results[0].ExtractedResults[0], "alg-confusion")
 	assert.Contains(t, results[0].Info.Description, "RS256")
+	assert.Equal(t, output.RecordKindCandidate, results[0].RecordKind)
+	assert.Equal(t, output.EvidenceGradeCandidate, results[0].EvidenceGrade)
 }
 
 func TestScanPerRequest_HS256WeakSecret(t *testing.T) {
@@ -207,6 +201,11 @@ func TestScanPerRequest_HS256WeakSecret(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.Contains(t, results[0].ExtractedResults[0], "HS256")
 	assert.NotContains(t, results[0].ExtractedResults[0], "alg-confusion")
+	assert.Equal(t, output.RecordKindCandidate, results[0].RecordKind)
+	for _, evidence := range results[0].ExtractedResults {
+		assert.NotContains(t, evidence, token)
+		assert.NotEqual(t, "Weak secret: secret", evidence)
+	}
 }
 
 func TestScanPerRequest_JWTInResponseBody(t *testing.T) {
@@ -221,6 +220,7 @@ func TestScanPerRequest_JWTInResponseBody(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Contains(t, results[0].ExtractedResults[0], "HS256")
+	assert.Equal(t, output.RecordKindCandidate, results[0].RecordKind)
 }
 
 func TestScanPerRequest_JWTInResponseSetCookie(t *testing.T) {
@@ -234,6 +234,8 @@ func TestScanPerRequest_JWTInResponseSetCookie(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Contains(t, results[0].ExtractedResults[0], "HS256")
+	assert.Equal(t, output.RecordKindFinding, results[0].RecordKind)
+	assert.Equal(t, output.EvidenceGradeImpact, results[0].EvidenceGrade)
 }
 
 func TestScanPerRequest_NoJWT(t *testing.T) {
@@ -244,6 +246,59 @@ func TestScanPerRequest_NoJWT(t *testing.T) {
 	results, err := m.ScanPerRequest(ctx, scanCtx)
 	require.NoError(t, err)
 	assert.Empty(t, results)
+}
+
+// makeRSAMetaToken builds an RS256 token with a Cloudflare-Access pre-auth meta
+// payload and a non-HMAC signature, so it can't be brute-forced and would
+// otherwise emit the asymmetric "algorithm confusion" informational finding.
+func makeRSAMetaToken(payload string) string {
+	h := base64.RawURLEncoding.EncodeToString([]byte(`{"typ":"JWT","alg":"RS256"}`))
+	p := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	signingInput := h + "." + p
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		panic(err)
+	}
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(key.N.Bytes())
+}
+
+func TestFindJWTs_SkipsCloudflareAccessMetaToken(t *testing.T) {
+	// type=meta and auth_status=NONE are the Cloudflare Access pre-auth shape.
+	for _, payload := range []string{
+		`{"type":"meta","aud":"app","exp":1781357251}`,
+		`{"auth_status":"NONE","aud":"app","exp":1781357251}`,
+	} {
+		token := makeRSAMetaToken(payload)
+		ctx := makeHTTPCtxWithResponseBody(fmt.Sprintf(`{"meta":"%s"}`, token))
+		assert.Empty(t, findJWTs(ctx), "pre-auth meta token must be skipped: %s", payload)
+	}
+}
+
+func TestScanPerRequest_SkipsCloudflareAccessMetaToken(t *testing.T) {
+	m := New()
+	token := makeRSAMetaToken(`{"type":"meta","auth_status":"NONE","aud":"app","exp":1781357251}`)
+	// Reflected into the login-page body, exactly as on a Cloudflare Access SSO page.
+	ctx := makeHTTPCtxWithResponseBody(fmt.Sprintf(`<form action="/cdn-cgi/access/login?meta=%s">`, token))
+	scanCtx := &modkit.ScanContext{}
+
+	results, err := m.ScanPerRequest(ctx, scanCtx)
+	require.NoError(t, err)
+	assert.Empty(t, results, "pre-auth meta token must not produce an algorithm-confusion finding")
+}
+
+func TestScanPerRequest_AsymmetricNonMetaTokenStillFlagged(t *testing.T) {
+	// A normal asymmetric application token (real identity, no meta marker) must
+	// still produce the informational algorithm-confusion finding — the skip is
+	// scoped to pre-auth meta tokens only.
+	m := New()
+	token := makeRSAMetaToken(`{"sub":"1234567890","role":"user"}`)
+	ctx := makeHTTPCtxWithAuth(token)
+	scanCtx := &modkit.ScanContext{}
+
+	results, err := m.ScanPerRequest(ctx, scanCtx)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Contains(t, results[0].Info.Name, "Algorithm Confusion")
 }
 
 // signHMAC creates a JWT signed with an arbitrary HMAC hash function.
@@ -325,10 +380,12 @@ func TestScanPerRequest_PlaintextSignature(t *testing.T) {
 
 	assert.Equal(t, severity.High, results[0].Info.Severity)
 	assert.Equal(t, severity.Firm, results[0].Info.Confidence)
+	assert.Equal(t, output.RecordKindCandidate, results[0].RecordKind)
 	assert.Contains(t, results[0].Info.Name, "Non-Cryptographic Signature")
-	assert.Contains(t, results[0].Info.Description, "plaintext ASCII")
+	assert.Contains(t, results[0].Info.Description, "printable text")
 	assert.Contains(t, results[0].ExtractedResults[0], "HS256")
-	assert.Contains(t, results[0].ExtractedResults[1], "Plaintext signature")
+	assert.Contains(t, results[0].ExtractedResults[1], "Printable signature length")
+	assert.NotContains(t, results[0].ExtractedResults[1], "signature_generated_with_secret123")
 }
 
 func TestScanPerRequest_PlaintextSignature_NotEmittedWhenSecretFound(t *testing.T) {
@@ -360,9 +417,11 @@ func TestScanPerRequest_AsymmetricJWT_InformationalFinding(t *testing.T) {
 	// Should be low severity, tentative confidence
 	assert.Equal(t, severity.Low, results[0].Info.Severity)
 	assert.Equal(t, severity.Tentative, results[0].Info.Confidence)
+	assert.Equal(t, output.RecordKindObservation, results[0].RecordKind)
+	assert.Equal(t, output.EvidenceGradeObservation, results[0].EvidenceGrade)
 	assert.Contains(t, results[0].Info.Name, "Algorithm Confusion")
 	assert.Contains(t, results[0].Info.Description, "RS256")
-	assert.Contains(t, results[0].Info.Description, "CVE-2015-9235")
+	assert.Contains(t, results[0].Info.Description, "not tested")
 	assert.Contains(t, results[0].ExtractedResults[0], "RS256")
 }
 

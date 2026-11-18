@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -92,14 +93,23 @@ type scanSeverityCounts struct {
 	Suspect  int64
 }
 
-// aggregateScanFindings queries finding severity counts for a scan.
+// aggregateScanFindings queries finding severity counts for a scan. A failed
+// query reads as zero counts; callers that must tell the two apart use
+// queryScanFindings.
 func (r *Repository) aggregateScanFindings(ctx context.Context, scanUUID string) scanSeverityCounts {
+	sc, _ := r.queryScanFindings(ctx, scanUUID)
+	return sc
+}
+
+// queryScanFindings is aggregateScanFindings with the query error reported.
+func (r *Repository) queryScanFindings(ctx context.Context, scanUUID string) (scanSeverityCounts, error) {
 	var rows []SeverityCount
-	_ = r.db.NewSelect().
+	err := r.db.NewSelect().
 		TableExpr("findings").
 		ColumnExpr("severity").
 		ColumnExpr("COUNT(*) AS count").
-		Where("scan_uuid = ?", scanUUID).
+		Where("(scan_uuid = ? OR EXISTS (SELECT 1 FROM finding_observations o WHERE o.finding_id = findings.id AND o.scan_uuid = ?))", scanUUID, scanUUID).
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
 		GroupExpr("severity").
 		Scan(ctx, &rows)
 
@@ -121,30 +131,106 @@ func (r *Repository) aggregateScanFindings(ctx context.Context, scanUUID string)
 			sc.Suspect = row.Count
 		}
 	}
-	return sc
+	return sc, err
+}
+
+// ScanSeverityTally returns a scan's persisted finding counts keyed by severity
+// name, omitting severities with no findings. It reads the same rows the scan
+// row's own counters are computed from, so a consumer reading the machine event
+// stream's scan.finished and a consumer querying the database afterwards agree.
+func (r *Repository) ScanSeverityTally(ctx context.Context, scanUUID string) map[string]int {
+	return severityTally(r.aggregateScanFindings(ctx, scanUUID))
+}
+
+// ScanFindingTotal returns how many findings a scan persisted, with the same
+// per-severity breakdown ScanSeverityTally gives, read from the findings table
+// rather than the scan row.
+//
+// It is the ONE count every end-of-scan summary prints. The runner's "Scan
+// finished … findings: N" banner and the CLI's "N issues found" line used to
+// read two different things — the scan row's total_findings (stale until the
+// row is finalized) and a project-wide count over the in-scope hosts — and
+// disagreed on the same run. Both now call this, so they cannot.
+//
+// Reading the table rather than the row also means a scan whose terminal
+// CompleteScanWithOutcome write failed still reports its true count. The error
+// is the query's: a caller should print no count rather than a wrong zero.
+func (r *Repository) ScanFindingTotal(ctx context.Context, scanUUID string) (int, map[string]int, error) {
+	sc, err := r.queryScanFindings(ctx, scanUUID)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int(sc.Total), severityTally(sc), nil
+}
+
+// severityTally renders counts as a severity-name map, omitting zeros.
+func severityTally(sc scanSeverityCounts) map[string]int {
+	out := map[string]int{}
+	for name, n := range map[string]int64{
+		"critical": sc.Critical,
+		"high":     sc.High,
+		"medium":   sc.Medium,
+		"low":      sc.Low,
+		"suspect":  sc.Suspect,
+		"info":     sc.Info,
+	} {
+		if n > 0 {
+			out[name] = int(n)
+		}
+	}
+	return out
+}
+
+// CountRecordsForScan returns how many HTTP records this scan persisted.
+func (r *Repository) CountRecordsForScan(ctx context.Context, projectUUID, scanUUID string) (int64, error) {
+	q := r.db.NewSelect().TableExpr("http_records").Where("scan_uuid = ?", scanUUID)
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	n, err := q.Count(ctx)
+	return int64(n), err
 }
 
 // applySeverityCounts sets severity count fields on an UPDATE query builder.
 func applySeverityCounts(q *bun.UpdateQuery, sc scanSeverityCounts) *bun.UpdateQuery {
-	q = q.Set("critical_count = ?", sc.Critical).
+	// total_findings is set unconditionally alongside the severity counts: a
+	// recompute yielding zero (all findings deleted/reclassified) must be able to
+	// reset it to 0, otherwise the row keeps a stale non-zero total while every
+	// severity count reads 0 — an internally inconsistent scan record.
+	return q.Set("critical_count = ?", sc.Critical).
 		Set("high_count = ?", sc.High).
 		Set("medium_count = ?", sc.Medium).
 		Set("low_count = ?", sc.Low).
 		Set("info_count = ?", sc.Info).
-		Set("suspect_count = ?", sc.Suspect)
-	if sc.Total > 0 {
-		q = q.Set("total_findings = ?", sc.Total)
-	}
-	return q
+		Set("suspect_count = ?", sc.Suspect).
+		Set("total_findings = ?", sc.Total)
 }
 
-// CompleteScan marks a scan as completed (or failed if errMsg is non-empty)
-// and populates severity counts from the findings table.
+// CompleteScan marks a scan as completed (or failed if errMsg is non-empty) and
+// populates severity counts from the findings table.
+//
+// Leaves the completeness columns untouched, so a caller with no phase-outcome
+// data (the server's own finalization paths, an agent rescan) records "unknown"
+// rather than asserting a coverage verdict it cannot know. The runner, which
+// does see every phase, calls CompleteScanWithOutcome instead.
 func (r *Repository) CompleteScan(ctx context.Context, scanUUID string, errMsg string) error {
-	status := "completed"
-	if errMsg != "" {
-		status = "failed"
-	}
+	return r.CompleteScanWithOutcome(ctx, scanUUID, errMsg, ScanCompletion{})
+}
+
+// CompleteScanWithOutcome is CompleteScan plus the scan's coverage verdict: how
+// complete the run was, the single reason it stopped short, and the per-phase
+// outcomes behind that verdict.
+//
+// The status vocabulary is deliberately unchanged — "completed" still means the
+// scan reached its end, and existing consumers keep working. Completeness is a
+// SECOND axis alongside it, because the two are independent facts: a run can
+// reach its end having covered half its input, and conflating that into a new
+// status value would break every caller that switches on the four it knows.
+//
+// A zero ScanCompletion writes nothing to the three columns, which is how a
+// caller says "I don't know" without overwriting a verdict with a guess.
+func (r *Repository) CompleteScanWithOutcome(ctx context.Context, scanUUID string, errMsg string, c ScanCompletion) error {
+	status := ScanTerminalStatus(errMsg)
 
 	// Compute duration from started_at so the scan row doesn't report 0ms after
 	// it finishes. We read started_at first rather than using SQL arithmetic to
@@ -173,9 +259,56 @@ func (r *Repository) CompleteScan(ctx context.Context, scanUUID string, errMsg s
 		Set("updated_at = CURRENT_TIMESTAMP").
 		Where("uuid = ?", scanUUID)
 	q = applySeverityCounts(q, sc)
+	q = applyScanCompletionColumns(q, c)
 
 	_, err := q.Exec(ctx)
 	return err
+}
+
+// ScanCancelledMessage is the error_message a run cancelled by its caller
+// (Ctrl-C, SIGTERM, a stop request) is finalized with.
+const ScanCancelledMessage = "cancelled"
+
+// ScanTerminalStatus is the stored status for a scan finalized with errMsg:
+// "completed" without one, "cancelled" for the cancellation marker, "failed"
+// otherwise. error_message still carries "cancelled" on a cancelled row, so a
+// reader that predates the status (it used to be stored "failed") keeps
+// telling the two apart.
+func ScanTerminalStatus(errMsg string) string {
+	switch errMsg {
+	case "":
+		return "completed"
+	case ScanCancelledMessage:
+		return "cancelled"
+	}
+	return "failed"
+}
+
+// applyScanCompletionColumns adds the completeness columns to an UPDATE, and
+// adds nothing at all for a zero completion.
+//
+// Written as JSON text rather than through the model's jsonb tag because this is
+// a column-level UPDATE, not a model save — bun only applies the type mapping
+// when it owns the struct field. The outcomes are serialised here so the column
+// holds the same shape the REST scan object and `--format jsonl` carry.
+func applyScanCompletionColumns(q *bun.UpdateQuery, c ScanCompletion) *bun.UpdateQuery {
+	if c.Completeness == "" && c.StopReason == "" && len(c.Phases) == 0 {
+		return q
+	}
+	q = q.Set("completeness = ?", c.Completeness).
+		Set("stop_reason = ?", c.StopReason)
+	if len(c.Phases) == 0 {
+		return q.Set("phase_outcomes = ?", nil)
+	}
+	encoded, err := json.Marshal(c.Phases)
+	if err != nil {
+		// A PhaseOutcome is plain strings and ints, so this cannot fail in
+		// practice; if it somehow does, the verdict is still worth more than the
+		// detail behind it, so record the verdict and drop the detail.
+		zap.L().Warn("failed to encode scan phase outcomes", zap.Error(err))
+		return q.Set("phase_outcomes = ?", nil)
+	}
+	return q.Set("phase_outcomes = ?", string(encoded))
 }
 
 // RefreshScanStats updates running scan stats during long-running scans
@@ -194,14 +327,27 @@ func (r *Repository) RefreshScanStats(ctx context.Context, scanUUID string) erro
 
 // ListScans returns scans ordered by created_at descending with limit/offset, filtered by project.
 func (r *Repository) ListScans(ctx context.Context, projectUUID string, limit, offset int) ([]*Scan, int64, error) {
+	return r.ListScansStartedBetween(ctx, projectUUID, nil, nil, limit, offset)
+}
+
+// ListScansStartedBetween is ListScans restricted to scans whose started_at
+// falls within [from, to]; a nil bound is open. The bounds apply before the
+// limit, so an older window is not hidden behind the newest page.
+func (r *Repository) ListScansStartedBetween(ctx context.Context, projectUUID string, from, to *time.Time, limit, offset int) ([]*Scan, int64, error) {
 	var scans []*Scan
 	q := r.db.NewSelect().
 		Model(&scans).
 		OrderExpr("created_at DESC").
-		Limit(limit).
-		Offset(offset)
+		Limit(int64(limit)).
+		Offset(int64(offset))
 	if projectUUID != "" {
 		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	if from != nil {
+		q = q.Where("started_at >= ?", *from)
+	}
+	if to != nil {
+		q = q.Where("started_at <= ?", *to)
 	}
 	count, err := q.ScanAndCount(ctx)
 	if err != nil {
@@ -211,45 +357,49 @@ func (r *Repository) ListScans(ctx context.Context, projectUUID string, limit, o
 }
 
 // LoadEnabledScopes loads enabled scope rules for a project, ordered by priority.
-// Falls back to the default project's scopes if no project-specific scopes exist.
+// An empty projectUUID means the default project — never "all projects". Falls
+// back to the default project's scopes when a non-default project has none, but
+// if the default project itself has no enabled scopes it returns empty rather
+// than an unscoped query that would leak every project's rules across engagements.
 func (r *Repository) LoadEnabledScopes(ctx context.Context, projectUUID string) ([]*Scope, error) {
+	projectUUID = defaultProjectUUID(projectUUID)
+
 	var scopes []*Scope
-
-	if projectUUID != "" {
-		err := r.db.NewSelect().
-			Model(&scopes).
-			Where("project_uuid = ?", projectUUID).
-			Where("enabled = ?", true).
-			Order("priority ASC").
-			Scan(ctx)
-		if err != nil {
-			zap.L().Debug("Failed to load project scopes", zap.Error(err))
-			return nil, err
-		}
-		if len(scopes) > 0 {
-			return scopes, nil
-		}
-		// Fall back to default project scopes
-		if projectUUID != DefaultProjectUUID {
-			return r.LoadEnabledScopes(ctx, DefaultProjectUUID)
-		}
-	}
-
-	// No project filter or default project — load all enabled scopes
 	err := r.db.NewSelect().
 		Model(&scopes).
+		Where("project_uuid = ?", projectUUID).
 		Where("enabled = ?", true).
 		Order("priority ASC").
 		Scan(ctx)
 	if err != nil {
-		zap.L().Debug("Failed to load scopes", zap.Error(err))
+		zap.L().Debug("Failed to load project scopes", zap.Error(err))
 		return nil, err
 	}
+	if len(scopes) > 0 {
+		return scopes, nil
+	}
+
+	// A non-default project with no scopes inherits the default project's scopes.
+	if projectUUID != DefaultProjectUUID {
+		return r.LoadEnabledScopes(ctx, DefaultProjectUUID)
+	}
+
+	// Default project has no enabled scopes — return empty, not every project's.
 	return scopes, nil
 }
 
+// ScanSourceScanOnReceive is scans.scan_source for a server's scan-on-receive
+// runner row.
+const ScanSourceScanOnReceive = "scan-on-receive"
+
 // CreateScanWithCursor creates a Scan record. If mode is "incremental", copies cursor
 // from the last completed scan with matching Modules. Otherwise starts at zero.
+//
+// A scan-on-receive row inherits from the newest earlier scan-on-receive row
+// of its project and modules whatever that row's status: the cursor only
+// advances past records the run processed, so a server stopped with SIGTERM
+// (cancelled) or one that crashed (abandoned) still marks durable progress,
+// and restarting from zero rescanned everything it had already done.
 func (r *Repository) CreateScanWithCursor(ctx context.Context, scan *Scan) error {
 	if scan == nil {
 		return fmt.Errorf("invalid Scan")
@@ -258,16 +408,24 @@ func (r *Repository) CreateScanWithCursor(ctx context.Context, scan *Scan) error
 	scan.ProjectUUID = defaultProjectUUID(scan.ProjectUUID)
 
 	if scan.ScanMode == "incremental" && scan.Modules != "" {
-		// Find the last completed scan with the same modules to copy cursor
+		// Find the last completed scan with the same modules to copy cursor. The
+		// lookup must stay within this scan's project: a cursor is a per-tenant
+		// (created_at, uuid) position, so inheriting one from another project would
+		// make this incremental scan skip records up to that foreign timestamp.
 		var prev Scan
-		err := r.db.NewSelect().
+		q := r.db.NewSelect().
 			Model(&prev).
 			Column("cursor_at", "cursor_uuid").
-			Where("status = ?", "completed").
-			Where("modules = ?", scan.Modules).
-			OrderExpr("finished_at DESC").
-			Limit(1).
-			Scan(ctx)
+			Where("project_uuid = ?", scan.ProjectUUID).
+			Where("modules = ?", scan.Modules)
+		if scan.ScanSource == ScanSourceScanOnReceive {
+			q = q.Where("scan_source = ?", ScanSourceScanOnReceive).
+				Where("cursor_at IS NOT NULL").
+				OrderExpr("created_at DESC")
+		} else {
+			q = q.Where("status = ?", "completed").OrderExpr("finished_at DESC")
+		}
+		err := q.Limit(1).Scan(ctx)
 		if err == nil && !prev.CursorAt.IsZero() {
 			scan.StartCursorAt = prev.CursorAt
 			scan.StartCursorUUID = prev.CursorUUID
@@ -310,7 +468,7 @@ func (r *Repository) AdvanceScanCursorBy(ctx context.Context, scanUUID string, r
 	}
 	// Format cursor_at to match SQLite's CURRENT_TIMESTAMP format (no timezone suffix).
 	// Go's time.Time serialization adds timezone info that breaks SQLite text comparison.
-	cursorAt := recordCreatedAt.UTC().Format("2006-01-02 15:04:05")
+	cursorAt := dbTimestampString(r.db.Driver(), recordCreatedAt)
 	_, err := r.db.NewUpdate().
 		Model((*Scan)(nil)).
 		Set("cursor_at = ?", cursorAt).
@@ -335,34 +493,51 @@ func (r *Repository) ResetScanCursor(ctx context.Context, scanUUID string) error
 	return err
 }
 
-// CountRecordsAfterCursor counts records after the given cursor position.
-// A zero cursorAt means count all records. When hostnames is non-empty,
-// only records matching those hostnames are counted.
-func (r *Repository) CountRecordsAfterCursor(ctx context.Context, cursorAt time.Time, cursorUUID string, hostnames ...string) (int64, error) {
-	return r.countRecordsAfterCursor(ctx, cursorAt, cursorUUID, nil, hostnames)
+// CountRecordsAfterCursor counts a project's records after the given cursor
+// position. A zero cursorAt means count all of them. When hosts is non-empty,
+// only records matching those in-scope origins (scheme+hostname+port) are
+// counted.
+//
+// projectUUID is required rather than optional so that spanning projects has to
+// be asked for: passing "" still counts every project, for a merge or an export
+// that deliberately does. (This query had no project predicate at all, and
+// returned the whole table on any multi-project store — see
+// TestCountRecords_IsProjectScoped for what that broke.)
+func (r *Repository) CountRecordsAfterCursor(ctx context.Context, projectUUID string, cursorAt time.Time, cursorUUID string, hosts ...HostTarget) (int64, error) {
+	return r.countRecordsAfterCursor(ctx, projectUUID, cursorAt, cursorUUID, nil, hosts)
 }
 
 // CountRecordsAfterCursorBySource is like CountRecordsAfterCursor but also
 // filters on http_records.source. Used by scan-on-receive shallow mode to
 // report only user-ingested traffic in the "new ingested records" status,
 // excluding finding/scanner artefacts produced by the scan itself.
-func (r *Repository) CountRecordsAfterCursorBySource(ctx context.Context, cursorAt time.Time, cursorUUID string, sources []string, hostnames []string) (int64, error) {
-	return r.countRecordsAfterCursor(ctx, cursorAt, cursorUUID, sources, hostnames)
+func (r *Repository) CountRecordsAfterCursorBySource(ctx context.Context, projectUUID string, cursorAt time.Time, cursorUUID string, sources []string, hosts []HostTarget) (int64, error) {
+	return r.countRecordsAfterCursor(ctx, projectUUID, cursorAt, cursorUUID, sources, hosts)
 }
 
-func (r *Repository) countRecordsAfterCursor(ctx context.Context, cursorAt time.Time, cursorUUID string, sources []string, hostnames []string) (int64, error) {
+func (r *Repository) countRecordsAfterCursor(ctx context.Context, projectUUID string, cursorAt time.Time, cursorUUID string, sources []string, hosts []HostTarget) (int64, error) {
 	q := r.db.NewSelect().Model((*HTTPRecord)(nil))
 
-	if !cursorAt.IsZero() {
-		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", cursorAt, cursorAt, cursorUUID)
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
 	}
 
-	if len(hostnames) > 0 {
-		q = q.Where("hostname IN (?)", bun.List(hostnames))
+	if !cursorAt.IsZero() {
+		// The same text form the cursor keyset compares everywhere else: bun's
+		// time.Time rendering carries a zone suffix that SQLite's
+		// CURRENT_TIMESTAMP text does not, which made same-second rows compare
+		// wrong.
+		at := dbTimestampString(r.db.Driver(), cursorAt)
+		q = q.Where("(created_at > ? OR (created_at = ? AND uuid > ?))", at, at, cursorUUID)
 	}
+
+	q = applyHostScopeFilter(q, hosts)
 
 	if len(sources) > 0 {
 		q = q.Where("source IN (?)", bun.List(sources))
+	} else {
+		// The assessment's own count: finding evidence is not input.
+		q = applyEvidenceExclusion(q)
 	}
 
 	count, err := q.Count(ctx)
@@ -370,6 +545,37 @@ func (r *Repository) countRecordsAfterCursor(ctx context.Context, cursorAt time.
 		return 0, fmt.Errorf("failed to count records after cursor: %w", err)
 	}
 	return int64(count), nil
+}
+
+// CountRecordsByStatusCode returns http_record counts grouped by HTTP status
+// code, restricted to the same project and in-scope origins as
+// CountRecordsAfterCursor (empty hosts = every origin, empty projectUUID =
+// every project). Keys are the raw numeric status codes (0 for a missing/unset
+// status); callers bucket them into 2xx/3xx/… classes.
+//
+// It powers the scan-completion summary's status-class line, printed as a
+// breakdown OF the record count beside it, so its project and host scope has to
+// match that count's exactly or the classes do not sum to the total.
+func (r *Repository) CountRecordsByStatusCode(ctx context.Context, projectUUID string, hosts ...HostTarget) (map[int]int64, error) {
+	var rows []struct {
+		StatusCode int   `bun:"status_code"`
+		Count      int64 `bun:"count"`
+	}
+	q := r.db.NewSelect().
+		Model((*HTTPRecord)(nil)).
+		ColumnExpr("status_code, COUNT(*) AS count")
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	q = applyHostScopeFilter(q, hosts)
+	if err := q.GroupExpr("status_code").Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("failed to count records by status code: %w", err)
+	}
+	out := make(map[int]int64, len(rows))
+	for _, row := range rows {
+		out[row.StatusCode] = row.Count
+	}
+	return out, nil
 }
 
 // PauseScan sets a scan's status to "paused".
@@ -438,7 +644,7 @@ func (r *Repository) ListScanLogs(ctx context.Context, scanUUID string, level, p
 		q = q.Where("phase = ?", phase)
 	}
 
-	q = q.Limit(limit).Offset(offset)
+	q = q.Limit(int64(limit)).Offset(int64(offset))
 
 	total, err := q.ScanAndCount(ctx)
 	if err != nil {
@@ -449,6 +655,10 @@ func (r *Repository) ListScanLogs(ctx context.Context, scanUUID string, level, p
 
 // DeleteScan deletes a scan record by UUID.
 func (r *Repository) DeleteScan(ctx context.Context, uuid string) error {
+	// The scan's coverage ledger goes with it.
+	if err := r.DeleteScanProgress(ctx, uuid); err != nil {
+		return fmt.Errorf("failed to delete scan progress: %w", err)
+	}
 	_, err := r.db.NewDelete().
 		Model((*Scan)(nil)).
 		Where("uuid = ?", uuid).
@@ -457,4 +667,22 @@ func (r *Repository) DeleteScan(ctx context.Context, uuid string) error {
 		return fmt.Errorf("failed to delete scan: %w", err)
 	}
 	return nil
+}
+
+// CountRecordsWithMethodsNotIn counts a project's records on the given
+// origins (empty = every origin) whose method is not in methods, excluding
+// finding evidence. `--safe` reports it as the write-method records its
+// GET/HEAD policy left untested.
+func (r *Repository) CountRecordsWithMethodsNotIn(ctx context.Context, projectUUID string, hosts []HostTarget, methods []string) (int64, error) {
+	q := r.db.NewSelect().Model((*HTTPRecord)(nil))
+	if projectUUID != "" {
+		q = q.Where("project_uuid = ?", projectUUID)
+	}
+	q = applyHostScopeFilter(q, hosts)
+	q = applyEvidenceExclusion(q)
+	if len(methods) > 0 {
+		q = q.Where("UPPER(COALESCE(method, '')) NOT IN (?)", bun.List(methods))
+	}
+	n, err := q.Count(ctx)
+	return int64(n), err
 }

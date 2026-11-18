@@ -28,6 +28,12 @@ type Graph struct {
 	// Only HybridStateVertexImpl computes real distances.
 	// When compareMode == CompareModeExact, skip near-dup computation.
 	compareMode CompareMode
+
+	// structIndex buckets state IDs by URL template + top SimHash bits for
+	// structural clone detection.
+	structIndex map[string][]string
+	// structClones counts captured states folded into an existing one.
+	structClones int
 }
 
 // NewGraph creates a new state graph.
@@ -46,12 +52,41 @@ func NewGraph() *Graph {
 // AddState adds a state to the graph.
 // Returns true if state was added, false if it already exists.
 func (g *Graph) AddState(s *State) bool {
+	_, added := g.PutIfAbsent(s)
+	return added
+}
+
+// PutIfAbsent inserts s unless a state with the same ID (the hash of its
+// stripped DOM) is already present, and returns the canonical state for that
+// ID: s itself when it was added, otherwise a copy of the state already in the
+// graph (the same copy GetState hands out). Check and insert happen under one
+// write lock, so two tabs that capture the same DOM at once get one state and
+// agree on which one it is — a separate HasState/AddState or AddState/GetState
+// pair could interleave with another tab's insert.
+func (g *Graph) PutIfAbsent(s *State) (*State, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if _, exists := g.states[s.ID]; exists {
+	if existing, exists := g.states[s.ID]; exists {
 		zap.L().Debug("State already exists in graph", zap.String("state_id", s.ID))
-		return false
+		return existing.Clone(), false
+	}
+	// A structural clone (same URL template, SimHash within structMaxHamming)
+	// is the existing state with different content, not a new state to
+	// explore. The index state is always kept.
+	if !s.IsIndex() && s.StructID != 0 {
+		key := structBucket(s.URL, s.StructID)
+		for _, id := range g.structIndex[key] {
+			if existing, ok := g.states[id]; ok && StructHamming(existing.StructID, s.StructID) <= structMaxHamming {
+				g.structClones++
+				zap.L().Debug("State is a structural clone", zap.String("state_id", s.ID), zap.String("clone_of", id))
+				return existing.Clone(), false
+			}
+		}
+		if g.structIndex == nil {
+			g.structIndex = make(map[string][]string)
+		}
+		g.structIndex[key] = append(g.structIndex[key], s.ID)
 	}
 
 	g.setNearDuplicateLocked(s)
@@ -71,7 +106,7 @@ func (g *Graph) AddState(s *State) bool {
 		zap.Float64("dist_to_nearest", s.DistToNearest),
 		zap.Bool("is_near_duplicate", s.IsNearDuplicate))
 
-	return true
+	return s, true
 }
 
 // setNearDuplicateLocked calculates and sets the nearest state information.
@@ -1038,4 +1073,12 @@ func pathExists(candidates *pathCandidateHeap, path []*action.Eventable) bool {
 		}
 	}
 	return false
+}
+
+// StructClones is how many captured states were folded into an existing state
+// as structural clones.
+func (g *Graph) StructClones() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.structClones
 }

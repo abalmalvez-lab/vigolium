@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Spring Boot and Spring MVC applications by analyzing HTTP
-response headers (X-Application-Context, Server), cookies (JSESSIONID pattern),
-default error page patterns (Whitelabel), and body content markers.
+	ModuleDesc = `**What it means:** The target was passively identified as a Spring Boot or Spring MVC application from signals such as the X-Application-Context header, a Whitelabel Error Page, a JSESSIONID cookie, Spring default error JSON, or a Server header revealing Tomcat or Jetty. Informational technology disclosure, not a vulnerability by itself.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects Spring via Whitelabel Error Page, server headers, session cookies
-- Identifies underlying servlet container (Tomcat, Jetty, Undertow)
-- Recognizes Spring-specific response patterns
-- Deduplicates by host to avoid redundant processing
+**How it's exploited:** Knowing the framework lets an attacker focus on Spring-specific weaknesses - probing exposed Actuator endpoints (env, heapdump, mappings) and Spring4Shell-class binding flaws - and target only the relevant CVEs.
 
-## References
-- https://docs.spring.io/spring-boot/docs/current/reference/html/
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/02-Fingerprint_Web_Server`
+**Fix:** Suppress framework-revealing headers and replace default Spring error pages and login forms with generic custom responses.`
 
 	ModuleConfirmation = "Confirmed when Spring-specific headers, cookies, or body patterns are detected in the response"
 	ModuleSeverity     = severity.Info

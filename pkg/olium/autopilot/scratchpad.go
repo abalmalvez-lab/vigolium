@@ -260,6 +260,55 @@ func (c *ScratchpadContext) render() string {
 	return b.String()
 }
 
+// Render returns the full markdown working-memory snapshot, acquiring the
+// lock. The internal render() assumes the caller already holds c.mu (it's
+// called from the update_plan / remember executors, which lock first); this
+// exported wrapper lets the section controller build a reconstructed brief
+// safely from outside those executors.
+func (c *ScratchpadContext) Render() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.render()
+}
+
+// Remember upserts a keyed note programmatically and persists — the same
+// keyed-slot semantics the remember tool applies, exposed for the section
+// controller to pin each section's closing summary under section-<N>-closing.
+// A blank key appends (never used by the controller, which always keys).
+// Best-effort persist: an on-disk write failure is non-fatal (the in-memory
+// copy remains authoritative for the run).
+func (c *ScratchpadContext) Remember(key, text string, tags []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := Note{Key: key, Text: text, Tags: tags, At: time.Now().UTC().Format(time.RFC3339)}
+	if key != "" {
+		for i := range c.notes {
+			if c.notes[i].Key == key {
+				c.notes[i] = n
+				_ = c.persist()
+				return
+			}
+		}
+	}
+	c.notes = append(c.notes, n)
+	c.evictIfNeeded()
+	_ = c.persist()
+}
+
+// NoteByKey returns the text of the keyed note, or "" when no note carries
+// that key. Used by the section controller to surface the most recent closing
+// summary prominently in the reconstructed brief.
+func (c *ScratchpadContext) NoteByKey(key string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.notes {
+		if c.notes[i].Key == key {
+			return c.notes[i].Text
+		}
+	}
+	return ""
+}
+
 // Digest returns a compact plan-state snapshot the engine pins to every tool
 // result tail. The full render() (~1 KiB markdown) is echoed only when
 // update_plan or remember are called; on every other tool call this short
@@ -336,8 +385,8 @@ func (*updatePlanTool) Schema() map[string]any {
 				"items": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"id":     map[string]any{"type": "string", "description": "Stable short id (e.g. 'auth', 'idor'). Auto-assigned if omitted."},
-						"task":   map[string]any{"type": "string", "description": "What this step accomplishes. Required."},
+						"id":     map[string]any{"type": "string", "description": "Stable short id (e.g. 'auth', 'idor'). Auto-assigned if omitted; reuse an existing id to update that item."},
+						"task":   map[string]any{"type": "string", "description": "What this step accomplishes. Required, except when 'id' names an item already in the plan (its text carries over)."},
 						"status": map[string]any{"type": "string", "enum": []string{planPending, planInProgress, planDone, planDropped}, "description": "Default 'pending'."},
 						"note":   map[string]any{"type": "string", "description": "Optional short progress note (e.g. 'verifier in api/auth.go:88')."},
 					},
@@ -363,6 +412,15 @@ func (t *updatePlanTool) Execute(_ context.Context, args map[string]any, _ tool.
 		return tool.Result{Content: "update_plan: 'plan' must be an array of {task, status?, id?, note?} objects", IsError: true}, nil
 	}
 
+	// Existing task text, by id. The list has replace-semantics, but a model
+	// re-sending a known item to flip its status naturally sends {id, status,
+	// note} and drops the task text it already wrote — rejecting that costs a
+	// whole turn to re-send text we already have. Carry it forward instead.
+	prior := make(map[string]string, len(t.sp.plan))
+	for _, p := range t.sp.plan {
+		prior[p.ID] = p.Task
+	}
+
 	next := make([]PlanItem, 0, len(arr))
 	for i, item := range arr {
 		obj, ok := item.(map[string]any)
@@ -372,7 +430,16 @@ func (t *updatePlanTool) Execute(_ context.Context, args map[string]any, _ tool.
 		task, _ := obj["task"].(string)
 		task = strings.TrimSpace(task)
 		if task == "" {
-			return tool.Result{Content: fmt.Sprintf("update_plan: plan[%d].task is required", i), IsError: true}, nil
+			if id, _ := obj["id"].(string); id != "" {
+				task = prior[strings.TrimSpace(id)]
+			}
+		}
+		if task == "" {
+			return tool.Result{
+				Content: fmt.Sprintf("update_plan: plan[%d].task is required (a one-line description of the step; "+
+					"it may be omitted only when 'id' matches an item already in the plan)", i),
+				IsError: true,
+			}, nil
 		}
 		status, _ := obj["status"].(string)
 		status = strings.TrimSpace(status)
@@ -478,6 +545,26 @@ func (t *rememberTool) Execute(_ context.Context, args map[string]any, _ tool.Up
 		Content: out,
 		Details: map[string]any{"notes_total": len(t.sp.notes)},
 	}, nil
+}
+
+// NextOpenTask returns the task text of the first in_progress plan item, or
+// failing that the first pending item, or "" when the plan has neither. The
+// section controller uses it to seed each new section's task from the durable
+// plan so a rotated operator resumes on the right step.
+func (c *ScratchpadContext) NextOpenTask() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range c.plan {
+		if p.Status == planInProgress {
+			return p.Task
+		}
+	}
+	for _, p := range c.plan {
+		if p.Status == planPending {
+			return p.Task
+		}
+	}
+	return ""
 }
 
 // recall returns notes, optionally filtered to those carrying every tag in

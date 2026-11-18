@@ -9,23 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Firebase-specific files and endpoints that should not be publicly
-accessible: project configuration, security rules, runtime config, service
-account keys, and mobile config files.
+	ModuleDesc = `**What it means:** The host serves a Firebase file that should not be public, ranging from project-config disclosure (init.json, google-services.json) up to leaked Firestore/Storage/RTDB security rules, runtime config, or an Admin SDK service account key with private_key.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Checks /__/firebase/init.json for project config exposure
-- Probes for security rules files (firestore.rules, storage.rules, database.rules.json)
-- Detects exposed service account keys and runtime configuration
-- Non-destructive: all probes are read-only GET requests
+**How it's exploited:** Leaked rules reveal authorization logic, letting an attacker exploit permissive read/write paths. Runtime config holds third-party keys, and a service account key grants full admin access to the project and its Google Cloud resources.
 
-## References
-- https://firebase.google.com/docs/hosting/reserved-urls
-- https://firebase.google.com/docs/rules
-- https://firebase.google.com/docs/admin/setup`
+**Fix:** Remove these files from the web root and deploys, store credentials in a secret manager outside the served tree, and rotate any exposed key.`
 
 	ModuleConfirmation = "Confirmed when probed Firebase files return 200 with expected content markers (Firebase config keys, rules syntax, service account fields)"
 	ModuleSeverity     = severity.High

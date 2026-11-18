@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Composer dependency management artifacts that should not be publicly
-accessible: composer.json and composer.lock manifests revealing exact dependency
-versions, vendor directory contents, Composer installed metadata, and PHPUnit
-dev endpoint that may allow remote code execution.
+	ModuleDesc = `**What it means:** The web server exposes PHP Composer artifacts that should never be reachable over HTTP - composer.json/composer.lock manifests, the vendor directory, or the PHPUnit eval-stdin.php endpoint. These leak exact dependency versions, and one is an RCE vector.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Fingerprints 404 responses to detect custom error pages
-- PHPUnit eval-stdin.php is a known RCE vector in vulnerable versions
+**How it's exploited:** An attacker reads composer.lock to learn dependency versions, then correlates them against CVE databases for version-specific exploits. The worst case, an exposed PHPUnit eval-stdin.php (CVE-2017-9841), lets an attacker POST arbitrary PHP for remote code execution.
 
-## References
-- https://getcomposer.org/doc/
-- https://blog.packagist.com/composer-lock-security/
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Block public access to composer files and the vendor directory, disable directory listing, and keep PHPUnit out of the web root.`
 
 	ModuleConfirmation = "Confirmed when probed Composer artifacts return 200 with expected content markers"
 	ModuleSeverity     = severity.High

@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects stored (persistent) XSS. A unique canary payload is written through an insertion
-point, the page is then re-fetched with a clean request, and if the canary surfaces in that
-separate response it must have been stored. Execution is then confirmed in a headless
-browser, so a finding reflects a payload that both persisted and ran.
+	ModuleDesc = `**What it means:** The application stores attacker input and later renders it as live HTML/JavaScript, so injected script runs for anyone who views the page. Browser-confirmed: a canary persisted on a clean re-fetch and fired a JavaScript dialog in a headless browser.
 
-## Notes
-- Distinguishes stored from reflected: the retrieval request never carries the payload, so a
-  reflected-only value cannot trigger a finding
-- Retrieval is currently the same URL the value was submitted to; display pages on a
-  different URL are not yet covered
-- Confirmation replays the scan session (cookies) so behind-login pages still render
+**How it's exploited:** An attacker submits malicious script once; it is saved server-side and served to every later visitor, executing in their authenticated session with no per-victim interaction. This enables session theft, account takeover, and worm-like spread.
 
-## References
-- https://owasp.org/www-community/attacks/xss/#stored-xss-attacks`
+**Fix:** Contextually output-encode stored user input when rendering, apply server-side validation, and enforce a restrictive Content-Security-Policy.`
 
 	ModuleConfirmation = "Confirmed when an injected payload persists and executes JavaScript on a subsequent retrieval of the page"
 	ModuleSeverity     = severity.High

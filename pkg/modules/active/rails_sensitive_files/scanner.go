@@ -18,6 +18,13 @@ import (
 
 var masterKeyPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
+// localSecretPattern matches the hex secret_key_base Rails writes to
+// tmp/local_secret.txt (SecureRandom.hex → lowercase hex, 128 chars in modern
+// Rails). It is anchored so a blank body, an HTML shell, or any non-hex
+// catch-all placeholder fails — the same empty-200 false positive the /up
+// health-check probe hits.
+var localSecretPattern = regexp.MustCompile(`^[0-9a-f]{32,}$`)
+
 type notFoundFingerprint struct {
 	bodyHash string
 	bodyLen  int
@@ -66,10 +73,7 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -99,11 +103,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -133,11 +135,9 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -174,6 +174,30 @@ func (m *Module) probeFile(
 				return nil
 			}
 		}
+	}
+
+	// Catch-all / SPA shell guard: a themed app that returns the same shell for
+	// any path is a false positive even when a weak marker appears in that shell.
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
+	// Content-type discipline (the decisive, zero-false-negative, truncation-proof
+	// guard for this module): every file probed here is a Rails config / source /
+	// log / data artifact — YAML (database.yml, secrets.yml), Ruby source
+	// (puma.rb, schema.rb, seeds.rb), a plaintext log, an encrypted-credentials
+	// blob, a hex key, or a SQLite binary — and NONE of them is ever served as an
+	// HTML *document*. A universal catch-all / echo host that answers arbitrary
+	// paths with its themed text/html shell would otherwise forge a match on a
+	// weak reflected marker ("source"/"gem " for the Gemfile, "port"/"workers"
+	// for puma.rb, "create"/"User" for seeds.rb) that survives in the response.
+	// This class defeats the <html>/<!DOCTYPE> anti-markers and the 404
+	// fingerprint under the gzip + bogus Content-Length:0 transport quirk, which
+	// captures only a truncated TAIL fragment (no leading <!DOCTYPE); the
+	// Content-Type header survives that truncation intact. A genuine Rails config
+	// file never comes back as text/html, so this costs no true positives.
+	if modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
+		return nil
 	}
 
 	for _, anti := range sf.antiMarkers {
@@ -221,7 +245,12 @@ func (m *Module) probeFile(
 			matchedMarkers = append(matchedMarkers, "encrypted credentials blob")
 
 		case "/tmp/local_secret.txt":
-			if len(body) >= 256 {
+			// A real local secret is a long hex secret_key_base. A blank or
+			// non-hex body (the catch-all / CDN empty-200 placeholder) carries no
+			// signal: the upper bound alone let an empty body through and report a
+			// secret leak. Require the hex token, bounded above to stay terse.
+			trimmed := strings.TrimSpace(body)
+			if len(trimmed) >= 256 || !localSecretPattern.MatchString(trimmed) {
 				return nil
 			}
 			matchedMarkers = append(matchedMarkers, "local secret content")
@@ -243,8 +272,8 @@ func (m *Module) probeFile(
 		Info: output.Info{
 			Name:        fmt.Sprintf("Rails Sensitive File: %s", sf.name),
 			Description: sf.desc,
-			Severity:    sf.sev,
-			Confidence:  severity.Firm,
+			Severity:    modkit.CapSeverity(sf.sev, severity.Medium),
+			Confidence:  severity.Tentative,
 			Tags:        []string{"rails", "ruby", "sensitive-file", "information-disclosure"},
 			Reference:   []string{"https://guides.rubyonrails.org/security.html"},
 		},

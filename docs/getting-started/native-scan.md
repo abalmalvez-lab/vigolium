@@ -14,14 +14,17 @@ extended recipe book see [Stateless Scanning](../guides/stateless-scan.md).
 
 | Command | Persists to DB? | Phases | Use it for |
 |---------|-----------------|--------|------------|
-| `scan-url` | No | none — direct module run | One URL, fast |
-| `scan-request` | No | none — direct module run | A raw HTTP request / curl |
+| `scan-url` (direct default) | No | direct module run | One URL, fast |
+| `scan-request` (direct default) | No | direct module run | A raw HTTP request / curl |
 | `scan --stateless` | No (temp DB, discarded) | full pipeline | One-shot full scan |
 | `scan` | Yes (`~/.vigolium/...sqlite`) | full pipeline | Persistent projects |
 
-`scan-url` and `scan-request` never touch a database. `scan --stateless`
-creates a temporary SQLite database, runs every requested phase, exports
-results, and deletes the database on exit.
+The default direct paths for `scan-url` and `scan-request` run in memory. Phase
+flags, persisted file formats, `-S/--stateless`, `--auth`/`--auth-file` or
+`--intensity` route them through the full Runner, so those invocations may use
+the active or a temporary database.
+`scan --stateless` creates a temporary SQLite database, runs every requested
+phase, exports results, and deletes the database on exit.
 
 > Pass `-o/--output` (with `--format`) when using `--stateless` — otherwise
 > results are discarded along with the temporary database. Vigolium prints a
@@ -57,15 +60,15 @@ vigolium scan-url -m sqli -m xss "https://example.com/search?q=test"
 # Filter by tag
 vigolium scan-url --module-tag injection https://example.com/api/data
 
-# Skip passive analysis and insertion-point fuzzing for the fastest result
-vigolium scan-url --no-passive --no-insertion-points https://example.com/api/data
+# Skip passive analysis for an active-only result
+vigolium scan-url --no-passive https://example.com/api/data
 ```
 
-Run a discovery/spider phase *before* the scan (these promote `scan-url` to the
-full pipeline and require a database — pass `--db`):
+Run a discovery/spider phase *before* the scan. These promote `scan-url` to the
+full pipeline; add `-S` when you want its database discarded:
 
 ```bash
-vigolium scan-url --discover --db /tmp/scan.sqlite https://example.com
+vigolium scan-url --discover -S --format jsonl -o result.jsonl https://example.com
 ```
 
 ## Scan a raw HTTP request — `scan-request`
@@ -87,6 +90,20 @@ Override the host when the request file has only a path:
 
 ```bash
 vigolium scan-request -i request.txt --target https://staging.example.com
+```
+
+`-H` overrides the captured request: it replaces every captured header of the
+same name, or is appended when the capture has none.
+
+```bash
+vigolium scan-request -i request.txt -H 'Cookie: session=fresh'
+```
+
+Both commands share `scan`'s tuning flags: `--auth`/`--auth-file`,
+`--intensity`, `--scanning-max-duration`, `--oast-url` and `--scope-origin`.
+
+```bash
+vigolium scan-url https://example.com/api/me --auth-file admin.yaml --intensity quick
 ```
 
 ## Piping from stdin
@@ -128,11 +145,14 @@ vigolium run dynamic-assessment --stateless -t https://example.com \
   --format jsonl -o results
 ```
 
-Multiple targets from a file — each target gets an isolated temporary database,
-and the output filename is suffixed per host so results don't overwrite:
+Multiple targets share one output by default. Add `--split-by-host` to create a
+separate artifact per host:
 
 ```bash
 vigolium scan --stateless -T targets.txt --format jsonl -o results
+# -> results.jsonl
+
+vigolium scan --stateless -T targets.txt --format jsonl -o results --split-by-host
 # -> results-example.com.jsonl, results-test.example.com.jsonl, ...
 ```
 
@@ -142,6 +162,10 @@ vigolium scan --stateless -T targets.txt --format jsonl -o results
 # OpenAPI / Swagger spec
 vigolium scan --stateless -i api.yaml -I openapi \
   -t https://api.example.com --format jsonl -o results
+
+# WSDL / SOAP service description
+vigolium scan --stateless -i service.wsdl -I wsdl \
+  -t https://soap.example.com --format jsonl -o results
 
 # Postman collection
 vigolium scan --stateless -i collection.json -I postman \
@@ -160,7 +184,7 @@ vigolium scan --stateless -i nuclei.jsonl -I nuclei --format jsonl -o results
 ## Tuning a scan
 
 ```bash
-# Speed knobs — defaults: -c 50, -r 100 req/s, --max-per-host 50, --timeout 15s
+# Effective defaults: -c 40, -r 100 req/s, --max-per-host 40, --timeout 15s
 vigolium scan --stateless -t https://example.com \
   -c 100 -r 200 --max-per-host 10 --timeout 30s \
   --format jsonl -o results
@@ -207,19 +231,19 @@ token extraction, and multi-session IDOR/BOLA testing.
 
 ## CI/CD integration
 
-`--ci-output-format` forces clean JSONL with no banners or color codes, ideal
-for parsing in a pipeline:
+Use `-j` for one machine-readable JSON envelope on stdout (human logs go to
+stderr), `--format jsonl,sarif -o findings` for files a pipeline can archive,
+and `--fail-on high` to fail the job on findings (a partial scan also fails it):
 
 ```bash
 vigolium scan --stateless -t https://example.com \
-  --ci-output-format -o findings
+  --format jsonl,sarif -o findings --fail-on high
 ```
 
 A minimal gate that fails the build when any finding is reported:
 
 ```bash
-vigolium scan --stateless -t "$TARGET" --ci-output-format -o findings
-test ! -s findings.jsonl || { echo "Vulnerabilities found"; exit 1; }
+vigolium scan --stateless -t "$TARGET" --fail-on info --format jsonl -o findings.jsonl
 ```
 
 See [CI/CD Integration](../guides/ci-cd-integration.md) for full pipeline
@@ -230,13 +254,20 @@ examples.
 | `--format` | Output | Notes |
 |------------|--------|-------|
 | `console` | Terminal (default) | Colored, human-readable |
-| `jsonl` | `<o>.jsonl` | One JSON object per line; `-j` is shorthand |
+| `jsonl` | `<o>.jsonl` | One JSON object per line (`-j` is the scan document, not jsonl) |
 | `html` | `<o>.html` | Interactive ag-grid report; requires `-o` |
-| `console,jsonl,html` | All of the above | Comma-separate to combine |
+| `report` | document report | Self-contained report; requires `-o` |
+| `pdf` | `<o>.pdf` | PDF rendered with headless Chrome; requires `-o` |
+| `sqlite` | `<o>.sqlite` | Reopen with `finding -S --db`; requires `-S` |
+| `fs` | sibling directory trees | Browsable request/response and finding files |
+| `console,jsonl,html` | all selected formats | Comma-separate to combine |
 
 For stateless runs, `-o` is the **base** path — Vigolium appends the correct
 extension per format and materializes every requested format from the
-temporary database before tearing it down.
+temporary database before tearing it down. Without `--format`, a known
+extension picks it (`-o r.html` is `--format html`, `-o r.junit.xml` is
+junit); `-o x.json` is the `-j` document file and needs `-j`. Every output
+path is created and checked before the first request.
 
 ## Cheat sheet
 
@@ -255,7 +286,7 @@ vigolium scan --stateless -i openapi.yaml -I openapi \
   -t https://api.example.com --format html -o report
 
 # CI gate
-vigolium scan --stateless -t "$TARGET" --ci-output-format -o findings
+vigolium scan --stateless -t "$TARGET" --fail-on high --format jsonl -o findings.jsonl
 ```
 
 ## Next steps

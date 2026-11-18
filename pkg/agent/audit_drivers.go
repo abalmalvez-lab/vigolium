@@ -16,10 +16,17 @@ const (
 	AuditDriverPiolium = "piolium"
 	AuditDriverAudit   = "audit"
 	AuditDriverBoth    = "both"
-	// AuditDriverAuto is the default. It runs audit first; piolium is
-	// only invoked as a fallback when audit fails (or isn't available).
-	// A clean audit run finishes the audit without ever consulting
-	// piolium, so a missing piolium runtime is not reported up front.
+	// AuditDriverAuto is the default. A preflight picks the leg: when the
+	// resolved coding-agent CLI (claude or codex) is on PATH, the audit
+	// binary is embedded, and the mode chain holds at least one
+	// audit-supported mode, audit runs and piolium is never consulted.
+	// If any of those checks fails, audit is skipped without ever being
+	// launched and piolium runs as the fallback.
+	//
+	// A mid-run audit failure is deliberately NOT a fallback trigger:
+	// once audit starts, its outcome is the run's outcome. Because a
+	// clean audit run never consults piolium, a missing piolium runtime
+	// is not reported up front.
 	AuditDriverAuto = "auto"
 )
 
@@ -122,6 +129,12 @@ type AuditDriverCfgInput struct {
 	// ignored for the piolium harness.
 	KeepRaw bool
 
+	// KeepSourceOutputDir suppresses the post-run cleanup of
+	// <source>/vigolium-results/ from the source tree (a session copy is
+	// always synced regardless). The CLI sets it from --keep-raw/--clean-raw
+	// so the on-disk results can be reviewed or re-imported. Audit-only.
+	KeepSourceOutputDir bool
+
 	// AuthOverride carries the resolved BYOK bundle for this run. It is
 	// already folded into Invocation.Auth by the caller (via
 	// ResolveAuditDriverInvocation's variadic override or
@@ -153,6 +166,7 @@ func BuildAuditDriverCfg(in AuditDriverCfgInput) AuditAgentConfig {
 		StreamWriter:          in.StreamWriter,
 		ShowThinking:          in.ShowThinking,
 		KeepRaw:               in.KeepRaw,
+		KeepSourceOutputDir:   in.KeepSourceOutputDir,
 		AuthOverride:          in.AuthOverride,
 	}
 }

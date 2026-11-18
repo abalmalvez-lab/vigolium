@@ -222,6 +222,7 @@ func QueryGenericTable(ctx context.Context, db *DB, tableName string, limit, off
 		result = append(result, row)
 	}
 
+	redactGenericRows(tableName, result)
 	return result, colNames, total, rows.Err()
 }
 
@@ -416,6 +417,7 @@ func QueryGenericTableFiltered(ctx context.Context, db *DB, tableName string, op
 	if err != nil {
 		return nil, nil, 0, err
 	}
+	redactGenericRows(tableName, result)
 	return result, colNames, total, nil
 }
 
@@ -457,6 +459,7 @@ func GetGenericRecord(ctx context.Context, db *DB, tableName, pkValue string) (m
 	if len(results) == 0 {
 		return nil, sql.ErrNoRows
 	}
+	redactGenericRows(tableName, results)
 	return results[0], nil
 }
 
@@ -658,9 +661,16 @@ func buildWhereClause(driver string, allColumns []ColumnInfo, opts GenericQueryO
 			if strings.Contains(colType, "TEXT") || strings.Contains(colType, "VARCHAR") ||
 				strings.Contains(colType, "CHAR") || colType == "CHARACTER VARYING" ||
 				colType == "UUID" {
+				// Escaped and given an ESCAPE clause like every other LIKE in this
+				// package — a generic-table search is exactly where a term full of
+				// %s and _s (an encoded payload, a snake_case column value) arrives.
+				// The clause is appended literally rather than through
+				// WithLikeEscape, which rewrites `LIKE ?`: this builder's
+				// placeholder is $N on Postgres, so the rewrite would silently miss.
 				ph := makePlaceholder(driver, argIdx)
-				searchConds = append(searchConds, fmt.Sprintf("%s LIKE %s", quoteIdent(driver, c.Name), ph))
-				args = append(args, "%"+opts.SearchTerm+"%")
+				searchConds = append(searchConds, fmt.Sprintf(
+					"%s LIKE %s%s", quoteIdent(driver, c.Name), ph, likeEscapeClause))
+				args = append(args, LikeContains(opts.SearchTerm))
 				argIdx++
 			}
 		}
@@ -733,4 +743,52 @@ func quoteIdent(driver, name string) string {
 	default:
 		return `"` + name + `"`
 	}
+}
+
+// listAllColumns returns every table's columns in ONE catalog query, as
+// table -> column -> present.
+//
+// One query, not one per table. missingColumns walks 80 migrated columns across
+// 9 tables, and asking per table cost 9 round trips on every process start —
+// negligible on SQLite, but 9 network RTTs on a Postgres deployment, paid by
+// every CLI invocation that opens a store. (Asking per COLUMN, which this
+// replaced an earlier version of, cost 80.)
+//
+// SQLite reaches the per-table PRAGMA through pragma_table_info as a
+// table-valued function, so it joins against sqlite_master instead of being
+// issued once per name.
+func listAllColumns(ctx context.Context, db *DB) (map[string]map[string]bool, error) {
+	var query string
+	switch db.Driver() {
+	case "sqlite":
+		query = `SELECT m.name, p.name FROM sqlite_master m
+		         JOIN pragma_table_info(m.name) p
+		         WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'`
+	case "postgres":
+		query = `SELECT table_name, column_name FROM information_schema.columns
+		         WHERE table_schema = 'public'`
+	default:
+		return nil, fmt.Errorf("unsupported driver: %s", db.Driver())
+	}
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[string]map[string]bool)
+	for rows.Next() {
+		var table, column string
+		if err := rows.Scan(&table, &column); err != nil {
+			return nil, err
+		}
+		cols, ok := out[table]
+		if !ok {
+			cols = make(map[string]bool)
+			out[table] = cols
+		}
+		cols[column] = true
+	}
+	return out, rows.Err()
 }

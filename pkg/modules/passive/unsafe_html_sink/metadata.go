@@ -9,31 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript, TypeScript, Vue, and Svelte response bodies for patterns that inject
-raw HTML into the DOM without sanitization. These sinks are common sources of XSS
-vulnerabilities in modern frontend frameworks: React (dangerouslySetInnerHTML),
-Vue (v-html), Svelte ({@html}), Angular (bypassSecurityTrust*), and vanilla DOM APIs
-(innerHTML, outerHTML, insertAdjacentHTML, document.write). Also detects dangerous
-code injection patterns via eval() and new Function().
+	ModuleDesc = `**What it means:** Static analysis of served JS, Vue, or Svelte code found a known unsafe HTML or code-execution sink - framework sinks (dangerouslySetInnerHTML, v-html, bypassSecurityTrust), DOM sinks (innerHTML, insertAdjacentHTML, document.write), or eval and new Function. Informational lead; it does not confirm untrusted input reaches the sink.
 
-## Notes
-- Passive only -- does not send any HTTP requests
-- Scans JS/TS/Vue/Svelte files and inline scripts in HTML responses
-- Each detected pattern produces a separate finding
-- Deduplicates by host+path
-- eval() detections are suppressed for test/spec/mock files
+**How it's exploited:** If a value from the URL, fragment, postMessage, or other user input reaches the sink unsanitized, an attacker injects script and runs arbitrary code in the victim's browser.
 
-## References
-- https://react.dev/reference/react-dom/components/common#dangerously-setting-the-inner-html
-- https://vuejs.org/api/built-in-directives.html#v-html
-- https://svelte.dev/docs/special-tags#html
-- https://angular.io/api/platform-browser/DomSanitizer
-- https://owasp.org/www-community/attacks/DOM_Based_XSS
-- https://cwe.mitre.org/data/definitions/79.html`
+**Fix:** Sanitize untrusted input before any HTML sink (for example DOMPurify) and avoid eval and new Function on dynamic data.`
 
-	ModuleConfirmation = "Confirmed when response JavaScript or template code contains known unsafe HTML injection sinks"
-	ModuleSeverity     = severity.High
+	ModuleConfirmation = "Observation when a sink exists; confirmation requires connected attacker-controlled dataflow and sanitizer analysis, handled by the taint-aware detector"
+	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"xss", "javascript", "light"}
 )

@@ -89,6 +89,46 @@ type VulnClassifier interface {
 	VulnClass() string // e.g., "xss", "sqli", "ssti"
 }
 
+// BodyDifferentialConfirmable is an optional interface for active modules whose
+// findings should be re-confirmed by the executor's safety net before being
+// reported. When a module implementing it returns true, the executor replays the
+// finding's payload-applied request and compares it against a clean (no-payload)
+// baseline (the pre-scan baseline already on the item, plus one fresh fetch),
+// requiring a reproducible, payload-driven in-band difference and rejecting
+// status flips and dynamic-noise diffs (via modkit.ConfirmBodyDifferential).
+//
+// Only modules whose true-positive signal IS an in-band body/header difference
+// should opt in. Modules whose signal is out-of-band (OAST), timing-based, a
+// small error string, or whose payload mutates server state (and so must not be
+// replayed) must NOT implement this — they keep their own confirmation.
+type BodyDifferentialConfirmable interface {
+	ConfirmsByBodyDifferential() bool
+}
+
+// ResultDifferentialConfirmable is the per-result form of
+// BodyDifferentialConfirmable, for modules that mix an in-band leg with OAST or
+// timing legs. The executor consults it only when the module-level interface
+// is absent or returns false, and re-confirms the result by body differential
+// only when it returns true. Implementations return true for in-band results
+// (typically result.Signal() == output.SignalInband) and false for results
+// whose proof is a callback or a delay, which a replay cannot show.
+type ResultDifferentialConfirmable interface {
+	ConfirmsResultByBodyDifferential(result *output.ResultEvent) bool
+}
+
+// ConfirmsByBodyDifferential reports whether m's result should go through the
+// executor's body-differential re-confirmation: the module-level opt-in first,
+// then the per-result one.
+func ConfirmsByBodyDifferential(m Module, result *output.ResultEvent) bool {
+	if c, ok := m.(BodyDifferentialConfirmable); ok && c.ConfirmsByBodyDifferential() {
+		return true
+	}
+	if c, ok := m.(ResultDifferentialConfirmable); ok && result != nil {
+		return c.ConfirmsResultByBodyDifferential(result)
+	}
+	return false
+}
+
 // TechAware is an optional interface for modules that only make sense against
 // certain technology stacks. Implement it on framework-specific modules
 // (e.g. Spring, Rails, Django) to skip them on incompatible targets.
@@ -106,4 +146,22 @@ type VulnClassifier interface {
 // "aspnet", "php", "wordpress").
 type TechAware interface {
 	RequiredTechs() []string
+}
+
+// PerScanModule is an optional interface for active modules that carry mutable
+// state meaningful only within ONE scan (per-host dedup maps, per-scan budgets,
+// compare clients, discovery maps). The registry stores a single shared singleton
+// of each module, so without isolation that state bleeds across concurrent
+// server-mode scans. The runner replaces such a module with a fresh instance for
+// each scan (see freshenPerScanModules); modules whose per-scan state is already
+// isolated via dedup.Lazy(scanCtx.DedupMgr()) or ScanContext need not implement it.
+//
+// Fresh returns a new instance with zeroed per-scan state. It is typed `any`
+// rather than ActiveModule so a module package can implement it without importing
+// pkg/modules — which would form an import cycle with the registry; the runner
+// asserts the result back to ActiveModule. Implementations are one line:
+//
+//	func (m *Module) Fresh() any { return New() }
+type PerScanModule interface {
+	Fresh() any
 }

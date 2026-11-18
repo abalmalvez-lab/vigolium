@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects blind Server-Side Template Injection vulnerabilities using a dual approach:
-OAST (Out-of-Band) callbacks via DNS lookups and time-delay payloads as a fallback.
-OAST payloads use nslookup to trigger DNS callbacks, while time-delay payloads use
-computationally expensive loops to cause measurable response delays.
+	ModuleDesc = `**What it means:** User input reaches a server-side template engine (Jinja2, Twig, Freemarker, ERB, or a JVM engine — Spring EL, Thymeleaf, Velocity, OGNL/Struts) and is evaluated as template code, not data. The attacker controls code inside the engine; the blind response looks unchanged.
 
-## Notes
-- Dual detection: OAST callbacks (Firm confidence) + time-delay fallback (Tentative confidence)
-- OAST payloads target Jinja2, Mako, Freemarker, ERB, EJS, and Pebble engines
-- Time-delay payloads target Jinja2, Twig, Mako, ERB, and Freemarker engines
-- Time-delay uses triple verification (slow, fast, slow) to reduce false positives
-- OAST findings arrive asynchronously via polling callbacks
+**How it's exploited:** Confirmed via an out-of-band callback — a shell nslookup, or a pure-JVM DNS/URL resolution where process execution is sandboxed — or paired heavy/trivial loops whose delay flags a time-based signal. An attacker escalates to remote code execution.
 
-## References
-- https://portswigger.net/research/server-side-template-injection
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/18-Testing_for_Server-Side_Template_Injection`
+**Fix:** Never pass untrusted input into template source; render user data only through escaped variables.`
 
 	ModuleConfirmation = "Confirmed via OAST DNS callback from template evaluation or consistent time-delay differential"
 	ModuleSeverity     = severity.Critical

@@ -12,17 +12,24 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/audit/bin"
+	"github.com/vigolium/vigolium/pkg/browserprobe"
 	"github.com/vigolium/vigolium/pkg/cftbrowser"
 	"github.com/vigolium/vigolium/pkg/database"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
 	"github.com/vigolium/vigolium/pkg/olium/auth"
 	"github.com/vigolium/vigolium/pkg/piolium"
 	"github.com/vigolium/vigolium/pkg/queue"
 )
+
+// browserLaunchProbe smoke-launches a resolved browser binary to prove it can
+// actually render, not just print a version. Indirected through a var so tests
+// can stub it (a real probe spawns a headless browser). See checkChromium.
+var browserLaunchProbe = browserprobe.Launchable
 
 // validReasoningEfforts is the set of values accepted by olium's reasoning_effort knob.
 var validReasoningEfforts = map[string]struct{}{
@@ -32,6 +39,7 @@ var validReasoningEfforts = map[string]struct{}{
 	"medium":  {},
 	"high":    {},
 	"xhigh":   {},
+	"max":     {}, // Anthropic-only; the Responses providers clamp it down
 }
 
 // Status represents the state of a diagnostic check.
@@ -61,6 +69,11 @@ type AgentCheck struct {
 	Message      string   `json:"message,omitempty"`
 	Details      []string `json:"details,omitempty"`
 	Tip          string   `json:"tip,omitempty"`
+	// Unverified marks a provider reached over an endpoint whose
+	// configuration is complete but which was not contacted: plain doctor
+	// does not probe it, `doctor --for agent` does. Endpoint names it.
+	Unverified bool   `json:"unverified,omitempty"`
+	Endpoint   string `json:"endpoint,omitempty"`
 }
 
 // ToolCheck holds the outcome of a third-party tool check.
@@ -76,6 +89,9 @@ type ToolCheck struct {
 type Report struct {
 	Status           Status                  `json:"status"` // "ready", "degraded", "not_ready"
 	Timestamp        string                  `json:"timestamp"`
+	Config           *CheckResult            `json:"config"`
+	Scope            *CheckResult            `json:"scope"`
+	OAST             *CheckResult            `json:"oast"`
 	Database         *CheckResult            `json:"database"`
 	Initialized      *CheckResult            `json:"initialized"`
 	Queue            *CheckResult            `json:"queue,omitempty"`
@@ -88,6 +104,11 @@ type Report struct {
 	Tools            map[string]*ToolCheck   `json:"tools"`
 	TemplatesDir     *CheckResult            `json:"templates_dir"`
 	NucleiTemplates  *CheckResult            `json:"nuclei_templates"`
+	// Skill is the coding-agent skill install check. The CLI fills it in after
+	// Run (it needs the binary's version and embedded bundle), so the server's
+	// /diagnostics leaves it nil. It never moves Status: a stale skill does
+	// not stop a scan.
+	Skill *CheckResult `json:"skill,omitempty"`
 }
 
 // Deps provides the dependencies needed to run diagnostics.
@@ -97,9 +118,46 @@ type Deps struct {
 	// DBErr carries the error from opening the database when DB is nil. The
 	// CLI populates this so checkDatabase can surface real connect failures
 	// (refused, auth failed, unknown host) instead of "not configured".
-	DBErr    error
-	Queue    queue.Queue
-	Settings *config.Settings
+	DBErr error
+	// ConfigErr carries the error from loading the configuration file when
+	// Settings fell back to defaults. doctor exists to REPORT broken state, so a
+	// config it could not read must be a failed check here rather than a log line
+	// nobody sees next to a report that says everything is fine.
+	ConfigErr error
+	// ConfigPath is the file the CLI actually resolved, so a report run with
+	// --config names the file it read rather than the default location. Empty
+	// falls back to the default path.
+	ConfigPath string
+	Queue      queue.Queue
+	Settings   *config.Settings
+	// ProbeBrowserLaunch, when set, makes the chromium check actually launch the
+	// resolved browser headless (catching a binary that passes --version but
+	// crashes on real startup). It spawns a browser process (~1-2s), so only the
+	// one-shot CLI paths (doctor, first-run init) enable it; the server
+	// /diagnostics endpoint leaves it off to stay a cheap, poll-safe readout.
+	ProbeBrowserLaunch bool
+	// ProbeNetwork, when set, lets the OAST check resolve the interactsh server
+	// and open one TLS connection to it (3s budget, no registration). Like
+	// ProbeBrowserLaunch it is set by the CLI doctor only; the server
+	// /diagnostics endpoint leaves it off so a poll never touches the network.
+	ProbeNetwork bool
+	// Include, when set, selects the checks to run by check id (the ids
+	// Report.Checks lists; `doctor --only`): a check it refuses never runs —
+	// no chromium launch, no jstangle extraction, no OAST resolution — and is
+	// absent from the report, whose Status is the verdict over the checks that
+	// ran. nil runs every check. The PATH lookups for the tools other than
+	// chromium always run: they are cheap, and the pi/piolium tips and the
+	// --fix dependency graph read them.
+	Include func(id string) bool
+}
+
+// AllCheckIDs lists every check id Run can report from the CLI (queue needs
+// Deps.Queue and is the server's), in Report.Checks order: what an Include
+// predicate and a `doctor --only` token choose among.
+func AllCheckIDs() []string {
+	return []string{"config", "scope", "database", "initialized", "chromium", "nuclei_templates", "jstangle", "oast",
+		"agent", "sessions_dir", "templates_dir", "browser", "audit", "vigolium-audit", "piolium",
+		"bun", "claude", "agent-browser", "pi", "codex", "npm", "skill"}
 }
 
 // AuditPathStatus describes one of the two driver paths under "Audit mode"
@@ -155,23 +213,35 @@ func Run(deps Deps) *Report {
 		Timestamp: time.Now().Format(time.RFC3339),
 		Tools:     make(map[string]*ToolCheck),
 	}
+	run := func(id string) bool { return deps.Include == nil || deps.Include(id) }
 
-	r.Database = checkDatabase(deps.DB, deps.DBErr)
-	r.Initialized = checkInitMarker()
-	r.Queue = checkQueue(deps.Queue)
-	r.Agent = checkAgent(settings)
-	r.Browser = checkBrowser(settings)
-	chromiumFallbacks := []string{"chromium-browser", "google-chrome", "google-chrome-stable"}
-	if runtime.GOOS == "darwin" {
-		chromiumFallbacks = append(chromiumFallbacks,
-			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-			"/Applications/Chromium.app/Contents/MacOS/Chromium",
-			"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-		)
+	if run("config") {
+		r.Config = checkConfig(deps.ConfigPath, deps.ConfigErr)
 	}
-	r.Tools["chromium"] = checkTool("chromium", chromiumFallbacks)
+	if run("scope") {
+		r.Scope = checkScope(settings)
+	}
+	if run("oast") {
+		r.OAST = checkOAST(settings, deps.ProbeNetwork)
+	}
+	if run("database") {
+		r.Database = checkDatabase(deps.DB, deps.DBErr)
+	}
+	if run("initialized") {
+		r.Initialized = checkInitMarker()
+	}
+	if run("queue") {
+		r.Queue = checkQueue(deps.Queue)
+	}
+	if run("agent") {
+		r.Agent = checkAgent(settings)
+	}
+	if run("browser") {
+		r.Browser = checkBrowser(settings)
+	}
+	if run("chromium") {
+		r.Tools["chromium"] = checkChromium(deps.ProbeBrowserLaunch)
+	}
 	r.Tools["bun"] = checkTool("bun", []string{config.ExpandPath("~/.bun/bin/bun")})
 	r.Tools["npm"] = checkTool("npm", nil)
 	r.Tools["agent-browser"] = checkTool("agent-browser", nil)
@@ -197,33 +267,47 @@ func Run(deps Deps) *Report {
 		t.Tip = "install with `bun add -g @openai/codex` — needed for `vigolium agent audit --driver=audit` (codex platform)"
 	}
 
-	// If no system chromium found, check CfT cache only (no download).
-	if r.Tools["chromium"].Status != StatusOK {
-		if cftbrowser.IsSupported() {
-			if cached, err := cftbrowser.FindCachedBrowser(); err == nil {
-				r.Tools["chromium"] = &ToolCheck{
-					Status:  StatusOK,
-					Path:    cached,
-					Message: "Chrome for Testing (cached)",
-					Details: []string{fmt.Sprintf("found cached Chrome for Testing: %s", cached)},
-				}
-			}
-		}
-	}
-	// Still nothing? Attach a package-manager-specific install hint so the
-	// user can either grab a system chromium or fall back to the bundled
-	// Chrome for Testing download.
-	if t := r.Tools["chromium"]; t != nil && t.Status != StatusOK {
-		t.Tip = chromiumInstallHint()
+	if run("sessions_dir") {
+		r.SessionsDir = checkSessionsDir(settings)
 	}
 
-	r.SessionsDir = checkSessionsDir(settings)
-	r.EmbeddedBinaries = map[string]*CheckResult{
-		"jsscan":         checkJSScanBinary(),
-		"vigolium-audit": checkAuditBinary(),
+	// The two embedded-binary probes and the piolium probe each block on a
+	// subprocess (jstangle extraction + JS probe, `vigolium-audit list`, and
+	// `pi -h`). Run serially they sum to ~10s on a machine that has all three
+	// installed; run concurrently the wall time is bounded by the slowest single
+	// probe. Each goroutine writes only its own local, so the shared Report and
+	// its maps are populated single-threaded after the join — no data race.
+	// The audit check reads the vigolium-audit probe, so an enabled audit
+	// runs that probe when selected even if vigolium-audit itself is not.
+	var (
+		probeWG       sync.WaitGroup
+		jstangleCheck *CheckResult
+		auditBinCheck *CheckResult
+		pioliumCheck  *CheckResult
+	)
+	probe := func(on bool, dst **CheckResult, fn func() *CheckResult) {
+		if !on {
+			return
+		}
+		probeWG.Add(1)
+		go func() { defer probeWG.Done(); *dst = fn() }()
 	}
-	r.Audit = checkAudit(settings, r.EmbeddedBinaries["vigolium-audit"])
-	r.Piolium = checkPiolium()
+	probe(run("jstangle"), &jstangleCheck, jstangleProbe)
+	probe(run("vigolium-audit") || (run("audit") && settings.Agent.Audit.IsEnabled()), &auditBinCheck, auditBinaryProbe)
+	probe(run("piolium"), &pioliumCheck, pioliumProbe)
+	probeWG.Wait()
+
+	r.EmbeddedBinaries = map[string]*CheckResult{}
+	if run("jstangle") {
+		r.EmbeddedBinaries["jstangle"] = jstangleCheck
+	}
+	if run("vigolium-audit") {
+		r.EmbeddedBinaries["vigolium-audit"] = auditBinCheck
+	}
+	if run("audit") {
+		r.Audit = checkAudit(settings, auditBinCheck)
+	}
+	r.Piolium = pioliumCheck
 	// When claude (Path A) is available, frame a missing piolium as optional
 	// rather than a problem to fix — the user already has a working audit
 	// driver. The status stays as-is (still reflects whether piolium itself
@@ -232,15 +316,108 @@ func Run(deps Deps) *Report {
 	if r.Piolium != nil && r.Piolium.Status != StatusOK && claudeOK {
 		r.Piolium.Tip = "optional — claude (Path A) is available; install only if you also want the piolium driver: `vigolium doctor --fix --only piolium`"
 	}
-	r.TemplatesDir = checkTemplatesDir(settings)
-	r.NucleiTemplates = checkNucleiTemplates(settings)
+	if run("templates_dir") {
+		r.TemplatesDir = checkTemplatesDir(settings)
+	}
+	if run("nuclei_templates") {
+		r.NucleiTemplates = checkNucleiTemplates(settings)
+	}
 
-	r.Status = computeOverallStatus(r)
+	r.Status = computeOverallStatus(r, run("database"))
 	return r
+}
+
+// The subprocess probes Run starts, replaceable in tests.
+var (
+	jstangleProbe    = checkJSTangleBinary
+	auditBinaryProbe = checkAuditBinary
+	pioliumProbe     = checkPiolium
+)
+
+// checkChromium resolves the chromium the browser crawl would launch: a
+// system browser, else a cached Chrome for Testing; launch, when set, starts
+// it headless to prove it runs (probeChromium). A missing one carries a
+// package-manager install hint.
+func checkChromium(launch bool) *ToolCheck {
+	chromiumFallbacks := []string{"chromium-browser", "google-chrome", "google-chrome-stable"}
+	if runtime.GOOS == "darwin" {
+		chromiumFallbacks = append(chromiumFallbacks,
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+		)
+	}
+	t := checkTool("chromium", chromiumFallbacks)
+	if launch {
+		t = probeChromium(t)
+	}
+	// If no system chromium found, check CfT cache only (no download).
+	if t.Status != StatusOK && cftbrowser.IsSupported() {
+		if cached, err := cftbrowser.FindCachedBrowser(); err == nil {
+			t = &ToolCheck{
+				Status:  StatusOK,
+				Path:    cached,
+				Message: "Chrome for Testing (cached)",
+				Details: []string{fmt.Sprintf("found cached Chrome for Testing: %s", cached)},
+			}
+		}
+	}
+	// Still nothing? Attach a package-manager-specific install hint so the
+	// user can either grab a system chromium or fall back to the bundled
+	// Chrome for Testing download. A launch-failure downgrade already carries a
+	// more specific tip (see probeChromium), so don't clobber it.
+	if t.Status != StatusOK && t.Tip == "" {
+		t.Tip = chromiumInstallHint()
+	}
+	return t
+}
+
+// checkConfig reports whether the configuration file loaded. A nil error means
+// either a clean load or no config file at all — both are fine, and the message
+// names the resolved path so the operator can tell which.
+func checkConfig(configPath string, cfgErr error) *CheckResult {
+	path := configPath
+	if path == "" {
+		path = config.ConfigFilePath()
+	}
+	if cfgErr == nil {
+		if _, err := os.Stat(path); err != nil {
+			return &CheckResult{Status: StatusOK, Message: "no config file — using built-in defaults"}
+		}
+		return &CheckResult{Status: StatusOK, Message: config.ContractPath(path)}
+	}
+	var loadErr *config.LoadError
+	if errors.As(cfgErr, &loadErr) {
+		path = loadErr.Path
+	}
+	return &CheckResult{
+		Status:  StatusError,
+		Message: fmt.Sprintf("%s could not be loaded — running on built-in defaults", config.ContractPath(path)),
+		Details: []string{cfgErr.Error()},
+		Tip:     "fix the file or pass a different --config; every other check below reflects DEFAULT settings, not yours.",
+	}
 }
 
 func checkDatabase(db *database.DB, dbErr error) *CheckResult {
 	if db == nil {
+		if errors.Is(dbErr, database.ErrSchemaTooNew) {
+			return &CheckResult{
+				Status:  StatusError,
+				Message: "schema_too_new",
+				Details: []string{dbErr.Error(), fmt.Sprintf("this binary: schema v%d", database.CurrentSchemaVersion())},
+				Tip:     "A newer vigolium migrated this database. Upgrade vigolium (`vigolium update`) to read or write it.",
+			}
+		}
+		if errors.Is(dbErr, database.ErrSchemaOutdated) {
+			return &CheckResult{
+				Status:  StatusError,
+				Message: "schema_outdated",
+				Details: []string{dbErr.Error()},
+				Tip:     "Run `vigolium db migrate`, or set database.auto_migrate_on_read: true.",
+			}
+		}
 		if dbErr != nil {
 			return &CheckResult{
 				Status:  StatusError,
@@ -306,6 +483,35 @@ func checkDatabase(db *database.DB, dbErr error) *CheckResult {
 	}
 	details = append(details, fmt.Sprintf("schema: %d tables present", len(tables)))
 
+	// Schema compatibility (schema_meta): which revision the store is at, the
+	// oldest reader it admits, and which build last migrated it.
+	metaCtx, metaCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer metaCancel()
+	if info, err := db.SchemaInfo(metaCtx); err == nil {
+		line := fmt.Sprintf("schema version: v%d (min reader v%d; this binary v%d)",
+			info.Version, info.MinReaderVersion, database.CurrentSchemaVersion())
+		if info.WrittenBy != "" {
+			line += ", written by " + info.WrittenBy
+		}
+		details = append(details, line)
+		if info.Version > database.CurrentSchemaVersion() {
+			return &CheckResult{
+				Status:  StatusWarning,
+				Message: fmt.Sprintf("driver=%s, schema=newer (v%d > v%d)", driver, info.Version, database.CurrentSchemaVersion()),
+				Details: append(details, "reads work; writes (scans, ingest, imports) are refused with schema_too_new"),
+				Tip:     "A newer vigolium migrated this database. Upgrade vigolium (`vigolium update`) before scanning into it.",
+			}
+		}
+		if info.Version < database.CurrentSchemaVersion() {
+			return &CheckResult{
+				Status:  StatusWarning,
+				Message: fmt.Sprintf("driver=%s, schema=outdated (v%d < v%d)", driver, info.Version, database.CurrentSchemaVersion()),
+				Details: details,
+				Tip:     "Run `vigolium db migrate` to upgrade it.",
+			}
+		}
+	}
+
 	return &CheckResult{
 		Status:  StatusOK,
 		Message: fmt.Sprintf("driver=%s, schema=ok", driver),
@@ -313,9 +519,9 @@ func checkDatabase(db *database.DB, dbErr error) *CheckResult {
 	}
 }
 
-// checkInitMarker inspects ~/.vigolium/initialized, the sentinel written by
-// ensureCoreDeps after the first-run dependency setup (chromium + nuclei
-// templates) completes. The marker is a status/debugging surface — its
+// checkInitMarker inspects ~/.vigolium/initialized, the sentinel written once
+// chromium and nuclei templates have both been seen present (by the scan
+// bootstrap's check, doctor, or `vigolium init`). The marker is a status/debugging surface — its
 // absence here just means the user has not yet run a scan-touching command,
 // not that anything is broken — so the result is StatusWarning at worst and
 // never affects overall readiness.
@@ -337,7 +543,7 @@ func checkInitMarker() *CheckResult {
 				Status:  StatusWarning,
 				Message: "first-run dep setup not yet completed",
 				Details: details,
-				Tip:     "Run any scan command (e.g. `vigolium scan-url <target>`) or `vigolium init` to trigger the chromium + nuclei-templates install and stamp the marker.",
+				Tip:     "Run `vigolium doctor --fix --only chrome,nuclei` (or `vigolium init`) to install chromium + nuclei-templates and stamp the marker; otherwise the first --spider / known-issue scan fetches them.",
 			}
 		}
 		return &CheckResult{
@@ -507,7 +713,9 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 				Tip:      "Run `claude setup-token` and export the result as $ANTHROPIC_API_KEY, or set agent.olium.oauth_token in ~/.vigolium/vigolium-configs.yaml.",
 			}
 		}
-	case "openai-api-key":
+	case "openai-api-key", "openai-responses":
+		// openai-responses uses the same OpenAI key resolution as openai-api-key;
+		// only the wire format differs (Responses vs Chat Completions).
 		if cfg.LLMAPIKey == "" && os.Getenv("OPENAI_API_KEY") == "" {
 			return &AgentCheck{
 				Status:   StatusError,
@@ -544,17 +752,19 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 		if envPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); envPath != "" {
 			details = append(details, fmt.Sprintf("GOOGLE_APPLICATION_CREDENTIALS: %s", envPath))
 		}
-	case "openai-compatible":
-		// Any backend speaking the OpenAI Chat Completions wire format
-		// (Ollama, LM Studio, vLLM, OpenRouter, …). base_url is the only
-		// hard requirement; api_key is optional (local backends omit it).
+	case "openai-compatible", "anthropic-compatible":
+		// A backend fronting a custom base_url — openai-compatible speaks the
+		// OpenAI Chat Completions wire format (Ollama, LM Studio, vLLM,
+		// OpenRouter, …); anthropic-compatible speaks the Anthropic Messages
+		// format against a gateway/proxy. Both require base_url + a model;
+		// api_key is optional (local backends omit it).
 		baseURL := cfg.CustomProvider.BaseURL
 		if baseURL == "" {
 			return &AgentCheck{
 				Status:   StatusError,
 				Name:     "olium",
 				Protocol: provider,
-				Message:  "openai-compatible provider requires a base URL",
+				Message:  fmt.Sprintf("%s provider requires a base URL", provider),
 				Details:  details,
 				Tip:      "Set agent.olium.custom_provider.base_url in ~/.vigolium/vigolium-configs.yaml (e.g. `http://localhost:11434/v1` for Ollama).",
 			}
@@ -565,7 +775,7 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 				Status:   StatusError,
 				Name:     "olium",
 				Protocol: provider,
-				Message:  "openai-compatible provider requires a model",
+				Message:  fmt.Sprintf("%s provider requires a model", provider),
 				Details:  details,
 				Tip:      "Set agent.olium.model or agent.olium.custom_provider.model_id in ~/.vigolium/vigolium-configs.yaml.",
 			}
@@ -577,17 +787,26 @@ func checkAgent(settings *config.Settings) *AgentCheck {
 			Protocol: provider,
 			Message:  fmt.Sprintf("unknown olium provider %q", provider),
 			Details:  details,
-			Tip:      "Set agent.olium.provider to one of: openai-codex-oauth, openai-api-key, anthropic-api-key, anthropic-oauth, anthropic-cli, anthropic-vertex, google-vertex, openai-compatible.",
+			Tip:      "Set agent.olium.provider to one of: openai-codex-oauth, openai-api-key, openai-responses, anthropic-api-key, anthropic-oauth, anthropic-cli, anthropic-vertex, google-vertex, openai-compatible, anthropic-compatible.",
 		}
 	}
 
-	return &AgentCheck{
+	out := &AgentCheck{
 		Status:   StatusOK,
 		Name:     "olium",
 		Protocol: provider,
 		Binary:   binary,
 		Details:  details,
 	}
+	// A provider behind an endpoint (Ollama, LM Studio, a gateway) is only
+	// configured here, not reached: say so rather than report it ready.
+	if provider == "openai-compatible" || provider == "anthropic-compatible" {
+		out.Unverified = true
+		out.Endpoint = cfg.CustomProvider.BaseURL
+		out.Message = fmt.Sprintf("%s endpoint %s not contacted", provider, cfg.CustomProvider.BaseURL)
+		out.Tip = "Run `vigolium doctor --for agent` to probe the endpoint."
+	}
+	return out
 }
 
 func checkBrowser(settings *config.Settings) *CheckResult {
@@ -664,11 +883,21 @@ func checkSessionsDir(settings *config.Settings) *CheckResult {
 			Tip:     "Fix directory permissions on " + dir + " or set agent.sessions_dir to a writable path.",
 		}
 	}
-	return &CheckResult{
+	res := &CheckResult{
 		Status:  StatusOK,
 		Message: fmt.Sprintf("path=%s", config.ContractPath(dir)),
 		Details: details,
 	}
+	if m, err := ReadTemplatesMarker(dir); err == nil {
+		res.Message += fmt.Sprintf(", version=%s", m.Version)
+		if want := settings.KnownIssueScan.TemplatesVersion; want != "" && want != m.Version {
+			res.Tip = fmt.Sprintf("installed %s but known_issue_scan.templates_version pins %s — run `vigolium doctor --fix --only nuclei`", m.Version, want)
+		}
+	}
+	if age, ok := TemplatesAge(dir); ok && age > templatesStaleAge && res.Tip == "" {
+		res.Tip = fmt.Sprintf("templates are %d days old — refresh with `vigolium doctor --fix --only nuclei`", int(age.Hours()/24))
+	}
+	return res
 }
 
 // probeWritable verifies the given directory accepts a temp file. The probe is
@@ -695,7 +924,7 @@ func checkAudit(settings *config.Settings, auditBinary *CheckResult) *CheckResul
 	mode := settings.Agent.Audit.EffectiveMode()
 	details := []string{fmt.Sprintf("mode: %s", mode)}
 	if auditBinary == nil {
-		auditBinary = checkAuditBinary()
+		auditBinary = auditBinaryProbe()
 	}
 	details = append(details, auditBinary.Details...)
 	if auditBinary.Status != StatusOK {
@@ -713,19 +942,19 @@ func checkAudit(settings *config.Settings, auditBinary *CheckResult) *CheckResul
 	}
 }
 
-func checkJSScanBinary() *CheckResult {
+func checkJSTangleBinary() *CheckResult {
 	details := []string{
 		fmt.Sprintf("runtime: %s/%s", runtime.GOOS, runtime.GOARCH),
-		"extracting embedded jsscan and validating cache checksum",
+		"extracting embedded jstangle and validating cache checksum",
 	}
 
-	scanner, err := jsscan.NewScanner(jsscan.DefaultConfig())
+	scanner, err := jstangle.NewScanner(jstangle.DefaultConfig())
 	if err != nil {
 		return &CheckResult{
 			Status:  StatusError,
 			Message: fmt.Sprintf("not available: %v", err),
 			Details: details,
-			Tip:     "This installed Vigolium binary does not contain a usable jsscan for this platform. Reinstall the latest release; if it persists, report the package platform and `vigolium version` output.",
+			Tip:     "This installed Vigolium binary does not contain a usable jstangle for this platform. Reinstall the latest release; if it persists, report the package platform and `vigolium version` output.",
 		}
 	}
 	if err := scanner.EnsureBinary(); err != nil {
@@ -742,18 +971,48 @@ func checkJSScanBinary() *CheckResult {
 	details = append(details,
 		fmt.Sprintf("path: %s", config.ContractPath(path)),
 		fmt.Sprintf("sha256: %s", checksum),
+	)
+
+	capabilities, err := scanner.Capabilities()
+	if err != nil {
+		return &CheckResult{
+			Status:  StatusError,
+			Message: fmt.Sprintf("capability handshake failed: %v", err),
+			Details: details,
+			Tip:     "The embedded helper and Go wrapper use incompatible protocols. Rebuild with `make ensure-jstangle`, or reinstall a matching Vigolium release.",
+		}
+	}
+	details = append(details,
+		fmt.Sprintf("protocol: v%d", capabilities.ProtocolVersion),
+		fmt.Sprintf("tool version: %s", capabilities.ToolVersion),
+		fmt.Sprintf("source hash: %s", capabilities.SourceHash),
+		fmt.Sprintf("profiles: %s", strings.Join(capabilities.Profiles, ", ")),
+		fmt.Sprintf("capabilities: %s", strings.Join(capabilities.Capabilities, ", ")),
+		fmt.Sprintf("framing: %s", strings.Join(capabilities.Framing, ", ")),
 		"running JavaScript extraction probe",
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	result, err := scanner.Scan(ctx, []byte(`fetch("/vigolium-doctor-jsscan", {method: "POST", body: JSON.stringify({ok: true})});`))
+	// Run the probe through the worker-pool Service — the same length-prefixed
+	// path production scans use — rather than a one-shot invocation.
+	service, err := jstangle.NewService(nil)
+	if err != nil {
+		return &CheckResult{
+			Status:  StatusError,
+			Message: fmt.Sprintf("worker pool init failed: %v", err),
+			Details: details,
+			Tip:     "The embedded jstangle extracted but its worker pool could not start. Reinstall the correct platform build; if it persists, report the package platform and this doctor output.",
+		}
+	}
+	defer func() { _ = service.Close() }()
+	result, err := service.ScanWithOptions(ctx, []byte(`fetch("/vigolium-doctor-jstangle", {method: "POST", body: JSON.stringify({ok: true})});`), jstangle.ScanOptions{Profile: jstangle.ProfileEndpoints})
 	if err != nil {
 		return &CheckResult{
 			Status:  StatusError,
 			Message: fmt.Sprintf("probe failed: %v", err),
 			Details: details,
-			Tip:     "The embedded jsscan extracted but could not execute. Reinstall the correct platform build; if it persists, report the package platform and this doctor output.",
+			Tip:     "The embedded jstangle extracted but could not execute. Reinstall the correct platform build; if it persists, report the package platform and this doctor output.",
 		}
 	}
 
@@ -766,24 +1025,65 @@ func checkJSScanBinary() *CheckResult {
 	details = append(details, fmt.Sprintf("probe: ok, requests=%d, bytes=%d", requests, bytesScanned))
 
 	return &CheckResult{
-		Status:  StatusOK,
-		Message: fmt.Sprintf("runtime=%s/%s, probe=ok", runtime.GOOS, runtime.GOARCH),
+		Status: StatusOK,
+		Message: fmt.Sprintf("protocol=v%d, source=%s, capabilities=%d, probe=ok",
+			capabilities.ProtocolVersion, shortDigest(capabilities.SourceHash), len(capabilities.Capabilities)),
 		Details: details,
 	}
 }
 
+func shortDigest(value string) string {
+	if len(value) <= 12 {
+		return value
+	}
+	return value[:12]
+}
+
 func checkAuditBinary() *CheckResult {
+	st := bin.Status()
 	details := []string{
 		fmt.Sprintf("runtime: %s/%s", runtime.GOOS, runtime.GOARCH),
-		"extracting embedded vigolium-audit and validating executable platform",
+		fmt.Sprintf("source: %s", st.Source),
+	}
+	if st.SHA256 != "" {
+		details = append(details, fmt.Sprintf("pinned sha256: %s (%d bytes uncompressed)", st.SHA256, st.Size))
+	}
+	if st.Source == bin.SourceDownload && st.Origin != "" {
+		details = append(details, fmt.Sprintf("download: %s", st.Origin))
+	}
+	if st.Path != "" {
+		details = append(details, fmt.Sprintf("cache: %s (installed=%t)", config.ContractPath(st.Path), st.Cached))
+	}
+
+	// An audit_external build fetches the helper on first use. A plain doctor
+	// run reports that without downloading; `--fix` prefetches it.
+	if st.Source == bin.SourceDownload && st.Err == nil && !st.Cached {
+		return &CheckResult{
+			Status:  StatusWarning,
+			Message: "vigolium-audit helper not downloaded yet",
+			Details: details,
+			Tip:     "It is fetched on first audit use. Prefetch it now with `vigolium doctor --fix --only vigolium-audit`, or set " + bin.BinaryEnv + "=/path/to/vigolium-audit for an offline install.",
+		}
+	}
+	if st.Source == bin.SourceDownload && st.Err != nil {
+		return &CheckResult{
+			Status:  StatusError,
+			Message: fmt.Sprintf("vigolium-audit helper unavailable: %v", st.Err),
+			Details: details,
+			Tip:     "This build downloads vigolium-audit instead of embedding it. Set " + bin.BaseURLEnv + " to an https mirror of the pinned helper, or " + bin.BinaryEnv + "=/path/to/vigolium-audit.",
+		}
 	}
 
 	if !bin.Available() {
+		msg, tip := "vigolium-audit binary not embedded", "This installed Vigolium binary does not contain vigolium-audit. Reinstall the latest release; source builds should use `make build` or `make release`, not raw `go build`."
+		if st.Source == bin.SourceOverride {
+			msg, tip = fmt.Sprintf("%s is not usable: %v", bin.BinaryEnv, st.Err), "Point "+bin.BinaryEnv+" at an executable vigolium-audit, or unset it to use the built-in helper."
+		}
 		return &CheckResult{
 			Status:  StatusError,
-			Message: "vigolium-audit binary not embedded",
+			Message: msg,
 			Details: details,
-			Tip:     "This installed Vigolium binary does not contain vigolium-audit. Reinstall the latest release; source builds should use `make build` or `make release`, not raw `go build`.",
+			Tip:     tip,
 		}
 	}
 
@@ -795,6 +1095,9 @@ func checkAuditBinary() *CheckResult {
 		}
 		if errors.Is(err, bin.ErrBinaryPlatformMismatch) {
 			tip = "The installed Vigolium package embedded a vigolium-audit binary for the wrong OS/arch. Reinstall the latest release; if it persists, report this as a packaging bug."
+		}
+		if errors.Is(err, bin.ErrChecksumMismatch) {
+			tip = "The vigolium-audit helper did not match its pinned sha256 and was not installed. Reinstall Vigolium; if it persists, report this doctor output."
 		}
 		return &CheckResult{
 			Status:  StatusError,
@@ -905,6 +1208,38 @@ func chromiumInstallHint() string {
 	}
 }
 
+// probeChromium hardens a resolved chromium ToolCheck by actually launching the
+// binary headless. A binary on PATH that prints a version is NOT proof it runs:
+// some distro Chromium builds crash on real headless startup (e.g. SIGTRAP on a
+// KVM guest) and a downloaded Chrome can miss a shared library — both pass a
+// `--version` check yet fail every spider. When the launch probe fails, the row
+// is downgraded to a warning so the Chrome-for-Testing fallback (and the
+// `--fix --only chrome` install) takes over instead of the doctor reporting a
+// browser that will fail at scan time. A row that wasn't resolved, or has no
+// path, is returned unchanged.
+func probeChromium(t *ToolCheck) *ToolCheck {
+	if t == nil || t.Status != StatusOK || t.Path == "" {
+		return t
+	}
+	if err := browserLaunchProbe(t.Path); err != nil {
+		return &ToolCheck{
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("%s found but failed to launch headless", t.Path),
+			Details: append(append([]string{}, t.Details...),
+				fmt.Sprintf("launch probe failed: %v", err),
+				"a --version check passes but the browser crashes on real startup"),
+			// A launch-failure needs a different remedy than "not found": the
+			// system browser is present but broken, so installing more of the
+			// same won't help — download a known-good Chrome for Testing (or
+			// point spidering.browser_path at a working browser). Set here so
+			// the generic install hint below doesn't override it.
+			Tip: "system browser crashes on launch — run `vigolium doctor --fix --only chrome` to download a working Chrome for Testing, or set `spidering.browser_path` to a working browser",
+		}
+	}
+	t.Details = append(t.Details, "launch probe: ok")
+	return t
+}
+
 func checkTool(name string, fallbacks []string) *ToolCheck {
 	candidates := append([]string{name}, fallbacks...)
 	details := []string{fmt.Sprintf("searching PATH for candidates: %v", candidates)}
@@ -1004,7 +1339,7 @@ func checkNucleiTemplates(settings *config.Settings) *CheckResult {
 //   - Core: only Database. A DB failure is the single condition that drops
 //     the system to "not_ready" — every scan path needs storage.
 //   - Native scan (vigolium scan / vigolium run): chromium, nuclei templates,
-//     and the embedded jsscan binary. Failures here drop to "degraded" —
+//     and the embedded jstangle binary. Failures here drop to "degraded" —
 //     native scans are partially broken but the rest of the system still works.
 //   - Olium-based agentic modes (autopilot + swarm + query): olium provider,
 //     sessions dir, prompt templates dir, and (when explicitly enabled) the
@@ -1016,9 +1351,23 @@ func checkNucleiTemplates(settings *config.Settings) *CheckResult {
 // missing optional mode would mislead users about what's actually broken.
 // Audit failures still surface as warning rows with install hints; they just
 // don't change the footer line.
-func computeOverallStatus(r *Report) Status {
-	if r.Database == nil || r.Database.Status == StatusError {
+//
+// databaseRan is false when Deps.Include left the database check out: a nil
+// Database then means "not asked about", not "no database".
+func computeOverallStatus(r *Report, databaseRan bool) Status {
+	if (databaseRan && r.Database == nil) || (r.Database != nil && r.Database.Status == StatusError) {
 		return "not_ready"
+	}
+	// Degraded, not not_ready: vigolium runs on defaults without a config file,
+	// so an unreadable one is a real problem that is not a hard stop.
+	if r.Config != nil && r.Config.Status != StatusOK {
+		return "degraded"
+	}
+	// A scope error does not stop vigolium from starting, but every scan drops
+	// the requests the broken rule touches (often all of them). Warnings do not
+	// change the verdict; neither does OAST, whose loss is reported per scan.
+	if r.Scope != nil && r.Scope.Status == StatusError {
+		return "degraded"
 	}
 
 	// Native scan dependencies.
@@ -1029,7 +1378,7 @@ func computeOverallStatus(r *Report) Status {
 		return "degraded"
 	}
 	if r.EmbeddedBinaries != nil {
-		if c := r.EmbeddedBinaries["jsscan"]; c != nil && c.Status != StatusOK {
+		if c := r.EmbeddedBinaries["jstangle"]; c != nil && c.Status != StatusOK {
 			return "degraded"
 		}
 	}

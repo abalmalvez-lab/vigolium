@@ -9,19 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects gRPC-Web protocol usage by inspecting request and response
-Content-Type headers and gRPC-specific response headers.
+	ModuleDesc = `**What it means:** The application exposes a gRPC-Web endpoint, identified passively from gRPC-Web Content-Type headers (application/grpc-web, +proto, -text) or a grpc-status header. An informational fingerprint that reveals an API protocol generic web testing often overlooks.
 
-## Notes
-- Detects gRPC-Web content types (application/grpc-web, application/grpc-web+proto, application/grpc-web-text)
-- Checks for grpc-status response header
-- Checks for gRPC content types in requests
-- Useful for identifying gRPC-Web endpoints for further testing
+**How it's exploited:** Knowing an endpoint speaks gRPC-Web lets an attacker use protocol-aware tooling: enumerating RPC service and method names, fuzzing length-prefixed protobuf messages, and probing each method for missing authorization or business-logic abuse. This mainly accelerates reconnaissance.
 
-## References
-- https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md
-- https://grpc.io/docs/platforms/web/`
+**Fix:** Treat gRPC-Web methods as authenticated, authorized API endpoints with input validation and rate limiting, and avoid exposing internal or debug services through the gateway.`
 
 	ModuleConfirmation = "Confirmed when request or response contains gRPC-Web content types or gRPC-specific headers"
 	ModuleSeverity     = severity.Info

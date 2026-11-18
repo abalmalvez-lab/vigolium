@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
@@ -56,6 +55,22 @@ func ColorSeverity(sev string) string {
 	}
 }
 
+// ColorConfidence colorizes a finding confidence label, matching the palette
+// used in the finding/db summary lines (certain→purple, firm→yellow,
+// tentative→gray). Unknown values are returned unchanged.
+func ColorConfidence(conf string) string {
+	switch strings.ToLower(conf) {
+	case "certain":
+		return terminal.HiPurple(conf)
+	case "firm":
+		return terminal.BoldYellow(conf)
+	case "tentative":
+		return terminal.Gray(conf)
+	default:
+		return conf
+	}
+}
+
 // FormatSeverityWithSymbols renders a one-line summary of severity counts using
 // per-severity symbols, omitting zero-count severities.
 func FormatSeverityWithSymbols(counts map[string]int) string {
@@ -88,15 +103,6 @@ func ValueOrNone(s string) string {
 		return "(none)"
 	}
 	return s
-}
-
-// ParseDate parses a date in YYYY-MM-DD or RFC3339 form.
-func ParseDate(s string) (time.Time, error) {
-	t, err := time.Parse("2006-01-02", s)
-	if err == nil {
-		return t, nil
-	}
-	return time.Parse(time.RFC3339, s)
 }
 
 // FormatTokenCount renders a numeric token count with K/M suffixes.
@@ -154,13 +160,4 @@ func SplitCSV(s string) []string {
 		}
 	}
 	return out
-}
-
-// CSVEscape quotes and escapes s for CSV output when it contains commas,
-// quotes, or newlines.
-func CSVEscape(s string) string {
-	if strings.ContainsAny(s, ",\"\n") {
-		return fmt.Sprintf("\"%s\"", strings.ReplaceAll(s, "\"", "\"\""))
-	}
-	return s
 }

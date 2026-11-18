@@ -9,23 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes common Next.js Draft Mode and Preview Mode API endpoints for missing or weak
-authentication. Draft Mode allows viewing unpublished CMS content by setting special
-cookies (__prerender_bypass, __next_preview_data). If the enabling endpoint lacks
-proper secret validation, attackers can access embargoed or sensitive content.
+	ModuleDesc = `**What it means:** A Next.js endpoint issued a live preview cookie without a valid secret. The cookie is a candidate; repeated stable content that differs from cookie-free controls confirms exposure.
 
-## Notes
-- Runs once per host on Next.js-identified targets
-- Probes common draft/preview API routes with no token and common weak tokens
-- Confirms by detecting __prerender_bypass or __next_preview_data cookies in response
-- Deduplicates by host
+**How it's exploited:** An attacker calls the draft route without its secret, receives a preview cookie, and browses unpublished content.
 
-## References
-- https://nextjs.org/docs/app/guides/draft-mode
-- https://nextjs.org/docs/pages/building-your-application/configuring/preview-mode`
+**Fix:** Require a strong secret on every draft-enabling endpoint, reject mismatches, and ensure exit routes only delete preview cookies.`
 
-	ModuleConfirmation = "Confirmed when a draft/preview endpoint sets bypass cookies without a valid secret"
+	ModuleConfirmation = "Candidate on a live non-deletion preview cookie; confirmed only by a stable cookie-versus-no-cookie content differential on a follow-up route"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"nextjs", "javascript", "misconfiguration", "light"}

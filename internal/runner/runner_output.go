@@ -10,9 +10,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/authentication"
+	hostlimit "github.com/vigolium/vigolium/pkg/core/ratelimit"
 	corestats "github.com/vigolium/vigolium/pkg/core/stats"
+	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/http"
+	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/output"
+	"github.com/vigolium/vigolium/pkg/scanevents"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"go.uber.org/zap"
 )
@@ -26,6 +32,155 @@ func (r *Runner) setPhaseTag(tag string) {
 	if r.teeWriter != nil {
 		r.teeWriter.SetPhase(tag)
 	}
+}
+
+// findingsVisibleOnStdout reports whether findings written via r.output already
+// render to stdout in human-readable form (console format). When false — jsonl/
+// html defer their output to post-scan files, or the run is silent — live
+// findings are otherwise invisible during the scan; see echoLiveFinding.
+func (r *Runner) findingsVisibleOnStdout() bool {
+	if s, ok := r.output.(interface{ ShowsFindingsOnStdout() bool }); ok {
+		return s.ShowsFindingsOnStdout()
+	}
+	return false
+}
+
+// echoLiveFinding renders a finding to stderr (and the session log) as it's
+// discovered, so a scan shows live results even when the stdout result stream is
+// deferred to files (jsonl/html). It's a no-op when findings already stream to
+// stdout in human-readable form (console format), when silent, or for a captured
+// -P child (whose stdout IS the per-target log). The phase status heartbeat,
+// traffic lines, and tech-detect lines all reach stderr independent of --format;
+// this gives findings the same treatment.
+func (r *Runner) echoLiveFinding(phaseTag string, result *output.ResultEvent) {
+	if result == nil || r.options.Silent || r.options.CapturedConsole {
+		return
+	}
+	if r.findingsVisibleOnStdout() {
+		return
+	}
+	line := output.FormatPhaseFindingLine(phaseTag, result)
+	r.writeSessionLog(line)
+	fmt.Fprint(os.Stderr, line)
+}
+
+// FormatBlockNoticeLine renders the one-line WAF/CDN block warning (with a
+// trailing newline) shown when the edge starts filtering scan traffic. It is
+// shared by every scan front-end so the message and the "unrecognized vendor"
+// fallback stay identical whether the scan runs through the Runner or the direct
+// scan-url/scan-request path.
+// NoticeMarkerBlock and NoticeMarkerPacing are the bracketed tags the two
+// operator notices are rendered with. Exported because a reader has to find them
+// again in a rendered log (`vigolium log` reprints any that fell above the tail
+// window) — matching on the marker rather than the prose is deliberate, since
+// the prose is a sentence that gets reworded and the marker is what it tags.
+const (
+	NoticeMarkerBlock  = "[waf-block-detected]"
+	NoticeMarkerPacing = "[waf-pacing-armed]"
+)
+
+func FormatBlockNoticeLine(n http.BlockNotice) string {
+	vendor := n.WAFType
+	if vendor == "" || vendor == "generic" {
+		vendor = "WAF/CDN"
+	}
+	return fmt.Sprintf("%s %s %s %s %s %s\n",
+		terminal.BoldYellow(terminal.SymbolWarning),
+		terminal.BoldYellow(NoticeMarkerBlock),
+		terminal.HiBlue(n.Host),
+		terminal.Muted("→"),
+		terminal.Yellow(fmt.Sprintf("%s (HTTP %d)", vendor, n.Status)),
+		terminal.Muted("edge is filtering scan traffic — results for this host may be incomplete"))
+}
+
+// attachWAFBlockNotifier wires a one-time-per-host WAF/CDN block warning onto the
+// scan's HTTP requester. The first time any scan request to a host comes back as
+// a captcha / bot-detection / challenge page, a prominent warning is printed to
+// stderr (and the session log) so the operator knows the edge is filtering
+// traffic and results against that host are likely incomplete. Fires across every
+// phase (discovery, spidering, dynamic-assessment) since all traffic flows
+// through the shared requester. No-op in silent mode or without a requester.
+// The machine event stream is NOT gated on Silent: --silent asks for a quiet
+// terminal, and a driver that passed both --silent and --events wants exactly
+// that — no console, full stream. So the notifier is installed whenever either
+// consumer wants it, and each consumer decides for itself.
+func (r *Runner) attachWAFBlockNotifier(requester *http.Requester) {
+	if requester == nil {
+		return
+	}
+	console := !r.options.Silent
+	if !console && !scanevents.On() {
+		return
+	}
+	requester.SetBlockNotifier(func(n http.BlockNotice) {
+		if console {
+			r.emitNoticeLine(FormatBlockNoticeLine(n))
+		}
+		emitBlockEvent(n)
+	})
+}
+
+// emitNoticeLine writes a preformatted operator notice to both the session log and
+// stderr — the shared tail of the WAF block/pacing notifiers.
+func (r *Runner) emitNoticeLine(line string) {
+	r.writeSessionLog(line)
+	fmt.Fprint(os.Stderr, line)
+}
+
+// FormatEdgePaceLine renders the one-line notice shown when a host is fingerprinted
+// behind a CDN/WAF edge and its active-scan concurrency is proactively paced to keep
+// a burst from arming a rate-based WAF. It spells out the concurrency drop so the
+// operator understands the scan will run slower against that host. Companion to
+// FormatBlockNoticeLine — a caution, not a failure: the scan continues, just gentler.
+func FormatEdgePaceLine(n hostlimit.PreArmNotice) string {
+	vendor := n.Vendor
+	if vendor == hostlimit.PreArmVendorLocal {
+		return fmt.Sprintf("%s %s %s %s %s %s\n",
+			terminal.Yellow(terminal.SymbolSnow),
+			terminal.BoldYellow(NoticeMarkerPacing),
+			terminal.HiBlue(n.Host),
+			terminal.Muted("→"),
+			terminal.Yellow("local host"),
+			terminal.Muted(fmt.Sprintf("starting per-host concurrency at %d (of %d) and ramping up on clean answers, so a small server is not overrun (disable with --no-waf-pacing)", n.Start, n.From)))
+	}
+	if vendor == "" {
+		vendor = "WAF/CDN"
+	}
+	detail := fmt.Sprintf("pacing per-host concurrency %d→%d to avoid tripping a rate-based WAF — scanning this host will be slower (disable with --no-waf-pacing)",
+		n.From, n.Start)
+	return fmt.Sprintf("%s %s %s %s %s %s\n",
+		terminal.Yellow(terminal.SymbolSnow),
+		terminal.BoldYellow(NoticeMarkerPacing),
+		terminal.HiBlue(n.Host),
+		terminal.Muted("→"),
+		terminal.Yellow(fmt.Sprintf("%s edge", vendor)),
+		terminal.Muted(detail))
+}
+
+// attachWAFPacingNotifier wires a one-time-per-host notice onto the scan's host
+// limiter for proactive CDN/WAF pacing. The first time any phase's traffic to a host
+// reveals a CDN/WAF edge (e.g. CloudFront/Cloudflare headers on a clean 200), the host
+// limiter drops that host's per-host concurrency so the later active phase paces from
+// its first request instead of bursting the edge into a rate-based block. The notice
+// hangs off the limiter — the single shared object every requester feeds — so it fires
+// exactly once per host no matter which requester (heuristics, auth prep, discovery)
+// first tripped the pre-arm. The throttle itself is applied regardless; this only
+// surfaces the operator warning. No-op without a limiter, or when neither the
+// console (silent mode) nor the machine event stream wants the notice.
+func (r *Runner) attachWAFPacingNotifier(limiter *hostlimit.HostRateLimiter) {
+	if limiter == nil {
+		return
+	}
+	console := !r.options.Silent
+	if !console && !scanevents.On() {
+		return
+	}
+	limiter.SetPreArmNotifier(func(n hostlimit.PreArmNotice) {
+		if console {
+			r.emitNoticeLine(FormatEdgePaceLine(n))
+		}
+		emitPacingEvent(n.Host, n.Vendor, n.From, n.Start)
+	})
 }
 
 // printPhaseStart prints a phase start message to stderr.
@@ -44,18 +199,36 @@ func (r *Runner) printPhaseDetail(detail string) {
 	fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolInfo), detail)
 }
 
-// formatTargetCounts builds a standardized "Targets: N (M CLI | K HTTP Records)" string.
+// formatTargetCounts builds a standardized "Targets: N (M input | K HTTP Records)" string.
 // Only HTTP records whose hostname matches the CLI targets are counted.
 func (r *Runner) formatTargetCounts(ctx context.Context, cliCount int) string {
 	var dbCount int64
 	if r.repository != nil {
-		hostnames := r.getInScopeDBHostnamesList(ctx)
-		dbCount, _ = r.repository.CountRecordsAfterCursor(ctx, time.Time{}, "", hostnames...)
+		hosts := r.getInScopeDBHosts(ctx)
+		dbCount, _ = r.repository.CountRecordsAfterCursor(ctx, r.options.ProjectUUID, time.Time{}, "", hosts...)
 	}
-	total := int64(cliCount) + dbCount
-	return fmt.Sprintf("Targets: %s (%s CLI | %s HTTP Records)",
-		terminal.Orange(fmt.Sprintf("%d", total)),
-		terminal.Orange(fmt.Sprintf("%d", cliCount)),
+	// A -T/--target-file (or -i) run carries its targets in the input source, not
+	// in options.Targets, so counting the CLI slice alone printed "0 input" for a
+	// scan that was about to hit dozens of hosts. Take whichever is larger: the
+	// caller's count wins when it is a phase-local target list the source can't
+	// know about.
+	seeded := int64(cliCount)
+	// A database-backed input source (full-scan-on-receive) counts http_records,
+	// which dbCount already reports; adding it as "input" would count them twice.
+	if _, fromDB := r.inputSource.(*database.DBInputSource); !fromDB {
+		if n := source.GetTotal(r.inputSource); n > seeded {
+			seeded = n
+		}
+	}
+	if r.options.ExcludesStoredRecords() {
+		return fmt.Sprintf("Targets: %s (%s input | %s stored HTTP Records not tested: input only)",
+			terminal.Orange(fmt.Sprintf("%d", seeded)),
+			terminal.Orange(fmt.Sprintf("%d", seeded)),
+			terminal.Orange(fmt.Sprintf("%d", dbCount)))
+	}
+	return fmt.Sprintf("Targets: %s (%s input | %s HTTP Records)",
+		terminal.Orange(fmt.Sprintf("%d", seeded+dbCount)),
+		terminal.Orange(fmt.Sprintf("%d", seeded)),
 		terminal.Orange(fmt.Sprintf("%d", dbCount)))
 }
 
@@ -242,7 +415,11 @@ func fmtDuration(d time.Duration) string {
 	return fmt.Sprintf("%dm%ds", m, s)
 }
 
-// logModuleMetrics logs the top modules by total time and findings at debug level.
+// logModuleMetrics logs the top modules by total time and findings.
+//
+// Info, not Debug: five lines per round, and the only view of where a phase's time
+// went. It is emitted next to the pool and clusterer stats, which are already Info
+// — there is no reason this one alone should need --debug.
 func logModuleMetrics(metrics map[string]corestats.ModuleStatsSnapshot) {
 	// Sort by total time descending for top-5 slowest
 	type entry struct {
@@ -263,7 +440,7 @@ func logModuleMetrics(metrics map[string]corestats.ModuleStatsSnapshot) {
 	}
 	for i := 0; i < limit; i++ {
 		e := entries[i]
-		zap.L().Debug("Module metrics",
+		zap.L().Info("Module metrics",
 			zap.String("module", e.id),
 			zap.Int64("invocations", e.snap.Invocations),
 			zap.Int64("findings", e.snap.Findings),
@@ -284,6 +461,11 @@ func (r *Runner) printScanConfig() {
 	settings := r.settings
 
 	fmt.Fprintf(os.Stderr, "\n%s %s\n", terminal.Green(terminal.SymbolStart), terminal.BoldHiBlue("Scan Configuration"))
+	// In stateless mode the scan lives in a throwaway database, so the UUID
+	// can't be used to query results later — printing it is just noise.
+	if opts.ScanUUID != "" && !opts.Stateless {
+		fmt.Fprintf(os.Stderr, "  %s Scan ID: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ScanUUID))
+	}
 	if opts.Stateless {
 		statelessLine := "Stateless mode: using temporary database"
 		if opts.Verbose && settings.Database.SQLite.Path != "" {
@@ -292,11 +474,20 @@ func (r *Runner) printScanConfig() {
 		fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolInfo), statelessLine)
 	}
 
-	if opts.ProjectUUID != "" {
+	// Only surface the project when it's a real, operator-chosen one. The
+	// auto-created default project is implementation noise — printing its UUID
+	// just clutters the header for the common single-project case — and in
+	// stateless mode the project lives in a throwaway database anyway.
+	if opts.ProjectUUID != "" && opts.ProjectUUID != database.DefaultProjectUUID && !opts.Stateless {
 		fmt.Fprintf(os.Stderr, "  %s Project: %s\n", terminal.Purple(terminal.SymbolInfo), terminal.HiTeal(opts.ProjectUUID))
 	}
 
-	strategy := settings.ScanningStrategy.DefaultStrategy
+	// The strategy ApplyScanStrategy resolved for this scan (a REST request's
+	// "strategy" included); the configured default only when none was applied.
+	strategy := opts.ScanningStrategy
+	if strategy == "" {
+		strategy = settings.ScanningStrategy.DefaultStrategy
+	}
 	if strategy == "" {
 		strategy = "default"
 	}
@@ -310,8 +501,12 @@ func (r *Runner) printScanConfig() {
 	targetsLine := fmt.Sprintf("Targets: %s", terminal.Orange(fmt.Sprintf("%d", len(opts.Targets))))
 	if r.repository != nil {
 		ctx := context.Background()
-		hostnames := r.getInScopeDBHostnamesList(ctx)
-		if dbCount, err := r.repository.CountRecordsAfterCursor(ctx, time.Time{}, "", hostnames...); err == nil && dbCount > 0 {
+		hosts := r.getInScopeDBHosts(ctx)
+		if dbCount, err := r.repository.CountRecordsAfterCursor(ctx, r.options.ProjectUUID, time.Time{}, "", hosts...); err == nil && dbCount > 0 && r.options.ExcludesStoredRecords() {
+			targetsLine += fmt.Sprintf(" (CLI: %s | stored HTTP Records not tested: %s)",
+				terminal.Orange(fmt.Sprintf("%d", len(opts.Targets))),
+				terminal.Orange(fmt.Sprintf("%d", dbCount)))
+		} else if err == nil && dbCount > 0 {
 			targetsLine += fmt.Sprintf(" (CLI: %s | HTTP Records: %s)",
 				terminal.Orange(fmt.Sprintf("%d", len(opts.Targets))),
 				terminal.Orange(fmt.Sprintf("%d", dbCount)))
@@ -319,38 +514,14 @@ func (r *Runner) printScanConfig() {
 	}
 	fmt.Fprintf(os.Stderr, "  %s %s\n", terminal.Purple(terminal.SymbolTarget), targetsLine)
 
-	// Phase labels with duration info
-	phaseLabel := func(name, phasePaceKey string, enabled bool) string {
-		label := name
-		if !enabled {
-			return terminal.Gray(terminal.SymbolError) + " " + terminal.Gray(label)
-		}
-		resolved := settings.ScanningPace.ResolvePhase(phasePaceKey)
-		var paceDetail string
-		if resolved.MaxDuration > 0 {
-			paceDetail = resolved.MaxDuration.String()
-		}
-		if resolved.DurationFactor > 0 {
-			if paceDetail != "" {
-				paceDetail += fmt.Sprintf(", x%.1f", resolved.DurationFactor)
-			} else {
-				paceDetail = fmt.Sprintf("x%.1f", resolved.DurationFactor)
-			}
-		}
-		if paceDetail != "" {
-			label += " " + terminal.Gray("("+paceDetail+")")
-		}
-		return terminal.Green(terminal.SymbolSuccess) + " " + terminal.HiCyan(label)
-	}
-
 	fmt.Fprintf(os.Stderr, "  %s Phases: %s | %s | %s\n",
 		terminal.Purple(terminal.SymbolInfo),
-		phaseLabel("ExternalHarvest", "external_harvester", opts.ExternalHarvestEnabled),
-		phaseLabel("Spidering", "spidering", opts.SpideringEnabled),
-		phaseLabel("Discovery", "discovery", opts.DiscoverEnabled))
+		PhaseLabel(settings, "ExternalHarvest", "external_harvester", opts.ExternalHarvestEnabled, 0),
+		PhaseLabel(settings, "Spidering", "spidering", opts.SpideringEnabled, SpideringBudget(settings, opts)),
+		PhaseLabel(settings, "Discovery", "discovery", opts.DiscoverEnabled, DiscoveryBudget(settings, opts)))
 	fmt.Fprintf(os.Stderr, "           %s | %s\n",
-		phaseLabel("KnownIssueScan", "known-issue-scan", opts.KnownIssueScanEnabled),
-		phaseLabel("DynamicAssessment", "dynamic-assessment", !opts.SkipDynamicAssessment))
+		PhaseLabel(settings, "KnownIssueScan", "known-issue-scan", opts.KnownIssueScanEnabled, 0),
+		PhaseLabel(settings, "DynamicAssessment", "dynamic-assessment", !opts.SkipDynamicAssessment, 0))
 
 	// Heuristics
 	heuristicsDesc := map[string]string{
@@ -369,8 +540,8 @@ func (r *Runner) printScanConfig() {
 			terminal.HiTeal(opts.HeuristicsCheck))
 	}
 
-	// Speed
-	rateLimit := settings.ScanningPace.RateLimit
+	// Speed — same source as the limiter that enforces it (effectiveRateLimit).
+	rateLimit := effectiveRateLimit(opts)
 	fmt.Fprintf(os.Stderr, "  %s Speed: concurrency=%s | rate-limit=%s | max-per-host=%s\n",
 		terminal.Purple(terminal.SymbolInfo),
 		terminal.HiBlue(fmt.Sprintf("%d", opts.Concurrency)),
@@ -378,13 +549,7 @@ func (r *Runner) printScanConfig() {
 		terminal.HiBlue(fmt.Sprintf("%d", opts.MaxPerHost)))
 
 	// Scope
-	scopeOrigin := "relaxed"
-	if settings.Scope.CLIOriginMode != "" {
-		scopeOrigin = settings.Scope.CLIOriginMode
-	}
-	if opts.ScopeOriginMode != "" {
-		scopeOrigin = opts.ScopeOriginMode
-	}
+	scopeOrigin := r.resolvedScopeOriginMode()
 	originDesc := map[string]string{
 		"relaxed":  "host must contain the target's keyword",
 		"all":      "no origin restriction, all hosts are in scope",
@@ -400,31 +565,45 @@ func (r *Runner) printScanConfig() {
 		terminal.HiPurple(scopeOrigin),
 		terminal.HiPurple(fmt.Sprintf("%v", settings.Scope.IgnoreStaticFile)),
 		originDescStr)
+	if pol := opts.TrafficPolicy; pol != nil && len(pol.AllowedMethods) > 0 {
+		fmt.Fprintf(os.Stderr, "  %s Methods: %s%s\n",
+			terminal.Purple(terminal.SymbolInfo),
+			terminal.HiPurple(strings.Join(settings.Scope.Methods, ",")),
+			terminal.Gray(map[bool]string{true: " (read-only: no form submission, logins or uploads)", false: ""}[pol.ReadOnly()]))
+	}
+	if r.offline() {
+		fmt.Fprintf(os.Stderr, "  %s Offline: %s\n",
+			terminal.Purple(terminal.SymbolInfo),
+			terminal.Gray("no OAST, external lookups, template or browser downloads, or update checks"))
+	}
 
 	// Modules
-	var activeCount int
+	var activeMods []modules.ActiveModule
 	if len(opts.Modules) > 0 && opts.Modules[0] == "all" {
-		activeCount = len(modules.GetActiveModules())
+		activeMods = modules.GetActiveModules()
 	} else {
-		activeCount = len(modules.GetActiveModulesByIDs(opts.Modules))
+		activeMods = modules.GetActiveModulesByIDs(opts.Modules)
 	}
-	passiveCount := len(modules.GetPassiveModules())
-	fmt.Fprintf(os.Stderr, "  %s Modules: %s active, %s passive\n",
+	passiveMods := modules.GetPassiveModules()
+	activeCount, passiveCount, hygieneNote := HygieneBannerCounts(opts, settings, activeMods, passiveMods)
+	if hygieneNote != "" {
+		hygieneNote = " " + hygieneNote
+	}
+	fmt.Fprintf(os.Stderr, "  %s Modules: %s active, %s passive%s\n",
 		terminal.Purple(terminal.SymbolInfo),
 		terminal.Orange(fmt.Sprintf("%d", activeCount)),
-		terminal.Orange(fmt.Sprintf("%d", passiveCount)))
+		terminal.Orange(fmt.Sprintf("%d", passiveCount)),
+		hygieneNote)
 
 	// Extensions
 	extEnabled := settings != nil && settings.DynamicAssessment.Extensions.Enabled
 	if extEnabled {
-		extCount := 0
-		if r.sharedInfra != nil && r.sharedInfra.JSEngine != nil {
-			extCount = len(r.sharedInfra.JSEngine.ActiveModules()) + len(r.sharedInfra.JSEngine.PassiveModules())
-		}
-		fmt.Fprintf(os.Stderr, "  %s Extensions: %s | %s loaded\n",
+		// No count here: the extension engine is built later, in
+		// buildInfrastructure, so a "N loaded" figure printed now could only
+		// ever have said 0.
+		fmt.Fprintf(os.Stderr, "  %s Extensions: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
-			terminal.HiGreen("enabled"),
-			terminal.HiTeal(fmt.Sprintf("%d", extCount)))
+			terminal.HiGreen("enabled"))
 	} else {
 		fmt.Fprintf(os.Stderr, "  %s Extensions: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
@@ -446,7 +625,17 @@ func (r *Runner) printScanConfig() {
 		printSessionAuth("from inline auth")
 	case totalAuth > 1:
 		printSessionAuth(fmt.Sprintf("from %d auth source(s)", totalAuth))
+	case opts.NoAuth:
+		fmt.Fprintf(os.Stderr, "  %s Session auth: %s\n",
+			terminal.Purple(terminal.SymbolInfo),
+			terminal.Gray("none (--no-auth)"))
 	default:
+		// The scan falls back to the sessions stored for its hosts: say so,
+		// or the banner reads "none" while a stored cookie is sent.
+		if stored, _, ok := r.loadSessionsFromDB(context.Background()); ok {
+			printSessionAuth(fmt.Sprintf("from the database: %s (--no-auth to scan without)", sessionNames(stored)))
+			return
+		}
 		fmt.Fprintf(os.Stderr, "  %s Session auth: %s\n",
 			terminal.Purple(terminal.SymbolInfo),
 			terminal.Gray("none"))
@@ -457,43 +646,61 @@ func (r *Runner) printScanConfig() {
 // metadata entry in the scan logs. This allows API consumers to inspect what
 // settings were active for any historical scan.
 func (r *Runner) logConfigSnapshot() {
+	r.scanLogger.InfoWithMeta("config", "scan configuration snapshot", r.configSnapshotMeta())
+}
+
+// configSnapshotMeta builds the snapshot's key/value map. Split out from the log
+// call so a test can assert what the snapshot claims without a logger, which is
+// how the rate-limit disagreement went unnoticed: the snapshot reported the
+// configured pace while the scan ran at the option's rate.
+func (r *Runner) configSnapshotMeta() map[string]any {
 	opts := r.options
 	settings := r.settings
 
 	strategy := ""
-	rateLimit := 0
+	kisRateLimit := 0
 	if settings != nil {
 		strategy = settings.ScanningStrategy.DefaultStrategy
-		rateLimit = settings.ScanningPace.RateLimit
+		kisRateLimit = settings.ScanningPace.ResolvePhase("known-issue-scan").RateLimit
 	}
 
-	var activeCount int
+	var activeMods []modules.ActiveModule
 	if len(opts.Modules) > 0 && opts.Modules[0] == "all" {
-		activeCount = len(modules.GetActiveModules())
+		activeMods = modules.GetActiveModules()
 	} else {
-		activeCount = len(modules.GetActiveModulesByIDs(opts.Modules))
+		activeMods = modules.GetActiveModulesByIDs(opts.Modules)
 	}
-	passiveCount := len(modules.GetPassiveModules())
+	passiveMods := modules.GetPassiveModules()
 
-	meta := map[string]interface{}{
-		"project_uuid":             opts.ProjectUUID,
-		"targets":                  opts.Targets,
-		"strategy":                 strategy,
-		"scanning_profile":         opts.ScanningProfile,
-		"concurrency":              opts.Concurrency,
-		"rate_limit":               rateLimit,
-		"max_per_host":             opts.MaxPerHost,
-		"heuristics_check":         opts.HeuristicsCheck,
-		"scope_origin_mode":        opts.ScopeOriginMode,
-		"active_modules":           activeCount,
-		"passive_modules":          passiveCount,
-		"spidering_enabled":        opts.SpideringEnabled,
-		"discovery_enabled":        opts.DiscoverEnabled,
-		"known_issue_scan_enabled": opts.KnownIssueScanEnabled,
-		"external_harvest":         opts.ExternalHarvestEnabled,
-		"skip_dynamic":             opts.SkipDynamicAssessment,
+	// The snapshot records what actually ran, so the suppressed hardening
+	// advisories come out of the counts the same way the banner subtracts them.
+	activeCount, passiveCount, _ := HygieneBannerCounts(opts, settings, activeMods, passiveMods)
+	hygieneSuppressed := (len(activeMods) - activeCount) + (len(passiveMods) - passiveCount)
+
+	meta := map[string]any{
+		"project_uuid":     opts.ProjectUUID,
+		"targets":          opts.Targets,
+		"strategy":         strategy,
+		"scanning_profile": opts.ScanningProfile,
+		"concurrency":      opts.Concurrency,
+		// The rate the scan's limiter actually enforces, not the configured pace.
+		"rate_limit": effectiveRateLimit(opts),
+		// Known-issue-scan builds its own limiter from the resolved phase pace, so
+		// it is the one phase whose rate can legitimately differ from the above.
+		"rate_limit_known_issue_scan": kisRateLimit,
+		"max_per_host":                opts.MaxPerHost,
+		"heuristics_check":            opts.HeuristicsCheck,
+		"scope_origin_mode":           r.resolvedScopeOriginMode(),
+		"active_modules":              activeCount,
+		"passive_modules":             passiveCount,
+		"hygiene_modules_off":         hygieneSuppressed,
+		"spidering_enabled":           opts.SpideringEnabled,
+		"discovery_enabled":           opts.DiscoverEnabled,
+		"known_issue_scan_enabled":    opts.KnownIssueScanEnabled,
+		"external_harvest":            opts.ExternalHarvestEnabled,
+		"skip_dynamic":                opts.SkipDynamicAssessment,
 	}
-	r.scanLogger.InfoWithMeta("config", "scan configuration snapshot", meta)
+	return meta
 }
 
 // printVerboseTargets prints up to the first 10 targets when verbose mode is enabled.
@@ -511,4 +718,15 @@ func (r *Runner) printVerboseTargets(targets []string) {
 	if len(targets) > 10 {
 		fmt.Fprintf(os.Stderr, "    %s\n", terminal.Muted(fmt.Sprintf("... and %d more", len(targets)-10)))
 	}
+}
+
+// sessionNames lists session names for a banner.
+func sessionNames(sessions []*authentication.Session) string {
+	names := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		if s != nil {
+			names = append(names, s.Name)
+		}
+	}
+	return strings.Join(names, ", ")
 }

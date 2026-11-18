@@ -5,15 +5,13 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
-	"crypto/tls"
-	"crypto/x509"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math/rand"
-	"net"
+	randv2 "math/rand/v2"
 	"net/url"
 	"os"
 	"path"
@@ -141,6 +139,30 @@ func RandomNumberInRange(from, to int) string {
 	return strconv.Itoa(rand.Intn(to-from+1) + from)
 }
 
+// ALNUM_CHARSET is the mixed-case alphanumeric alphabet used by RandomAlnum.
+const ALNUM_CHARSET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+// RandomOf returns n characters drawn uniformly from charset using the
+// auto-seeded math/rand/v2 global source, which is safe for concurrent use and
+// never repeats just because two calls land in the same clock tick (unlike
+// RandomFromChoices). It returns "" for n <= 0 or an empty charset. Not for
+// secrets: use crypto/rand for anything security-sensitive.
+func RandomOf(n int, charset string) string {
+	if n <= 0 || charset == "" {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = charset[randv2.IntN(len(charset))]
+	}
+	return string(b)
+}
+
+// RandomAlnum returns n random mixed-case alphanumeric characters (see RandomOf).
+func RandomAlnum(n int) string {
+	return RandomOf(n, ALNUM_CHARSET)
+}
+
 func RandomString(length int) string {
 	if length == 0 {
 		length = 1
@@ -184,7 +206,7 @@ var mediaRegex = regexp.MustCompile(
 	`^(woff|woff2|ttf|eot|otf|svg|mp4|webm|ogg|mkv|flv|avi|mov|wmv|css|jpg|jpeg|png|gif|bmp|webp|js|ico|pdf|mp3|m3u8)$`,
 )
 var mediaAndJSRegex = regexp.MustCompile(
-	`^(woff|woff2|ttf|eot|otf|svg|mp4|webm|ogg|mkv|flv|avi|mov|wmv|css|jpg|jpeg|png|gif|bmp|webp|js|ico|pdf|mp3|m3u8|js|json|zip|tar.gz|exe|gz|rar)$`,
+	`^(woff|woff2|ttf|eot|otf|svg|mp4|webm|ogg|mkv|flv|avi|mov|wmv|css|jpg|jpeg|png|gif|bmp|webp|js|ico|pdf|mp3|m3u8|js|json|zip|tar.gz|exe|gz|rar|tar|tgz|7z|bz2)$`,
 )
 
 // IsMediaAndJSURL checks if a URL is a media or JS file
@@ -537,58 +559,4 @@ func MightBeFunction(value string) bool {
 		}
 	}
 	return lo.Contains(phpFunctions, value)
-}
-
-func GetCertificateFromHostname(host string) []string {
-	if host == "" {
-		return []string{}
-	}
-	hostname, port, _ := net.SplitHostPort(host)
-	if hostname == "" {
-		hostname = host
-	}
-	if port == "" {
-		port = "443"
-	}
-
-	conn, err := tls.Dial("tcp", hostname+":"+port, &tls.Config{
-		InsecureSkipVerify: true,
-	})
-	if err != nil {
-		return []string{}
-	}
-	defer func() { _ = conn.Close() }()
-
-	certs, _, err := serverCert(hostname, port)
-	if err != nil {
-		return []string{}
-	}
-	if len(certs) == 0 {
-		return []string{}
-	}
-	cert := certs[0]
-
-	return cert.DNSNames
-}
-
-var serverCert = func(host, port string) ([]*x509.Certificate, string, error) {
-	d := &net.Dialer{
-		Timeout: time.Duration(5) * time.Second,
-	}
-
-	conn, err := tls.DialWithDialer(d, "tcp", host+":"+port, &tls.Config{
-		InsecureSkipVerify: true,
-		CipherSuites:       nil,
-		MaxVersion:         tls.VersionTLS12,
-	})
-	if err != nil {
-		return []*x509.Certificate{{}}, "", err
-	}
-	defer func() { _ = conn.Close() }()
-
-	addr := conn.RemoteAddr()
-	ip, _, _ := net.SplitHostPort(addr.String())
-	cert := conn.ConnectionState().PeerCertificates
-
-	return cert, ip, nil
 }

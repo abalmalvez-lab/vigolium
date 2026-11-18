@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects Rails development/debug tooling exposed in production responses.
-Identifies Rails exception pages with stack traces, Better Errors pages, Web Console
-presence, ActiveRecord database errors, and absolute filesystem path disclosure.
+	ModuleDesc = `**What it means:** A Ruby on Rails app serves debug tooling in a production response. The scanner matched detailed exception pages, the Better Errors and Web Console gems, leaked ActiveRecord errors, or filesystem paths. Impact ranges from information disclosure to remote code execution.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Checks for Rails-specific exception class names and debug section markers
-- Detects Better Errors and Web Console development gems
-- Identifies ActiveRecord/database error leakage
-- Flags absolute filesystem path disclosure in responses
+**How it's exploited:** An attacker reads leaked stack traces and database errors to map the schema and column names for targeted SQL injection. If the Better Errors or Web Console consoles are reachable, they run arbitrary Ruby.
 
-## References
-- https://guides.rubyonrails.org/debugging_rails_applications.html
-- https://owasp.org/www-community/Improper_Error_Handling`
+**Fix:** Remove the better_errors and web-console gems from production and set config.consider_all_requests_local to false so Rails returns generic error pages.`
 
 	ModuleConfirmation = "Confirmed when Rails-specific debug patterns or exception details are found in response bodies"
 	ModuleSeverity     = severity.High

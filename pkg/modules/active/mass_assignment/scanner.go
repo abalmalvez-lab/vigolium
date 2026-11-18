@@ -3,6 +3,8 @@ package mass_assignment
 import (
 	"encoding/json"
 	"maps"
+	stdurl "net/url"
+	"reflect"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -36,6 +38,14 @@ var privilegeProbes = []struct {
 	{"roles", []any{"admin", "user"}},
 	{"level", 9999},
 }
+
+// canaryKey is a benign, non-privileged field used as a control. If the endpoint
+// echoes this arbitrary unknown key back, it blindly reflects whatever it receives
+// and any privilege-key "echo" is meaningless — so we suppress findings entirely.
+const (
+	canaryKey   = "vigolium_ma_canary_field"
+	canaryValue = "vigolium_ma_canary_value"
+)
 
 // Module implements the Mass Assignment active scanner.
 type Module struct {
@@ -95,7 +105,23 @@ func (m *Module) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
 // IncludesBaseCanProcess returns false since we have fully custom CanProcess.
 func (m *Module) IncludesBaseCanProcess() bool { return false }
 
+// injResult holds the outcome of a single injected request.
+type injResult struct {
+	status   int
+	body     string // response body only (for comparison/echo checks)
+	full     string // full response incl. headers (evidence)
+	raw      []byte // the modified request, raw
+	location string
+}
+
 // ScanPerRequest tests mass assignment on the given JSON request.
+//
+// Detection is differential: a privilege key is only reported when injecting it
+// actually changes the response AND the key appears in the response because of our
+// injection (it is absent from the untouched baseline). A benign canary key is sent
+// first; if the endpoint echoes that too, it reflects arbitrary input indiscriminately
+// and we report nothing — this avoids flagging endpoints that simply ignore or blindly
+// mirror unknown fields without honoring them.
 func (m *Module) ScanPerRequest(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
@@ -121,6 +147,34 @@ func (m *Module) ScanPerRequest(
 		return nil, nil // Not a JSON object, skip
 	}
 
+	// Baseline body from the original, un-injected response. Used to attribute any
+	// reflected key to our injection rather than the endpoint's natural output.
+	// A record can arrive request-only (spec/curl imports, ingested requests), and
+	// without a baseline every echo would look like our injection - skip instead.
+	if !ctx.HasResponse() {
+		return nil, nil
+	}
+	baselineBody := ctx.Response().BodyToString()
+
+	// Control probe: inject a benign unknown key. If the endpoint reflects it back
+	// (and the baseline did not already contain it), it mirrors arbitrary input and
+	// no privilege-key echo can be trusted — bail out to avoid false positives.
+	if _, exists := originalObj[canaryKey]; !exists {
+		control := make(map[string]any, len(originalObj)+1)
+		maps.Copy(control, originalObj)
+		control[canaryKey] = canaryValue
+
+		ctl, err := m.sendInjected(ctx, httpClient, control)
+		if err != nil {
+			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
+				return nil, nil
+			}
+		} else if valueNewlyReflected(canaryKey, canaryValue, ctl.body, baselineBody) {
+			// Endpoint blindly reflects unknown fields — unreliable, report nothing.
+			return nil, nil
+		}
+	}
+
 	var results []*output.ResultEvent
 
 	for _, probe := range privilegeProbes {
@@ -134,23 +188,17 @@ func (m *Module) ScanPerRequest(
 		maps.Copy(injected, originalObj)
 		injected[probe.key] = probe.value
 
-		injectedBody, err := json.Marshal(injected)
-		if err != nil {
+		// Capture a fresh no-key control BEFORE mutation. A post-mutation control
+		// is invalid for stateful endpoints: if the injection really persisted,
+		// the subsequent no-key response should still contain the value and would
+		// incorrectly suppress the true positive.
+		preControl, err := m.sendInjected(ctx, httpClient, originalObj)
+		if err != nil || preControl.status < 200 || preControl.status >= 300 ||
+			jsonContainsKeyValue(preControl.body, probe.key, probe.value) {
 			continue
 		}
 
-		modifiedRaw, err := httpmsg.SetBody(ctx.Request().Raw(), injectedBody)
-		if err != nil {
-			continue
-		}
-
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-		if err != nil {
-			continue
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
-
-		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
+		res, err := m.sendInjected(ctx, httpClient, injected)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return results, nil
@@ -158,53 +206,312 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		statusCode := 0
-		respBody := ""
-		if resp.Response() != nil {
-			statusCode = resp.Response().StatusCode
-			respBody = resp.FullResponseString()
-		}
-
-		// Server returned validation error — skip (server properly rejects unknown fields)
-		if statusCode == 400 || statusCode == 422 {
-			resp.Close()
+		// Server rejected the unknown field — it validates input, not vulnerable.
+		if isRejected(res.status, res.body) {
 			continue
 		}
 
-		respBodyLower := strings.ToLower(respBody)
-		if strings.Contains(respBodyLower, "unknown field") ||
-			strings.Contains(respBodyLower, "unexpected field") ||
-			strings.Contains(respBodyLower, "not allowed") {
-			resp.Close()
+		if res.status < 200 || res.status >= 300 {
 			continue
 		}
 
-		if statusCode >= 200 && statusCode < 300 {
-			// Check if the injected key is echoed back in the response
-			echoed := strings.Contains(respBody, `"`+probe.key+`"`)
-
-			desc := "Mass assignment: server accepted injected key '" + probe.key + "'"
-			if echoed {
-				desc = "Mass assignment: server echoed back injected privilege key '" + probe.key + "'"
-			}
-
-			results = append(results, &output.ResultEvent{
-				URL:              urlx.String(),
-				Request:          string(modifiedRaw),
-				Response:         respBody,
-				FuzzingParameter: probe.key,
-				ExtractedResults: []string{probe.key + "=" + toString(probe.value)},
-				Info: output.Info{
-					Description: desc,
-				},
-			})
-			resp.Close()
-			return results, nil
+		// Require evidence the injection actually took effect:
+		//   1. the response genuinely differs from the un-injected baseline, AND
+		//   2. the exact typed key/value surfaces in the response because of us.
+		// Without this, an endpoint that silently ignores the field returns the same
+		// 2xx response as before and must NOT be flagged.
+		if normalizeBody(res.body) == normalizeBody(baselineBody) {
+			continue
 		}
-		resp.Close()
+		if !valueNewlyReflected(probe.key, probe.value, res.body, baselineBody) {
+			continue
+		}
+		// Reconfirm the key's reflection TRACKS our injection rather than being the
+		// page's own per-request variance. The baseline is a single (possibly stale)
+		// snapshot, so a common word like "level"/"verified" that drifts in and out
+		// of an SSR page's embedded state (feature flags, personalization) can look
+		// "newly reflected" by coincidence. Require it to reflect again on re-injection
+		// AND be absent from a fresh no-key control before trusting it.
+		if !m.reflectionTracksInjection(ctx, httpClient, injected, probe.key, probe.value) {
+			continue
+		}
+
+		readback, persisted := m.verifyPersistence(ctx, httpClient, res, probe.key, probe.value)
+		kind := output.RecordKindCandidate
+		grade := output.EvidenceGradeDifferential
+		name := "Mass Assignment Acceptance Candidate"
+		description := "The endpoint repeatedly returned the exact injected privilege value while a benign unknown field was not accepted. This proves selective binding/acceptance, but no durable state readback was available."
+		var additionalEvidence []string
+		if persisted {
+			kind = output.RecordKindFinding
+			grade = output.EvidenceGradeImpact
+			name = "Mass Assignment with Persistent Privilege Field"
+			description = "The endpoint accepted the exact injected privilege value and two independent GET readbacks returned that same typed value, confirming durable unauthorized state assignment."
+			additionalEvidence = []string{readback.rawString(), readback.full}
+		}
+
+		results = append(results, &output.ResultEvent{
+			ModuleID:           ModuleID,
+			URL:                urlx.String(),
+			Request:            string(res.raw),
+			Response:           res.full,
+			AdditionalEvidence: additionalEvidence,
+			FuzzingParameter:   probe.key,
+			ExtractedResults:   []string{probe.key + "=" + toString(probe.value)},
+			RecordKind:         kind,
+			EvidenceGrade:      grade,
+			Info: output.Info{
+				Name:        name,
+				Description: description,
+				Severity:    ModuleSeverity,
+				Confidence:  ModuleConfidence,
+				Tags:        ModuleTags,
+			},
+			Metadata: map[string]any{
+				"injected_key":   probe.key,
+				"injected_value": probe.value,
+				"persisted":      persisted,
+			},
+		})
+		return results, nil
 	}
 
 	return results, nil
+}
+
+// sendInjected marshals obj, swaps it into the request body, executes it, and returns
+// the (closed) response details. The caller does not need to Close anything.
+func (m *Module) sendInjected(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	obj map[string]any,
+) (*injResult, error) {
+	injectedBody, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+
+	modifiedRaw, err := httpmsg.SetBody(ctx.Request().Raw(), injectedBody)
+	if err != nil {
+		return nil, err
+	}
+
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
+
+	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true, NoClustering: true})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Close()
+
+	res := &injResult{raw: modifiedRaw}
+	if resp.Response() != nil {
+		res.status = resp.Response().StatusCode
+		res.body = resp.BodyString()
+		res.full = resp.FullResponseString()
+		res.location = resp.Response().Header.Get("Location")
+	}
+	return res, nil
+}
+
+// isRejected reports whether the server explicitly refused the unknown field.
+func isRejected(status int, body string) bool {
+	if status == 400 || status == 422 {
+		return true
+	}
+	b := strings.ToLower(body)
+	return strings.Contains(b, "unknown field") ||
+		strings.Contains(b, "unexpected field") ||
+		strings.Contains(b, "not allowed")
+}
+
+// valueNewlyReflected requires the exact typed value, not just the key name. A
+// server that accepts a known field but normalizes role=admin back to role=user
+// has not granted the requested privilege and must not be reported.
+func valueNewlyReflected(key string, value any, injectedBody, baselineBody string) bool {
+	return jsonContainsKeyValue(injectedBody, key, value) && !jsonContainsKeyValue(baselineBody, key, value)
+}
+
+// reflectionTracksInjection reconfirms that a privilege key surfaces in the
+// response BECAUSE we injected it, not because the endpoint's output naturally
+// varies request to request. The caller captured a fresh pre-mutation no-key
+// control; this helper re-sends the injected body and requires the exact typed
+// value again. Transport ambiguity fails closed.
+func (m *Module) reflectionTracksInjection(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	injected map[string]any,
+	key string,
+	value any,
+) bool {
+	// (a) Re-inject: a genuinely accepted/echoed field reflects on every send. A 2xx
+	// re-injection that no longer carries the key means the first reflection was
+	// per-request noise, not our field.
+	re, err := m.sendInjected(ctx, httpClient, injected)
+	if err != nil || re.status < 200 || re.status >= 300 || !jsonContainsKeyValue(re.body, key, value) {
+		return false
+	}
+
+	return true
+}
+
+func jsonContainsKeyValue(body, key string, expected any) bool {
+	var document any
+	if err := json.Unmarshal([]byte(body), &document); err != nil {
+		return false
+	}
+	canonicalExpected := canonicalJSONValue(expected)
+	return findJSONKeyValue(document, key, canonicalExpected)
+}
+
+func canonicalJSONValue(value any) any {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return value
+	}
+	var canonical any
+	if err := json.Unmarshal(encoded, &canonical); err != nil {
+		return value
+	}
+	return canonical
+}
+
+func findJSONKeyValue(value any, key string, expected any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for candidate, child := range typed {
+			if candidate == key && jsonValueContains(child, expected) {
+				return true
+			}
+			if findJSONKeyValue(child, key, expected) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if findJSONKeyValue(child, key, expected) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// jsonValueContains permits response objects to enrich an injected nested map
+// with server fields while still requiring every requested nested value.
+func jsonValueContains(actual, expected any) bool {
+	expectedMap, expectedIsMap := expected.(map[string]any)
+	actualMap, actualIsMap := actual.(map[string]any)
+	if expectedIsMap {
+		if !actualIsMap {
+			return false
+		}
+		for key, expectedChild := range expectedMap {
+			actualChild, ok := actualMap[key]
+			if !ok || !jsonValueContains(actualChild, expectedChild) {
+				return false
+			}
+		}
+		return true
+	}
+	return reflect.DeepEqual(actual, expected)
+}
+
+func (m *Module) verifyPersistence(
+	ctx *httpmsg.HttpRequestResponse,
+	client *http.Requester,
+	injected *injResult,
+	key string,
+	value any,
+) (*injResult, bool) {
+	readRaw, ok := readbackRequest(ctx, injected.location)
+	if !ok {
+		return nil, false
+	}
+	first, err := m.sendRaw(ctx, client, readRaw)
+	if err != nil || first.status < 200 || first.status >= 300 || !jsonContainsKeyValue(first.body, key, value) {
+		return nil, false
+	}
+	second, err := m.sendRaw(ctx, client, readRaw)
+	if err != nil || second.status != first.status || !jsonContainsKeyValue(second.body, key, value) || !modkit.BodiesSimilar(first.body, second.body) {
+		return nil, false
+	}
+	return first, true
+}
+
+func readbackRequest(ctx *httpmsg.HttpRequestResponse, location string) ([]byte, bool) {
+	method := strings.ToUpper(ctx.Request().Method())
+	raw := append([]byte(nil), ctx.Request().Raw()...)
+	if method == "POST" {
+		if strings.TrimSpace(location) == "" {
+			return nil, false
+		}
+		parsed, err := stdurl.Parse(location)
+		if err != nil {
+			return nil, false
+		}
+		if parsed.IsAbs() {
+			urlx, err := ctx.URL()
+			if err != nil || !strings.EqualFold(parsed.Host, urlx.Host) {
+				return nil, false
+			}
+		}
+		path := parsed.EscapedPath()
+		if path == "" {
+			path = "/"
+		}
+		if parsed.RawQuery != "" {
+			path += "?" + parsed.RawQuery
+		}
+		raw, err = httpmsg.SetPath(raw, path)
+		if err != nil {
+			return nil, false
+		}
+	} else if method != "PUT" && method != "PATCH" {
+		return nil, false
+	}
+	var err error
+	raw, err = httpmsg.SetMethod(raw, "GET")
+	if err != nil {
+		return nil, false
+	}
+	raw, err = httpmsg.SetBody(raw, nil)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
+func (m *Module) sendRaw(ctx *httpmsg.HttpRequestResponse, client *http.Requester, raw []byte) (*injResult, error) {
+	request := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
+	resp, _, err := client.Execute(request, http.Options{NoRedirects: true, NoClustering: true})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Close()
+	result := &injResult{raw: raw}
+	if resp.Response() != nil {
+		result.status = resp.Response().StatusCode
+		result.body = resp.BodyString()
+		result.full = resp.FullResponseString()
+		result.location = resp.Response().Header.Get("Location")
+	}
+	return result, nil
+}
+
+func (r *injResult) rawString() string {
+	if r == nil {
+		return ""
+	}
+	return string(r.raw)
+}
+
+// normalizeBody strips all whitespace so two responses can be compared for material
+// (rather than cosmetic) differences.
+func normalizeBody(s string) string {
+	return strings.Join(strings.Fields(s), "")
 }
 
 // markAndShouldContinue limits checks per host.

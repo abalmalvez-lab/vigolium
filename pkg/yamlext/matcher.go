@@ -1,11 +1,11 @@
 package yamlext
 
 import (
-	"regexp"
 	"strings"
 
 	"github.com/grafana/sobek"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/jsext/jsheaders"
 )
 
 // EvalMatcher evaluates a single matcher against a response.
@@ -53,7 +53,7 @@ func evalBodyMatcher(m *MatcherDef, resp *httpmsg.HttpResponse, ctx *TemplateCon
 	}
 
 	if m.Regex != "" {
-		re, err := regexp.Compile(m.Regex)
+		re, err := compileCached(m.Regex)
 		if err != nil {
 			return false, ""
 		}
@@ -91,7 +91,7 @@ func evalHeaderMatcher(m *MatcherDef, resp *httpmsg.HttpResponse, ctx *TemplateC
 	}
 
 	if m.Regex != "" {
-		re, err := regexp.Compile(m.Regex)
+		re, err := compileCached(m.Regex)
 		if err != nil {
 			return false, ""
 		}
@@ -131,11 +131,7 @@ func evalJSMatcher(m *MatcherDef, resp *httpmsg.HttpResponse) (bool, string) {
 		_ = respObj.Set("status", resp.StatusCode())
 		_ = respObj.Set("body", resp.BodyToString())
 
-		headersObj := vm.NewObject()
-		for _, h := range resp.Headers() {
-			_ = headersObj.Set(h.Name, h.Value)
-		}
-		_ = respObj.Set("headers", headersObj)
+		_ = respObj.Set("headers", jsheaders.New(vm, resp.Headers()))
 	}
 	_ = vm.Set("response", respObj)
 
@@ -200,7 +196,7 @@ func EvalRuleMatch(match *RuleMatchDef, resp *httpmsg.HttpResponse, ctx *Templat
 
 		// If regex or contains specified, check value
 		if match.Regex != "" {
-			re, err := regexp.Compile(match.Regex)
+			re, err := compileCached(match.Regex)
 			if err != nil {
 				return false, ""
 			}
@@ -235,7 +231,7 @@ func EvalRuleMatch(match *RuleMatchDef, resp *httpmsg.HttpResponse, ctx *Templat
 	// Check body_regex
 	if match.BodyRegex != "" {
 		body := resp.BodyToString()
-		re, err := regexp.Compile(match.BodyRegex)
+		re, err := compileCached(match.BodyRegex)
 		if err != nil {
 			return false, ""
 		}

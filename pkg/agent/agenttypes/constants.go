@@ -40,6 +40,13 @@ type AutopilotPipelineResult struct {
 	SessionDir            string
 	// Reentries counts how many post-halt coverage-verify re-prompts fired.
 	Reentries int
+	// BudgetStop names the budget that ended the operator loop ("wall_time",
+	// "tokens", "cost", "commands"), "" when none did.
+	BudgetStop string
+	// Operator-loop token usage and its estimated cost.
+	InputTokens  int64
+	OutputTokens int64
+	CostUSD      float64
 }
 
 // AutopilotPhase constants for the agent autopilot mode console output.
@@ -451,7 +458,7 @@ const (
 )
 
 // Scanning strategy names accepted by runner.LaunchParams.ScanningStrategy
-// and the run_scan tool's enum. Centralized here so preset wiring and tests
+// and the run_native_scan tool's enum. Centralized here so preset wiring and tests
 // stay in lockstep with the runner's expectations.
 const (
 	ScanStrategyLite     = "lite"
@@ -535,14 +542,14 @@ var AutopilotPresets = map[Intensity]AutopilotIntensityPreset{
 		NativeScanStrategy: ScanStrategyLite,
 	},
 	IntensityBalanced: {
-		MaxCommands:        500,
+		MaxCommands:        750,
 		Timeout:            6 * time.Hour,
 		AuditDriverMode:    "balanced",
 		Browser:            true,
 		NativeScanStrategy: ScanStrategyBalanced,
 	},
 	IntensityDeep: {
-		MaxCommands:        1500,
+		MaxCommands:        3000,
 		Timeout:            12 * time.Hour,
 		AuditDriverMode:    "deep",
 		Browser:            true,

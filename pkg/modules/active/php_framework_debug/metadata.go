@@ -9,23 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for debug and development endpoints specific to PHP frameworks beyond
-Laravel and Symfony: Yii debug module and Gii code generator, CodeIgniter
-user guide and profiler output, CakePHP debug kit, and common PHP framework
-debug patterns.
+	ModuleDesc = `**What it means:** A PHP framework debug or developer tool is reachable in production. The module probes endpoints for Yii (debug, Gii), CodeIgniter, CakePHP DebugKit, Slim, FuelPHP, and Phalcon DevTools, confirmed by framework-specific markers. These leak logs, SQL queries, stack traces, and configuration.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Covers Yii, CodeIgniter, CakePHP, and Slim frameworks
-- Fingerprints 404 responses to detect custom error pages
+**How it's exploited:** An attacker maps routes, reads config secrets, and harvests server paths. Yii Gii and Phalcon DevTools scaffold code and run migrations, escalating to code execution; others fingerprint the version for known CVEs.
 
-## References
-- https://www.yiiframework.com/doc/guide/2.0/en/tool-debugger
-- https://codeigniter.com/user_guide/
-- https://book.cakephp.org/4/en/debug-kit.html
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Disable debug mode and access-restrict framework dev tools and log directories in production.`
 
 	ModuleConfirmation = "Confirmed when probed framework debug endpoints return 200 with expected content markers"
 	ModuleSeverity     = severity.Medium

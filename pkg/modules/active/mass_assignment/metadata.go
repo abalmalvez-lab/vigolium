@@ -9,23 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests JSON API endpoints for mass assignment vulnerabilities by injecting privilege-related
-keys (role, admin, is_admin, permissions, etc.) into POST/PUT/PATCH JSON request bodies
-and observing server responses.
+	ModuleDesc = `**What it means:** A JSON API selectively accepted the exact typed value of a client-supplied privilege field. This is a candidate; two independent GET readbacks showing the same persisted value form a finding.
 
-## Notes
-- Only activates on POST/PUT/PATCH requests with application/json content type
-- Injects one privilege key at a time to isolate findings
-- Reports firm confidence if server echoes back the injected key in response
-- Reports tentative confidence if server accepts the request without error
-- Skips keys already present in the original request body
+**How it's exploited:** An attacker adds a field such as "role":"admin" to a create or update request and the server persists it, escalating privileges.
 
-## References
-- https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html
-- https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/`
+**Fix:** Bind an explicit allowlist of fields per endpoint and reject client-supplied privilege properties.`
 
-	ModuleConfirmation = "Confirmed when injected privilege keys are echoed back in server response or accepted without validation error"
+	ModuleConfirmation = "Candidate when the exact typed privilege value is selectively and repeatedly returned; confirmed only when two independent readbacks show the value persisted"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"injection", "api", "moderate"}

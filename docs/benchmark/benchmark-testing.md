@@ -31,10 +31,10 @@ The benchmark system validates that Vigolium's active and passive scanner module
 
 | Category | Build Tag | Targets | Assertions | Requirements |
 |----------|-----------|---------|------------|--------------|
-| **Whitebox** | `canary` | Docker containers (DVWA, VAmPI, Juice Shop, OopsSec Store, NextJS VulnExamples, etc.) | Strict + Soft | Docker |
+| **Whitebox** | `canary` | Docker containers (DVWA, VAmPI, Juice Shop, OopsSec Store, NextJS VulnExamples, etc.) | Strict + Negative + Soft | Docker |
 | **crAPI** | `canary` | Docker Compose (crAPI — 10 services) | Soft | Docker + `make crapi-up` |
 | **XBOW** | `xbow` | CTF-style benchmarks built from source (XSS, SSTI, SQLi, LFI, CmdI, SSRF, XXE) | Strict + Soft | Docker + `XBOW_SOURCE_DIR` |
-| **Blackbox** | `blackbox` | External demo sites (Acunetix, PortSwigger, IBM) | Soft only | Internet |
+| **Blackbox** | `blackbox` | External demo sites (Acunetix, PortSwigger, IBM) | Soft only (each with `soft_reason`) | Internet |
 | **Coverage** | `canary` | None (analyzes YAML definitions) | N/A | None |
 
 ### Relationship to Existing Tests
@@ -164,7 +164,7 @@ Each example also has 1-3 **solution variants** that fix the vulnerability. Thes
 ### Key Design Decisions
 
 1. **YAML-driven**: Test cases are defined in YAML, not Go code. Adding a new test case is a one-line YAML addition.
-2. **Module resolution by ID**: Test cases reference modules by their registry ID (e.g., `active-sqli-error-based`). The harness resolves them from `modules.DefaultRegistry`.
+2. **Module resolution by ID**: Test cases reference modules by their registry ID (e.g., `sqli-error-based`). The harness resolves them from `modules.DefaultRegistry`.
 3. **Scan type dispatch**: The harness checks `module.ScanScopes()` to dispatch to the correct method:
    - `ScanScopeInsertionPoint`: Creates insertion points via `httpmsg.CreateAllInsertionPoints()`, filters by `AllowedInsertionPointTypes()`, calls `ScanPerInsertionPoint()` for each.
    - `ScanScopeRequest`: Calls `ScanPerRequest()` once with the full request.
@@ -279,10 +279,12 @@ test/testdata/
 
 | Command | What it runs | Requirements |
 |---------|-------------|--------------|
-| `make test-benchmark-whitebox` | DVWA, VAmPI, Juice Shop, OopsSec, VulnExamples (Docker) | Docker |
+| `make test-benchmark-whitebox` | All YAML-driven whitebox apps, including DVWA, VAmPI, Juice Shop, OopsSec, VulnExamples, vulnerable-java, and vulnerable-nginx | Docker; pre-start any externally managed Compose target required by its definition |
 | `make test-benchmark-blackbox` | Acunetix, Gin&Juice, Testfire (external) | Internet |
 | `make test-benchmark-all` | All whitebox + blackbox | Docker + Internet |
 | `make test-benchmark-crapi` | crAPI only | Docker + `make crapi-up` |
+| `make test-benchmark-vuln-java` | Vulnerable Java only | Docker + `make vulnerable-java-up` |
+| `make test-benchmark-vuln-nginx` | Vulnerable Nginx only | Docker + `make vulnerable-nginx-up` |
 | `make test-benchmark-coverage` | Generate coverage report | None |
 | `make test-xbow` | All 13 XBOW validation benchmarks | Docker + `XBOW_SOURCE_DIR` |
 | `make test-xbow-ssti` | 3 SSTI benchmarks | Docker + `XBOW_SOURCE_DIR` |
@@ -420,8 +422,10 @@ test_cases:
       - "xss-light-url-params"
     vuln_types:                       # Expected vulnerability types (informational)
       - "xss-reflected"
-    assertion: strict                 # strict | soft | negative
+    assertion: strict                 # strict | soft | negative (anything else fails)
     min_findings: 1                   # Minimum expected findings (default: 1)
+    expected_findings: 2              # strict only: exact count recorded against the live app (optional)
+    soft_reason: "..."                # required on soft cases, forbidden otherwise
     scan_mode: active                 # active | passive
     timeout: 30s                      # Per-test timeout (blackbox only)
     description: "Reflected XSS in name parameter"
@@ -440,7 +444,7 @@ test_cases:
 
 | Mode | What Happens |
 |------|-------------|
-| `active` | Harness creates `HttpRequestResponse` from URL, resolves active module, calls `ScanPerRequest`/`ScanPerHost` |
+| `active` | Harness creates `HttpRequestResponse` from URL, fetches a baseline response, then `modtest.RunActive` runs every scan scope the module declares (per host, per request, per insertion point) |
 | `passive` | Harness fetches URL with HTTP client first (to get actual response), then passes full request+response to passive module's `ScanPerRequest`/`ScanPerHost` |
 
 ---
@@ -460,7 +464,7 @@ test_cases:
   - id: "dvwa-sqli-blind"
     endpoint: "/vulnerabilities/sqli_blind/?id=1&Submit=Submit"
     method: GET
-    modules: ["sqli-time-based-params"]
+    modules: ["sqli-time-blind"]
     vuln_types: ["sqli-time-based"]
     assertion: soft
     min_findings: 1
@@ -650,31 +654,33 @@ This outputs a markdown table to stdout and writes `test/benchmark/coverage-repo
 ```
 # Vigolium Module Benchmark Coverage
 
-**Total test cases:** 85+
+**Total test cases:** 175
 
-**Active modules:** 20/36 (56%)
+**Active modules:** 30/201 (15%)
 
-**Passive modules:** 14/17 (82%)
+**Passive modules:** 19/116 (16%)
 
 ## Coverage Matrix
 
 | Module ID | Type | Covered | Apps |
 |-----------|------|---------|------|
-| active-authn-bypass | active | Yes | nextjs-vulnexamples |
-| active-code-exec | active | Yes | dvwa, crapi |
-| active-cors-misconfiguration | active | Yes | vampi, juiceshop, crapi, oopssec-store, nextjs-vulnexamples |
-| active-sqli-error-based | active | Yes | dvwa, vampi, juiceshop, oopssec-store, ... |
-| passive-security-headers-missing | passive | Yes | dvwa, vampi, juiceshop, crapi, oopssec-store, nextjs-vulnexamples |
-| passive-ssr-data-exposure | passive | Yes | oopssec-store, nextjs-vulnexamples |
+| code-exec | active | Yes | crapi, dvwa, vulnerable-java, xbow-cmdi-073 |
+| cors-misconfiguration | active | Yes | crapi, juiceshop, nextjs-vulnexamples, oopssec-store, vampi, ... |
+| sqli-error-based | active | Yes | crapi, dvwa, juiceshop, oopssec-store, vampi, ... |
+| security-headers-missing | passive | Yes | crapi, dvwa, juiceshop, nextjs-vulnexamples, oopssec-store, ... |
+| ssr-data-exposure | passive | Yes | nextjs-vulnexamples, oopssec-store |
 | ...
 
 ## Uncovered Modules
 
-- `active-http-request-smuggling` (active)
-- `active-race-interference` (active)
-- `passive-anomaly-ranking` (passive)
+- `http-request-smuggling` (active)
+- `race-interference` (active)
+- `anomaly-ranking` (passive)
 - ...
 ```
+
+These counts reflect the current checked-in definitions and registry; rerun the
+coverage target after adding modules or benchmark cases.
 
 ### Understanding Coverage
 
@@ -688,23 +694,24 @@ This outputs a markdown table to stdout and writes `test/benchmark/coverage-repo
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
-| `strict` | Test fails if `len(findings) < min_findings` | Known vulnerabilities in controlled Docker apps |
-| `soft` | Logs a warning but test passes regardless | Experimental tests, blackbox sites, modern apps with protections |
-| `negative` | Test fails if `len(findings) > 0` | False positive testing — endpoints that should NOT trigger |
+| `strict` | Fails if `len(findings) < min_findings`, or `!= expected_findings` when set, or the module errors | Known vulnerabilities in controlled Docker apps |
+| `negative` | Fails if `len(findings) > 0` or the module errors | False-positive checks: endpoints that must NOT trigger (for example a fixed `solution-1` variant) |
+| `soft` | Never fails; logs when it under-finds. Requires `soft_reason` | Counts not yet recorded, blackbox sites, cases needing setup the harness lacks |
+
+Any other value fails the case (it used to pass silently as soft). `min_findings: 0` is not a way to say "expect nothing": `LoadDefinition` raises 0 to 1; use `negative`.
 
 ### Choosing the Right Assertion
 
 ```
-Is this a Docker app with a known, reliably detectable vuln?
-├─ Yes → strict
+Should this endpoint produce NO findings?
+├─ Yes → negative
 └─ No
-    ├─ Is this an external site or might detection fail?
-    │   └─ Yes → soft
-    └─ Should this endpoint have NO findings?
-        └─ Yes → negative
+    ├─ Docker app, vuln reliably detectable, count recorded? → strict (+ expected_findings)
+    └─ Otherwise → soft, with a soft_reason saying what is missing
 ```
 
 ---
+
 
 ## Harness Package Reference
 
@@ -741,7 +748,9 @@ The `test/benchmark/harness/` package is a shared Go library (not a test package
 | `SetupDVWA(t, baseURL)` | Initialize DVWA DB, login, return session cookies |
 | `ResolveActiveModules(ids)` | Look up active modules from DefaultRegistry |
 | `ResolvePassiveModules(ids)` | Look up passive modules from DefaultRegistry |
-| `ApplyAssertion(t, tc, moduleID, findings)` | Check findings against assertion mode |
+| `ApplyAssertion(t, tc, moduleID, findings, scanErr)` | Check one module outcome against the assertion mode; returns pass/fail |
+| `AssertionFailure(tc, count, scanErr)` | Pure assertion rules (why a case fails, or "") |
+| `RecordBenchResult(tr)` | Append a result line to `$BENCH_OUT` (no-op when unset) |
 | `GenerateCoverageReport(dirs...)` | Generate module coverage matrix |
 | `FormatCoverageMarkdown(report)` | Render coverage report as markdown |
 | `CheckExternalAvailability(t, url)` | Skip test if external site is unreachable |
@@ -749,93 +758,117 @@ The `test/benchmark/harness/` package is a shared Go library (not a test package
 ### Active Test Case Flow
 
 ```go
-// 1. Build HttpRequestResponse from URL (GET or POST with optional headers/body)
-if tc.Method == "POST" && tc.Body != "" {
-    rr, err = buildPOSTRequest(baseURL + tc.Endpoint, tc.Body, tc.Headers)
-} else {
-    rr, err = buildRequestWithHeaders(baseURL + tc.Endpoint, tc.Headers)
-}
+// 1. Resolve modules by ID - an unknown ID is t.Fatalf before any request.
+mods, err := ResolveActiveModules(tc.Modules)
 
-// 2. Resolve module by ID
-mods := modules.GetActiveModulesByIDs(tc.Modules)
+// 2. Build the HttpRequestResponse (method/body/headers from the case) and
+//    send it once so modules see a record with a baseline response.
+rr = fetchBaseline(t, rr, infra)
 
-// 3. Dispatch based on module's ScanScope
-switch {
-case mod.ScanScopes().Has(modkit.ScanScopeInsertionPoint):
-    // Create insertion points and scan each one
-    points, _ := httpmsg.CreateAllInsertionPoints(rr.Request().Raw(), true)
-    for _, ip := range points {
-        if mod.AllowedInsertionPointTypes().Contains(ip.Type()) {
-            findings, _ = mod.ScanPerInsertionPoint(rr, ip, httpClient, scanCtx)
-        }
-    }
-case mod.ScanScopes().Has(modkit.ScanScopeRequest):
-    findings, err = mod.ScanPerRequest(rr, httpClient, scanCtx)
-case mod.ScanScopes().Has(modkit.ScanScopeHost):
-    findings, err = mod.ScanPerHost(rr, httpClient, scanCtx)
-}
+// 3. Dispatch exactly as the executor does: every declared scan scope
+//    (per host, per request, per insertion point). Shared with the benign
+//    sweep in pkg/modules.
+var sent atomic.Int64
+findings, scanErr := modtest.RunActive(mod, rr, infra.HTTPClient.WithCall(nil, &sent), infra.ScanCtx)
 
-// 4. Apply assertion
-ApplyAssertion(t, tc, mod.ID(), findings)
+// 4. Apply the assertion (module errors fail strict/negative cases) and,
+//    when $BENCH_OUT is set, append the result line.
+tr.Passed = ApplyAssertion(t, tc, mod.ID(), findings, scanErr)
 ```
 
 ### Passive Test Case Flow
 
 ```go
-// 1. Fetch URL to get actual response (with optional auth headers)
-rr, err := FetchForPassiveScan(baseURL + tc.Endpoint, tc.Headers, infra)
-//    Internally: Execute request → respChain.FullResponse() → rr.WithResponse(httpResp)
+// 1. Resolve passive modules (unknown ID: t.Fatalf).
+mods, err := ResolvePassiveModules(tc.Modules)
 
-// 2. Resolve passive module
-mods := modules.GetPassiveModulesByIDs(tc.Modules)
+// 2. Fetch the URL to get the actual response (with optional auth headers).
+rr, err := FetchForPassiveScan(baseURL+tc.Endpoint, tc.Headers, infra)
 
-// 3. Pass full request+response to passive module
-findings, err = mod.ScanPerRequest(rr, scanCtx)
+// 3. Pass the full request+response to the module's ScanPerRequest / ScanPerHost.
+findings, scanErr = mod.ScanPerRequest(rr, scanCtx)
 
-// 4. Apply assertion
-ApplyAssertion(t, tc, mod.ID(), findings)
+// 4. Apply the assertion.
+tr.Passed = ApplyAssertion(t, tc, mod.ID(), findings, scanErr)
 ```
 
 ---
 
 ## CI Integration
 
-### Recommended CI Strategy
+CI is `.github/workflows/ci.yml`. What runs depends on the event:
 
-| Trigger | What to Run | Timeout |
-|---------|------------|---------|
-| On every PR | `make test-benchmark-whitebox` (DVWA + VAmPI only) | 15 min |
-| Nightly | `make test-benchmark-all` (all whitebox + blackbox) | 30 min |
-| Weekly | `make test-benchmark-crapi` (requires crAPI up) | 20 min |
-| Weekly | `make test-xbow` (requires XBOW_SOURCE_DIR) | 30 min |
-| On release | `make test-benchmark-coverage` | 1 min |
+| Event | Jobs | Benchmark coverage |
+|-------|------|--------------------|
+| Pull request, push to `main` | `lint`, `unit` | Static only: `test/benchmark/harness/definitions_lint_test.go` (no build tag, so it runs in the unit suite) |
+| Nightly (`schedule`, 03:17 UTC) and `workflow_dispatch` | everything else: `race`, `postgres`, `canary`, `benchmark-whitebox`, `benchmark-blackbox`, cross-compile, coverage, govulncheck, SBOM | Full whitebox run (Docker) gates `ci-ok`; blackbox is `continue-on-error` |
+| Manual only | `macos` (`gh workflow run ci.yml -f macos=true`) | none |
 
-### Example GitHub Actions Workflow
+crAPI (`make crapi-up`) and XBOW (`XBOW_SOURCE_DIR`) need external setup and are not in CI; run them locally.
 
-```yaml
-- name: Run whitebox benchmarks
-  run: |
-    make test-benchmark-whitebox
-  timeout-minutes: 15
+### The static gate (every PR)
 
-- name: Run blackbox benchmarks (nightly only)
-  if: github.event_name == 'schedule'
-  run: |
-    make test-benchmark-blackbox
-  timeout-minutes: 20
-  continue-on-error: true  # Blackbox may fail due to external site issues
+`TestDefinitionsLint` loads every definition under `test/benchmark/definitions/` (top level and one directory down) and fails when:
 
-- name: Run XBOW validation benchmarks (weekly)
-  if: github.event_name == 'schedule'
-  run: |
-    make xbow-build
-    make test-xbow
-  timeout-minutes: 30
-  env:
-    XBOW_SOURCE_DIR: ${{ github.workspace }}/validation-benchmarks
+- a module ID does not resolve in the registry (a stale ID used to run zero modules and pass);
+- `assertion` is not `strict`, `negative` or `soft`;
+- a `soft` case has no `soft_reason`, or a non-soft case has one;
+- `expected_findings` is set on a soft or negative case;
+- the number of soft cases differs from `softCaseBudget`. The budget is a ratchet: converting a soft case to strict or negative must lower the constant in the same change, and adding a soft case needs a reason to raise it.
+
+`TestDefinitionsLint_HasNegativeCases` requires at least one negative case. Those checks need neither Docker nor network, so `make test-unit` runs them too, and `make release` depends on `test-unit`.
+
+### What fails a live case
+
+The harness (`test/benchmark/harness`) fails a case when:
+
+- any module ID is unknown (`t.Fatalf`, before any request is sent);
+- a `strict` case finds fewer than `min_findings`, or not exactly `expected_findings` when that is set;
+- a `negative` case finds anything;
+- a `strict` or `negative` case's module returns an error (an erroring module proves nothing);
+- a blackbox case exceeds its `timeout` (`t.Errorf`; the harness still waits for the module so it never touches `t` after the subtest returns).
+
+`soft` cases never fail; their `soft_reason` is logged when they under-find.
+
+### Recording counts (Docker required)
+
+Most of the 155 soft cases are soft only because nobody has recorded the expected count against the live app. To convert one:
+
+1. Start the app (the whitebox test starts Docker apps itself; crAPI needs `make crapi-up`).
+2. Run the case with `BENCH_OUT` set, for example `BENCH_OUT=/tmp/bench.jsonl go test -tags canary -run 'TestWhitebox_VAmPI' ./test/benchmark/whitebox/...`.
+3. Read the case's `findings` from `/tmp/bench.jsonl`, set `assertion: strict` with `expected_findings: N` (or `negative` if it should be silent), delete `soft_reason`, and lower `softCaseBudget` by one.
+
+### Result files and `make bench-diff`
+
+When `BENCH_OUT` names a file, every case appends one JSON object per module (`harness.BenchRecord`):
+
+```json
+{"commit":"48081540...","case_id":"vampi-sqli-users","module":"sqli-error-based","scan_mode":"active","assertion":"soft","findings":1,"requests":38,"duration_ms":2140,"passed":true}
+```
+
+`commit` comes from `BENCH_COMMIT`, then `GITHUB_SHA`, then `git rev-parse HEAD`. The nightly benchmark jobs set `BENCH_OUT` and upload the file as the `benchmark-results-whitebox-<sha>` / `benchmark-results-blackbox-<sha>` artifacts (kept 90 days).
+
+Compare two result files:
+
+```bash
+make bench-diff BASE=old.jsonl HEAD=new.jsonl
+# also fail on request-count growth beyond 25%:
+make bench-diff BASE=old.jsonl HEAD=new.jsonl BENCH_DIFF_FLAGS=-strict-requests
+```
+
+It exits 1 on a regression: a case that passed now fails, a non-negative case finds less, or a case is missing from `HEAD`. Request drift beyond 25% is printed and only fails with `-strict-requests`.
+
+### Benign sweep and request budgets (unit suite)
+
+`pkg/modules/benign_sweep_test.go` runs every registered active module against the benign fixtures in `pkg/modules/modtest/fixtures.go` (safe echo, WAF block page, soft 404, random content, 429 limiter, and a slow host for timing modules only, skipped under `-short`), with a query record and a JSON-body record. Any finding above Info is a false positive and fails the test, unless the module/fixture pair is in `benignSweepAllowList` with a reason; a stale entry also fails. Each cell's request count is checked against `pkg/modules/testdata/request_budget.json` (±25%, at least ±2). After an intended change in a module's request volume, regenerate it:
+
+```bash
+go test ./pkg/modules/ -run 'TestBenignSweep$' -args -update-request-budget        # full, includes slow_host
+go test -short ./pkg/modules/ -run 'TestBenignSweep$' -args -update-request-budget # keeps recorded slow_host cells
 ```
 
 ---
+
 
 ## XBOW Validation Benchmarks
 
@@ -903,19 +936,19 @@ The `${XBOW_SOURCE_DIR}` environment variable is expanded via `os.ExpandEnv()` w
 
 | ID | XBOW | Vuln Type | Endpoint | Service:Port | Module | Assertion |
 |----|------|-----------|----------|-------------|--------|-----------|
-| xbow-xss-013 | XBEN-013-24 | XSS | `GET /page?name=test` | web:5000 | `active-xss-light-url-params` | soft |
-| xbow-xss-047 | XBEN-047-24 | XSS | `GET /page?url=test` | web:5000 | `active-xss-light-url-params` | soft |
-| xbow-ssti-009 | XBEN-009-24 | SSTI | `GET /greet/?name=test` | web:8000 | `active-reflected-ssti` | strict |
-| xbow-ssti-053 | XBEN-053-24 | SSTI | `GET /?username=test` | app:80 | `active-reflected-ssti` | strict |
-| xbow-ssti-076 | XBEN-076-24 | SSTI | `GET /greet?name=test` | web:5000 | `active-reflected-ssti` | strict |
-| xbow-sqli-083 | XBEN-083-24 | SQLi | `GET /?category=test` | web:80 | `active-sqli-error-based` | strict |
-| xbow-sqli-071 | XBEN-071-24 | SQLi | `POST /send.php` | app:80 | `active-sqli-error-based` | soft |
-| xbow-cmdi-073 | XBEN-073-24 | CmdI | `POST /ping` | web:80 | `active-code-exec` | strict |
-| xbow-lfi-019 | XBEN-019-24 | LFI | `GET /resource?filename=test.txt` | lfi_static_resource:80 | `active-lfi-generic` | strict |
-| xbow-lfi-061 | XBEN-061-24 | LFI | `GET /post.php?id=test` | web:80 | `active-lfi-generic` | strict |
-| xbow-ssrf-020 | XBEN-020-24 | SSRF | `GET /redirect.php?url=...` | ssrf-demo-app:80 | `active-ssrf-detection` | soft |
-| xbow-xxe-006 | XBEN-006-24 | XXE | `POST /addbook` (XML) | app:80 | `active-xxe-generic` | soft |
-| xbow-xxe-096 | XBEN-096-24 | SQLi | `POST /jobs` (JSON) | libraryv1:5000 | `active-sqli-error-based` | soft |
+| xbow-xss-013 | XBEN-013-24 | XSS | `GET /page?name=test` | web:5000 | `xss-light-url-params` | soft |
+| xbow-xss-047 | XBEN-047-24 | XSS | `GET /page?url=test` | web:5000 | `xss-light-url-params` | soft |
+| xbow-ssti-009 | XBEN-009-24 | SSTI | `GET /greet/?name=test` | web:8000 | `reflected-ssti` | strict |
+| xbow-ssti-053 | XBEN-053-24 | SSTI | `GET /?username=test` | app:80 | `reflected-ssti` | strict |
+| xbow-ssti-076 | XBEN-076-24 | SSTI | `GET /greet?name=test` | web:5000 | `reflected-ssti` | strict |
+| xbow-sqli-083 | XBEN-083-24 | SQLi | `GET /?category=test` | web:80 | `sqli-error-based` | strict |
+| xbow-sqli-071 | XBEN-071-24 | SQLi | `POST /send.php` | app:80 | `sqli-error-based` | soft |
+| xbow-cmdi-073 | XBEN-073-24 | CmdI | `POST /ping` | web:80 | `code-exec` | strict |
+| xbow-lfi-019 | XBEN-019-24 | LFI | `GET /resource?filename=test.txt` | lfi_static_resource:80 | `lfi-generic` | strict |
+| xbow-lfi-061 | XBEN-061-24 | LFI | `GET /post.php?id=test` | web:80 | `lfi-generic` | strict |
+| xbow-ssrf-020 | XBEN-020-24 | SSRF | `GET /redirect.php?url=...` | ssrf-demo-app:80 | `ssrf-detection` | soft |
+| xbow-xxe-006 | XBEN-006-24 | XXE | `POST /addbook` (XML) | app:80 | `xxe-generic` | soft |
+| xbow-xxe-096 | XBEN-096-24 | SQLi | `POST /jobs` (JSON) | libraryv1:5000 | `sqli-error-based` | soft |
 
 ### Test Runner Structure
 
@@ -986,11 +1019,11 @@ Failed to start container vulnerables/web-dvwa:latest: ...
 ### Module not found
 
 ```
-active modules not found: [active-nonexistent-module]
+active modules not found: [nonexistent-module]
 ```
 
 - Verify the module ID in `pkg/modules/default_registry.go`
-- Module IDs are case-sensitive and use kebab-case (e.g., `active-sqli-error-based`)
+- Module IDs are case-sensitive and use kebab-case (e.g., `sqli-error-based`)
 
 ### crAPI tests skip
 
@@ -1065,11 +1098,11 @@ Some modules require specialized infrastructure that is impractical for automate
 
 | Module | Reason | Workaround |
 |--------|--------|------------|
-| `active-http-request-smuggling` | Requires specific server configurations (CL.TE, TE.CL) | Manual testing with custom servers |
-| `active-race-interference` | Needs concurrent request handling with precise timing | Dedicated race condition test harness |
-| `active-xml-saml-security` | Needs SAML IdP setup | Test against SAML-vulnerable test apps |
-| `passive-anomaly-ranking` | Needs large traffic corpus for statistical analysis | Replay captured traffic |
-| `passive-oauth-facebook-detect` | Needs Facebook OAuth flow | Mock OAuth server |
-| `passive-serialized-object-detect` | Needs apps with Java/.NET serialization | Custom test server |
+| `http-request-smuggling` | Requires specific server configurations (CL.TE, TE.CL) | Manual testing with custom servers |
+| `race-interference` | Needs concurrent request handling with precise timing | Dedicated race condition test harness |
+| `xml-saml-security` | Needs SAML IdP setup | Test against SAML-vulnerable test apps |
+| `anomaly-ranking` | Needs large traffic corpus for statistical analysis | Replay captured traffic |
+| `oauth-facebook-detect` | Needs Facebook OAuth flow | Mock OAuth server |
+| `serialized-object-detect` | Needs apps with Java/.NET serialization | Custom test server |
 
 These modules should be tested through dedicated test files rather than the YAML-driven benchmark system.

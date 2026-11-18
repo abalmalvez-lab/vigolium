@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Laravel framework-specific misconfigurations: debug mode enabled with
-Ignition/Whoops error pages, exposed debugbar endpoints leaking SQL queries and
-routes, accessible application logs with stack traces and secrets, and exposed
-Telescope debugging dashboard.
+	ModuleDesc = `**What it means:** A Laravel app exposes development features that should never reach production: debug mode (Ignition or Whoops), an open Debugbar, readable logs, a Telescope or Horizon dashboard, or a leaked .env disclosing stack traces and often the APP_KEY plus database credentials.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Fingerprints 404 responses to detect custom error pages
-- Debug mode detection triggers a deliberate error to check for Ignition/Whoops
+**How it's exploited:** Debugbar and Telescope expose queries and full request/response pairs, and a disclosed APP_KEY or .env yields signing keys enabling session forgery or backend access. Some Ignition versions are exploitable for RCE.
 
-## References
-- https://laravel.com/docs/configuration
-- https://flareapp.io/docs/ignition-for-laravel/introduction
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Set APP_DEBUG=false in production, remove or restrict Debugbar, Telescope, and Horizon, and block public access to storage, log, and environment files.`
 
 	ModuleConfirmation = "Confirmed when probed Laravel endpoints return 200 with expected framework-specific markers"
 	ModuleSeverity     = severity.High

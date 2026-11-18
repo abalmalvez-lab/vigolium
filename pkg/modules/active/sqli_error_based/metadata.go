@@ -9,18 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects SQL injection vulnerabilities by injecting SQL syntax into parameters and
-analyzing response bodies for database error messages from MySQL, PostgreSQL, MSSQL,
-Oracle, and SQLite.
+	ModuleDesc = `**What it means:** A parameter is concatenated into a backend SQL query without escaping (error-based SQL injection): injecting broken syntax raises a leaked database error, and the same injection point lets an attacker rewrite the query.
 
-## Notes
-- Tests each insertion point independently
-- Uses request deduplication to avoid redundant checks
-- Skips hosts that have exceeded the error threshold
+**How it's exploited:** An attacker injects an unbalanced quote to confirm the flaw via the leaked DBMS error, then uses UNION or boolean payloads to read or modify data, dump credential hashes, and pivot deeper - the error is confirmed absent from a clean control request.
 
-## References
-- https://owasp.org/www-community/attacks/SQL_Injection`
+**Fix:** Use parameterized queries or prepared statements for database calls, validate input, and suppress detailed database error messages.`
 
 	ModuleConfirmation = "Confirmed when injected SQL syntax triggers a database error pattern in the response body"
 	ModuleSeverity     = severity.Critical

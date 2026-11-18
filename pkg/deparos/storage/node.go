@@ -27,8 +27,8 @@ type DiscoveredNode struct {
 	// Cached tags (computed from request/response analysis)
 	tags []string
 
-	// Cached kingfisher findings (secrets detected in response)
-	kingfisherFindings []KingfisherFinding
+	// Cached secret findings (secrets detected in response)
+	secretFindings []SecretFinding
 }
 
 // ID returns the database ID of the node.
@@ -60,6 +60,11 @@ type ResponseData struct {
 	FingerprintAttrs map[uint8]uint32 // Fingerprint attribute ID → hash value
 	Words            int64            // Word count in response body
 	Lines            int64            // Line count in response body
+	// DurationMs is the measured round-trip time for this response, in
+	// milliseconds. Zero means NOT MEASURED, never "instant" — a node reloaded
+	// from a prior session's store, or produced by a path that does not time
+	// its sends, legitimately has none.
+	DurationMs int64
 }
 
 // DiscoveryMetadata tracks how and when the URL was found
@@ -134,12 +139,12 @@ func (n *DiscoveredNode) SetTags(tags []string) {
 	n.tags = tags
 }
 
-// KingfisherFindings returns the cached kingfisher findings for this node
-func (n *DiscoveredNode) KingfisherFindings() []KingfisherFinding {
-	return n.kingfisherFindings
+// SecretFindings returns the cached secret findings for this node
+func (n *DiscoveredNode) SecretFindings() []SecretFinding {
+	return n.secretFindings
 }
 
-// SetKingfisherFindings sets the cached kingfisher findings for this node
-func (n *DiscoveredNode) SetKingfisherFindings(findings []KingfisherFinding) {
-	n.kingfisherFindings = findings
+// SetSecretFindings sets the cached secret findings for this node
+func (n *DiscoveredNode) SetSecretFindings(findings []SecretFinding) {
+	n.secretFindings = findings
 }

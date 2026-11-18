@@ -5,26 +5,21 @@ import "github.com/vigolium/vigolium/pkg/types/severity"
 const (
 	ModuleID    = "serialized-object-detect"
 	ModuleName  = "Serialized Object Detection"
-	ModuleShort = "Detects serialized Java/PHP/.NET/Python objects in request parameters"
+	ModuleShort = "Detects serialized Java/PHP/.NET/Python/Ruby/Node.js objects in request parameters (incl. base64-wrapped)"
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects serialized objects in HTTP request parameters by matching known
-serialization format signatures for Java, PHP, .NET, and Python.
+	ModuleDesc = `**What it means:** A request parameter (query, path, cookie, or body) carries a serialized object whose byte signature matches a known Java, PHP, .NET, Python, Ruby, or Node.js format, including base64-wrapped values. Accepting client-controllable serialized data drives insecure deserialization. This signature check confirms an attack surface, not exploitability.
 
-## Notes
-- Java: base64 prefix "rO0AB" or hex prefix "aced0005"
-- PHP: pattern matching O:N:"class", a:N:{, etc.
-- .NET: base64 prefix "AAEAAAD" (BinaryFormatter)
-- Python: pickle indicators ("ccopy_reg" prefix or protocol markers)
+**How it's exploited:** If the server deserializes the value without strict type allow-listing, an attacker supplies a crafted object that triggers gadget chains, leading to remote code execution, auth bypass, or object injection.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/16-Testing_for_HTTP_Incoming_Requests
-- https://portswigger.net/web-security/deserialization`
+**Fix:** Avoid deserializing untrusted input; if unavoidable, use JSON with schema validation or strict class allow-listing.`
 
 	ModuleConfirmation = "Confirmed when request parameter values contain known serialization format signatures"
-	ModuleSeverity     = severity.Medium
-	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"deserialization", "light"}
+	// The module text says this "confirms an attack surface, not exploitability" —
+	// a serialized blob in a request is a precondition/lead, not a confirmed
+	// deserialization vuln, so it belongs at Low rather than Medium.
+	ModuleSeverity   = severity.Low
+	ModuleConfidence = severity.Firm
+	ModuleTags       = []string{"deserialization", "light"}
 )

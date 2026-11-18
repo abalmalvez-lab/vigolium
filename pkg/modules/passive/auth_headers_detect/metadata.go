@@ -9,19 +9,19 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects authorization and authentication headers in HTTP requests,
-flagging endpoints that handle sensitive credentials.
+	ModuleDesc = `**What it means:** Informational: the scanner observed a request carrying an Authorization header (a Bearer token or Basic credentials) and records the endpoint and credential. This marks an authenticated boundary; the credential is sensitive.
 
-## Notes
-- Scans request headers for Authorization, Cookie, X-API-Key, and similar patterns
-- Helps identify authentication boundaries in the application
+**How it's exploited:** The disclosure maps which endpoints need authentication. If the credential is leaked, logged, or sent over a weak channel, an attacker who recovers it replays it to impersonate the user.
 
-## References
-- https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Authorization`
+**Fix:** Treat Authorization values as secrets: keep them out of logs, caches, and URLs, send only over TLS, scope and expire tokens, and rotate exposed credentials.`
 
-	ModuleConfirmation = "Confirmed when request contains recognized authentication headers (Authorization, Bearer tokens, API keys)"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"authentication", "info-disclosure", "light"}
+	ModuleConfirmation = "Confirmed when a request carries an Authorization header with a real credential (not a bare scheme or placeholder) and the response is the application, not a WAF/CDN edge block"
+	// Observing that a client sent its OWN Authorization header to its OWN API
+	// over TLS is reconnaissance/inventory, not a vulnerability — the credential
+	// was never disclosed to a third party. The module text says "Informational",
+	// so the severity must match: reporting this at Medium produced a large volume
+	// of over-severe findings (one per authenticated endpoint) across every host.
+	ModuleSeverity   = severity.Info
+	ModuleConfidence = severity.Tentative
+	ModuleTags       = []string{"authentication", "info-disclosure", "light"}
 )

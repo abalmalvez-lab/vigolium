@@ -9,25 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Inspects HTTP responses for NextAuth.js (Auth.js) session configuration issues.
-Checks session cookies for missing security flags, decodes JWT session tokens to
-detect sensitive data exposure, and fingerprints NextAuth API endpoints for
-information leakage.
+	ModuleDesc = `**What it means:** A NextAuth.js (Auth.js) session cookie lacks a browser security attribute, or a readable JWS-shaped session token contains a substantive value under a security-relevant claim. Name-only, empty, and redacted claims remain observations.
 
-## Notes
-- Detects NextAuth session cookies (next-auth.session-token, __Secure-next-auth.*)
-- Checks cookie flags: Secure, HttpOnly, SameSite
-- Decodes JWT payloads to detect sensitive claims (passwords, secrets, tokens)
-- Fingerprints NextAuth endpoints via response patterns
-- Deduplicates by host
+**How it's exploited:** Missing HttpOnly lets script read the session cookie; missing Secure permits cleartext transport; SameSite affects cross-site requests. Embedded credentials may expose an additional secret, but the scanner does not claim that credential is valid without provider or authorization proof.
 
-## References
-- https://next-auth.js.org/configuration/options
-- https://next-auth.js.org/configuration/options#cookies
-- https://authjs.dev/getting-started/session-management/protecting`
+**Fix:** Set Secure, HttpOnly, and SameSite=Lax/Strict on NextAuth cookies, and keep secrets out of the JWT payload.`
 
-	ModuleConfirmation = "Confirmed when NextAuth session cookies have insecure flags or JWT tokens contain sensitive data"
+	ModuleConfirmation = "Confirmed for parsed session-cookie attribute defects; decoded substantive claim values are candidates until their sensitivity or impact is validated"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"nextjs", "javascript", "authentication", "session", "light"}

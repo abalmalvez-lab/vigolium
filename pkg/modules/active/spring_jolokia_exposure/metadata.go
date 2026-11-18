@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed Jolokia endpoints that provide HTTP/JSON access to JMX
-(Java Management Extensions). Jolokia can disclose sensitive runtime attributes,
-MBean operations, and in some configurations enable dangerous operations like
-remote code execution through MBean invocation.
+	ModuleDesc = `**What it means:** An unauthenticated Jolokia endpoint (/jolokia, /jolokia/list, /actuator/jolokia) gives HTTP/JSON access to the application's JMX layer, exposing internal runtime state and management operations to anyone who reaches the URL. Hits are confirmed by Jolokia-specific JSON markers.
 
-## Notes
-- Runs once per host
-- Checks multiple Jolokia paths including actuator-prefixed variants
-- Validates responses using Jolokia-specific JSON markers
-- Fingerprints 404 responses to reduce false positives
+**How it's exploited:** An attacker reads JMX attributes to harvest configuration, credentials, and environment details, and enumerates MBeans via /jolokia/list. Where write/exec is enabled, dangerous MBean operations can alter settings or chain into remote code execution.
 
-## References
-- https://jolokia.org/reference/html/index.html
-- https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html`
+**Fix:** Disable Jolokia in production, or restrict it behind authentication and network controls and turn off write/exec access.`
 
 	ModuleConfirmation = "Confirmed when Jolokia endpoints return valid JSON responses with agent information or MBean data"
 	ModuleSeverity     = severity.High

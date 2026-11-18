@@ -32,11 +32,18 @@ type Options struct {
 	Hostname    string   // target hostname (derived from TargetURL if empty)
 
 	// Output
-	OutputPath   string    // write agent output to this file
-	DryRun       bool      // render prompt and print it, don't execute agent
-	ShowPrompt   bool      // print rendered prompt to stderr before executing
-	ScanUUID     string    // scan UUID to attach findings to
-	ProjectUUID  string    // project UUID for data scoping
+	OutputPath  string // write agent output to this file
+	DryRun      bool   // render prompt and print it, don't execute agent
+	ShowPrompt  bool   // print rendered prompt to stderr before executing
+	ScanUUID    string // scan UUID to attach findings to
+	ProjectUUID string // project UUID for data scoping
+	// EnableBurpBridgeTools exposes only the live read-only Burp search and
+	// inspect tools on a fresh agent session. It does not enable replay tools.
+	EnableBurpBridgeTools bool `json:"-"`
+	// OfflineTools restricts the run to tools that reach neither the network
+	// nor a shell (read_file, ls, grep, glob): the agent reasons over what the
+	// prompt carries and cannot contact the target. `agent triage --no-probe`.
+	OfflineTools bool      `json:"-"`
 	StreamWriter io.Writer `json:"-"` // when non-nil, agent output is streamed here in real-time
 	SessionDir   string    `json:"-"` // session directory for artifacts (transcripts, generated extensions, etc.)
 	Verbose      bool      `json:"-"` // when true, the toollog renders a per-tool result preview alongside the standard one-liner
@@ -122,6 +129,11 @@ type AgentFinding struct {
 	Snippet     string   `json:"snippet,omitempty"`
 	CWE         string   `json:"cwe,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
+	// URL, Hostname and MatchedAt locate a finding on a live target (a code
+	// finding has File/Line instead).
+	URL       string   `json:"url,omitempty"`
+	Hostname  string   `json:"hostname,omitempty"`
+	MatchedAt []string `json:"matched_at,omitempty"`
 }
 
 // UnmarshalJSON implements lenient parsing for AgentFinding.
@@ -158,6 +170,15 @@ func (f *AgentFinding) UnmarshalJSON(data []byte) error {
 	}
 	if v, ok := raw["tags"]; ok {
 		f.Tags = flexStringSlice(v)
+	}
+	if v, ok := raw["url"]; ok && v != nil {
+		f.URL = fmt.Sprint(v)
+	}
+	if v, ok := raw["hostname"]; ok && v != nil {
+		f.Hostname = fmt.Sprint(v)
+	}
+	if v, ok := raw["matched_at"]; ok {
+		f.MatchedAt = flexStringSlice(v)
 	}
 	return nil
 }

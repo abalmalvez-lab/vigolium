@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects HTTP response headers that reveal exact software version numbers.
-Headers such as Server, X-Powered-By, X-AspNet-Version, and X-AspNetMvc-Version
-frequently expose the underlying technology stack and its version, enabling attackers
-to search for known CVEs targeting those specific versions.
+	ModuleDesc = `**What it means:** The server returns HTTP headers disclosing its exact software version. This passively flags version-revealing headers (Server, X-Powered-By, X-AspNet-Version, X-Runtime, X-OWA-Version) only when they carry an actual version number, not just a product name. Informational disclosure that aids reconnaissance.
 
-## Notes
-- Checks common version-disclosing headers against version number patterns
-- Only reports when an actual version number is present (not just a product name)
-- Deduplicates by host to report each server's version headers once
-- Extracts the header name, product, and version for each finding
+**How it's exploited:** Knowing a precise version (for example Apache 2.4.41 or PHP 8.1.2) lets an attacker look up CVEs affecting exactly that build and target the host directly instead of probing blindly.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/08-Fingerprint_Web_Application_Framework
-- https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html
-- https://cwe.mitre.org/data/definitions/200.html`
+**Fix:** Suppress or generalize these headers (for example ServerTokens Prod, expose_php Off) and strip framework version headers at the proxy layer.`
 
 	ModuleConfirmation = "Confirmed when HTTP response headers contain version-disclosing values with identifiable version numbers"
 	ModuleSeverity     = severity.Info

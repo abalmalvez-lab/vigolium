@@ -535,12 +535,48 @@ func TestOriginMode_Relaxed(t *testing.T) {
 		{"test-example.net", true},
 		{"evil.com", false},
 		{"google.com", false},
+		// A third-party host whose subdomain label merely contains the keyword
+		// but whose registrable domain is unrelated must be out of scope. Guards
+		// against a bare strings.Contains(host, keyword) match.
+		{"example.evil.com", false},
 	}
 
 	for _, tt := range tests {
 		got := m.hostInScope(tt.host)
 		if got != tt.want {
 			t.Errorf("relaxed: hostInScope(%q) = %v, want %v", tt.host, got, tt.want)
+		}
+	}
+}
+
+// TestOriginMode_Relaxed_ThirdPartyKeywordSubstring is a regression test for the
+// SSO/login-wall case where a scan of admin-newcheckbox-test.acme.com (keyword
+// "acme") pulled the Cloudflare Access wall acmegroup.cloudflareaccess.com into
+// scope — because "acmegroup" contains "acme" — and deparos discovery then
+// actively probed that unrelated third-party host. Relaxed must match the keyword
+// against the registrable-domain leading label, not the full hostname.
+func TestOriginMode_Relaxed_ThirdPartyKeywordSubstring(t *testing.T) {
+	cfg := *DefaultScopeConfig()
+	cfg.CLIOriginMode = "relaxed"
+	cfg.IgnoreStaticFile = false
+	m := NewScopeMatcher(cfg, "https://admin-newcheckbox-test.acme.com")
+
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"admin-newcheckbox-test.acme.com", true}, // the target
+		{"wam.acme.com", true},                    // same registrable domain (acme.com IdP)
+		{"acme.io", true},                         // same org, different TLD
+		{"acmegroup.com", true},                   // brand domain, keyword in registrable label
+		{"acmegroup.cloudflareaccess.com", false}, // third-party wall — registrable label "cloudflareaccess"
+		{"acme.somecdn.net", false},               // keyword only in a subdomain label
+		{"acmegroup", false},                      // single-label host, no eTLD+1 — must not leak via substring
+	}
+
+	for _, tt := range tests {
+		if got := m.hostInScope(tt.host); got != tt.want {
+			t.Errorf("relaxed(acme): hostInScope(%q) = %v, want %v", tt.host, got, tt.want)
 		}
 	}
 }
@@ -775,17 +811,52 @@ func TestOriginMode_CoUKDomain(t *testing.T) {
 
 func TestOriginMode_EmptyOriginMode(t *testing.T) {
 	cfg := *DefaultScopeConfig()
-	cfg.CLIOriginMode = "" // empty should default to "relaxed"
+	cfg.CLIOriginMode = "" // empty should default to "balanced"
 	cfg.IgnoreStaticFile = false
 	m := NewScopeMatcher(cfg, "http://example.com")
 
-	// With relaxed default, evil.com should be out of scope (no keyword match)
 	if m.hostInScope("evil.com") {
-		t.Error("empty origin mode should default to relaxed: evil.com should be out of scope")
+		t.Error("empty origin mode should default to balanced: evil.com should be out of scope")
 	}
-	// But a host containing the keyword "example" should be in scope
 	if !m.hostInScope("example.com") {
-		t.Error("empty origin mode should default to relaxed: example.com should be in scope")
+		t.Error("empty origin mode should default to balanced: example.com should be in scope")
+	}
+	if !m.hostInScope("api.example.com") {
+		t.Error("empty origin mode should default to balanced: a subdomain should be in scope")
+	}
+	// The distinguishing case: balanced keys on the registrable domain, so a
+	// same-brand host on another TLD is OUT. Relaxed admits it; that difference
+	// is the reason balanced is the default (see ScopeConfig.CLIOriginMode).
+	if m.hostInScope("example.net") {
+		t.Error("empty origin mode should default to balanced: example.net (other TLD) should be out of scope")
+	}
+}
+
+// TestDefaultOriginModeExcludesCrossTLDIdP pins the scan-shape reason the
+// default is "balanced": a target's identity provider commonly lives on the
+// organization's other registrable domain, and relaxed mode admitted it — so a
+// scan of one app fanned out onto the corporate SSO estate, which is someone
+// else's infrastructure and never the thing under test.
+func TestDefaultOriginModeExcludesCrossTLDIdP(t *testing.T) {
+	cfg := *DefaultScopeConfig()
+	cfg.IgnoreStaticFile = false
+	m := NewScopeMatcher(cfg, "https://app.example.net")
+
+	if !m.hostInScope("app.example.net") {
+		t.Error("the target itself must stay in scope")
+	}
+	if m.hostInScope("sso.example.com") {
+		t.Error("cross-TLD IdP must be out of scope under the balanced default")
+	}
+	if m.hostInScope("challenges.cloudflare.com") {
+		t.Error("third-party CAPTCHA host must be out of scope")
+	}
+
+	// Same-registrable-domain IdP is still admitted by the scope rule — it is
+	// the crawler's wall denial, not the scope mode, that keeps the crawler off
+	// it. Pinned so a future scope change does not silently take over that job.
+	if !m.hostInScope("sso.example.net") {
+		t.Error("same-eTLD+1 host should remain in scope for the scope matcher")
 	}
 }
 

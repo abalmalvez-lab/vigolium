@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -143,7 +145,7 @@ func (s *SwarmRunner) runPlanAgent(ctx context.Context, cfg SwarmConfig, records
 		Verbose:        cfg.Verbose,
 	}
 
-	// Resolve effective vuln focus: --vuln-type takes precedence, --focus is a broader hint
+	// Resolve effective vuln focus: --vuln-type takes precedence, the intent-parsed focus is a broader hint
 	effectiveVulnType := cfg.VulnType
 	if effectiveVulnType == "" && cfg.Focus != "" {
 		effectiveVulnType = cfg.Focus
@@ -176,11 +178,13 @@ func (s *SwarmRunner) runPlanAgent(ctx context.Context, cfg SwarmConfig, records
 			extraContext = retryTruncateContext(records)
 		}
 
-		result, runErr := s.engine.RunWithExtra(ctx, opts, map[string]string{
+		// Pass the full skill registry so the planner sees the <available_skills>
+		// menu and can populate recommended_skills for the triage phase.
+		result, runErr := s.engine.RunWithExtraSkills(ctx, opts, map[string]string{
 			"RequestContext": extraContext,
 			"VulnType":       effectiveVulnType,
 			"TechStack":      techStackMd,
-		})
+		}, s.skills)
 		if runErr != nil {
 			if isRetryableAgentError(ctx, runErr) && attempt < maxAttempts {
 				zap.L().Warn("plan agent execution failed (retryable), will retry",
@@ -770,9 +774,9 @@ func mergeSwarmPlans(plans []*SwarmPlan) (*SwarmPlan, *BatchProvenance) {
 	}
 
 	merged := &SwarmPlan{
-		ModuleTags:            sortedKeys(tagSet),
-		ModuleIDs:             sortedKeys(idSet),
-		FocusAreas:            sortedKeys(focusSet),
+		ModuleTags:            slices.Sorted(maps.Keys(tagSet)),
+		ModuleIDs:             slices.Sorted(maps.Keys(idSet)),
+		FocusAreas:            slices.Sorted(maps.Keys(focusSet)),
 		Notes:                 strings.Join(notes, "; "),
 		NeedsExtensions:       needsExt,
 		NeedsExtensionsReason: needsExtReason,
@@ -788,14 +792,4 @@ func mergeSwarmPlans(plans []*SwarmPlan) (*SwarmPlan, *BatchProvenance) {
 		merged.Snippets = append(merged.Snippets, snip)
 	}
 	return merged, prov
-}
-
-// sortedKeys returns sorted keys from a boolean set map.
-func sortedKeys(s map[string]bool) []string {
-	result := make([]string, 0, len(s))
-	for k := range s {
-		result = append(result, k)
-	}
-	sort.Strings(result)
-	return result
 }

@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Drupal-specific files and endpoints that should not be publicly
-accessible: settings.php source disclosure, services.yml, update.php, install.php,
-authorize.php, CHANGELOG.txt, config sync directory, Twig debug output, public
-files directory listing, and development services.
+	ModuleDesc = `**What it means:** A Drupal site exposes files or endpoints that should be blocked from public access, from leaking database credentials and full configuration (settings.php, config sync export) down to confirming the version (CHANGELOG.txt). Each hit is reported at its own severity.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Covers both Drupal 7 and Drupal 8+ paths
-- Fingerprints 404 responses to detect custom error pages
+**How it's exploited:** A readable settings.php leaks database credentials and the hash salt, install.php may allow re-installing under attacker control, and a config sync directory leaks the module list. update.php and authorize.php drive module installation; version files pinpoint the version for CVEs.
 
-## References
-- https://www.drupal.org/docs/administering-a-drupal-site/security-in-drupal/securing-your-site
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Block web access to these admin scripts, config, source, and dotfiles, and disable directory listings.`
 
 	ModuleConfirmation = "Confirmed when probed Drupal files return 200 with expected content markers"
 	ModuleSeverity     = severity.High

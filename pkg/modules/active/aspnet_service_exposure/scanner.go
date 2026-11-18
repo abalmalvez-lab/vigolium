@@ -15,6 +15,13 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
+// decoyRounds is how many same-directory negative-control probes the catch-all
+// disproof issues per candidate. A host that answers every /<dir>/<anything> with
+// the same 200 page (a reflecting/echo server, an SPA fallback, a blanket rewrite)
+// trips at least one round and the candidate is dropped. Two rounds tolerate a
+// single WAF/CDN flake without over-probing.
+const decoyRounds = 2
+
 type notFoundFingerprint struct {
 	bodyHash string
 	bodyLen  int
@@ -63,10 +70,7 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -128,11 +132,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -162,11 +164,9 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -190,6 +190,17 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Content-type discipline (survives the body-truncation FP — the header is
+	// intact when a gzip/Content-Length:0 quirk leaves only a partial body tail): an
+	// OData $metadata probe targets an XML document never served as an HTML *page*.
+	// A reflecting/catch-all host that answers arbitrary paths with its themed
+	// text/html shell would otherwise forge a match on a weak marker ("EntityType")
+	// surviving in that tail; rejecting an HTML document for an XML probe costs no
+	// true positives.
+	if p.structured && modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
+		return nil
+	}
+
 	body := resp.Body().String()
 
 	if fp != nil {
@@ -205,6 +216,12 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Catch-all / SPA shell guard: a themed app that returns the same shell for
+	// any path is a false positive even when a weak marker appears in that shell.
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
 			return nil
@@ -215,15 +232,29 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
+	// Strip the reflected request path before marker matching: a catch-all/echo host
+	// that mirrors the requested path into its response would otherwise let a marker
+	// that is itself a path segment satisfy the check. The original body is kept for
+	// anti-markers and stored evidence.
+	matchBody := modkit.StripReflectedProbePath(body, p.path)
+
+	matchedMarkers, ok := p.accepts(matchBody)
+	if !ok {
+		return nil
 	}
-	if !matched {
+
+	// Multi-round catch-all disproof: probe several guaranteed-nonexistent siblings
+	// under this probe's parent directory. If a random sibling returns the same
+	// status and also satisfies the marker predicate, the host serves this content
+	// for any path — a reflecting/echo server or a wildcard rewrite — so a weak
+	// directory-listing word ("Index of", ".asmx") in the shell proves nothing. A
+	// genuinely exposed directory has no such sibling (the decoy 404s), so this
+	// costs no true positives, and it is robust to the body-truncation quirk because
+	// the decoy is run through the same predicate, not a body-similarity compare.
+	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+		_, sibOK := p.accepts(b)
+		return sibOK
+	}) {
 		return nil
 	}
 
@@ -264,11 +295,9 @@ func (m *Module) probeServiceDiscovery(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -285,6 +314,15 @@ func (m *Module) probeServiceDiscovery(
 		return nil
 	}
 
+	// Content-type discipline (survives the body-truncation FP): a WSDL / discovery
+	// document is XML, never an HTML *document*. A reflecting/catch-all host that
+	// answers arbitrary paths with its themed text/html shell is rejected here even
+	// when the shell tail happens to carry a "<definitions" substring; a real WSDL
+	// never comes back as text/html.
+	if modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
+		return nil
+	}
+
 	body := resp.Body().String()
 
 	if fp != nil {
@@ -294,9 +332,20 @@ func (m *Module) probeServiceDiscovery(
 		}
 	}
 
+	// Catch-all / SPA shell guard: a themed app that returns the same shell for
+	// any path is a false positive even when a weak marker appears in that shell.
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
+	// Strip the reflected request path (the WSDL/disco query is appended to the seed
+	// path) before marker matching so a catch-all/echo host that mirrors it back
+	// cannot self-satisfy the check.
+	matchBody := modkit.StripReflectedProbePath(body, path)
+
 	var matchedMarkers []string
 	for _, marker := range markers {
-		if strings.Contains(body, marker) {
+		if strings.Contains(matchBody, marker) {
 			matchedMarkers = append(matchedMarkers, marker)
 		}
 	}
@@ -353,11 +402,9 @@ func (m *Module) probeWCFDetailedFaults(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath/SetBody produce well-formed raw, so wrap directly
+	// instead of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {

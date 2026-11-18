@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent/agenttypes"
@@ -17,6 +16,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/agent/parsing"
 	agentprompt "github.com/vigolium/vigolium/pkg/agent/prompt"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/olium/skill"
 	"go.uber.org/zap"
 )
 
@@ -42,6 +42,10 @@ type Engine struct {
 	// populate SwarmResult.TokenUsage for cost / telemetry.
 	tokenUsageMu sync.Mutex
 	tokenUsage   agenttypes.TokenUsage
+
+	// budget is the run-wide cap installed by SetRunBudget (swarm's
+	// --max-commands / --token-budget / --max-cost-usd); see budget.go.
+	budget budgetState
 
 	// runtime is the AI-dispatch seam. It defaults to the olium-backed runtime;
 	// tests may inject a fake. All AI calls go through it so the engine depends
@@ -70,7 +74,29 @@ func (e *Engine) rt() AgentRuntime {
 // Run executes a full agent pipeline: resolve prompt → render → execute → parse → ingest.
 // Each call constructs a fresh in-process olium engine.
 func (e *Engine) Run(ctx context.Context, opts Options) (*Result, error) {
-	return e.runOnSession(ctx, opts, nil)
+	return e.runOnSession(ctx, opts, nil, nil)
+}
+
+// RunWithSkills is Run with a skill registry surfaced to the agent: the
+// fresh-per-call engine gets an <available_skills> block and the load_skill
+// tool for exactly the skills in reg. A nil/empty reg behaves like Run.
+func (e *Engine) RunWithSkills(ctx context.Context, opts Options, reg *skill.Registry) (*Result, error) {
+	return e.runOnSession(ctx, opts, nil, reg)
+}
+
+// RunWithExtraSkills merges extra template data (like RunWithExtra) and also
+// surfaces the given skill registry to the agent. Used by the swarm plan phase
+// to give the planner the full skill menu.
+func (e *Engine) RunWithExtraSkills(ctx context.Context, opts Options, extra map[string]string, reg *skill.Registry) (*Result, error) {
+	if extra != nil {
+		if opts.Extra == nil {
+			opts.Extra = make(map[string]string)
+		}
+		for k, v := range extra {
+			opts.Extra[k] = v
+		}
+	}
+	return e.runOnSession(ctx, opts, nil, reg)
 }
 
 // RunOnOliumEngine is like Run but reuses an existing AgentSession so the
@@ -80,12 +106,16 @@ func (e *Engine) Run(ctx context.Context, opts Options) (*Result, error) {
 // e.g., the source-analysis explore phase forks to 3 format/extension
 // goroutines that don't need to re-append the explore notes.
 func (e *Engine) RunOnOliumEngine(ctx context.Context, opts Options, sess AgentSession) (*Result, error) {
-	return e.runOnSession(ctx, opts, sess)
+	return e.runOnSession(ctx, opts, sess, nil)
 }
 
 // runOnSession is the unified Run implementation. sess=nil → fresh session
-// per call (default); sess != nil → reuse the supplied session.
-func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSession) (*Result, error) {
+// per call (default); sess != nil → reuse the supplied session. skills, when
+// non-nil and non-empty, is surfaced via a per-call session carrying the
+// <available_skills> block + load_skill tool (only on the fresh path; the
+// session-reuse path already baked in whatever skills its session was built
+// with).
+func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSession, skills *skill.Registry) (*Result, error) {
 	// AgentName is informational now — all dispatch goes through olium. Retain
 	// the field so log lines and Result.AgentName keep their old semantics.
 	if opts.AgentName == "" {
@@ -150,10 +180,62 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 
 		var out oliumRunOutput
 		var runErr error
-		if sess != nil {
+		switch {
+		case sess != nil:
+			// Session-reuse path: the recorder (if any) is attached to the
+			// session's engine and flushed by the caller's sess.Close().
 			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, sess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
-		} else {
-			out, runErr = e.rt().RunPrompt(ctx, oliumCfg, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.SourcePath, opts.Verbose)
+		case (skills != nil && skills.Len() > 0) || opts.EnableBurpBridgeTools:
+			// Fresh-per-call path with skills and/or the live Burp bridge: build a
+			// per-call session carrying the requested tools, run on it, then
+			// flush its transcript via Close (the recorder buffers the final
+			// turn until close). A build failure surfaces as a retryable error.
+			rec := RecordSpec{SessionDir: opts.SessionDir, Template: opts.PromptTemplate}
+			// When a repo is wired, also give the skill-driven agent the
+			// read+replay tool subset so its skills can actually confirm against
+			// scan records (not just reason over prompt context).
+			var vigTools *VigToolSpec
+			if e.repo != nil && skills != nil && skills.Len() > 0 {
+				vigTools = &VigToolSpec{Repo: e.repo, ProjectUUID: opts.ProjectUUID}
+			}
+			var burpBridgeTools *BurpBridgeToolSpec
+			if opts.EnableBurpBridgeTools || (skills != nil && skills.Len() > 0) {
+				burpBridgeTools = &BurpBridgeToolSpec{ProjectUUID: opts.ProjectUUID}
+			}
+			skillSess, sErr := e.rt().NewSessionWithSpec(oliumCfg, SessionSpec{
+				SourcePath:      opts.SourcePath,
+				IncludeTools:    true,
+				Skills:          skills,
+				VigTools:        vigTools,
+				BurpBridgeTools: burpBridgeTools,
+				Record:          rec,
+			})
+			if sErr != nil {
+				return oliumRunOutput{}, sErr
+			}
+			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, skillSess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
+			_ = skillSess.Close()
+		case opts.OfflineTools:
+			// Offline path: a per-call session whose only tools read local
+			// files, so the agent cannot reach the target (no bash, no
+			// web_fetch, no browser).
+			rec := RecordSpec{SessionDir: opts.SessionDir, Template: opts.PromptTemplate}
+			offSess, sErr := e.rt().NewSessionWithSpec(oliumCfg, SessionSpec{
+				SourcePath:   opts.SourcePath,
+				IncludeTools: true,
+				OfflineTools: true,
+				Record:       rec,
+			})
+			if sErr != nil {
+				return oliumRunOutput{}, sErr
+			}
+			out, runErr = e.rt().RunOnSession(ctx, oliumCfg, offSess, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.Verbose)
+			_ = offSess.Close()
+		default:
+			// Fresh-per-call path: record a per-phase transcript when a session
+			// dir is wired, named by template so concurrent phases don't clash.
+			rec := RecordSpec{SessionDir: opts.SessionDir, Template: opts.PromptTemplate}
+			out, runErr = e.rt().RunPrompt(ctx, oliumCfg, runPrompt, opts.StreamWriter, thinkingSink.writer(), opts.SourcePath, opts.Verbose, rec)
 		}
 		if runErr != nil {
 			return out, runErr
@@ -170,6 +252,7 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 	// Accumulate usage even on error — partial token cost still counts toward
 	// the run's total spend.
 	e.addTokenUsage(runOut.Usage)
+	e.chargeRunBudget(runOut.Usage, runOut.ToolCalls)
 
 	// Ensure streamed output ends with a newline so subsequent console lines
 	// (e.g. session dir, phase banners) don't start on the same line.
@@ -262,49 +345,6 @@ func (e *Engine) runOnSession(ctx context.Context, opts Options, sess AgentSessi
 	}
 
 	return result, nil
-}
-
-// Preflight verifies the olium provider is resolvable AND that
-// credentials actually work by issuing a tiny ping prompt. Call this
-// before starting a multi-phase pipeline so credential / network problems
-// fail fast (within ~5 seconds) instead of after a minute of normalize +
-// discovery work. agentName is retained for call-site compatibility; it
-// no longer affects dispatch.
-//
-// The ping is bounded by a hard 5s timeout; transient ping failures are
-// returned as errors so the caller can decide whether to bail or continue
-// (CLI usually bails, server endpoints typically continue and let the
-// real first-call failure surface in the run record).
-func (e *Engine) Preflight(agentName string) error {
-	if e.settings == nil {
-		return fmt.Errorf("agent settings are nil")
-	}
-	cfg := e.settings.Agent.Olium
-	if cfg.Provider == "" && cfg.Model == "" {
-		return fmt.Errorf("agent.olium config is empty — set agent.olium.provider in ~/.vigolium/vigolium-configs.yaml")
-	}
-
-	// Build a one-shot engine and issue a minimal ping. We use a fresh
-	// 5s context so a hung provider (TCP black hole) doesn't block the
-	// whole startup. Ping prompt asks for a single token to keep the
-	// cost effectively zero.
-	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	sess, err := e.rt().NewSession(&cfg, "")
-	if err != nil {
-		return fmt.Errorf("preflight: cannot build olium engine (check agent.olium.provider / credentials): %w", err)
-	}
-
-	out, err := e.rt().RunOnSession(pingCtx, &cfg, sess, "Reply with the single word OK.", nil, nil, false)
-	if err != nil {
-		// Wrap so the caller can identify auth vs network vs other.
-		return fmt.Errorf("preflight: provider %q failed (model=%q): %w", cfg.Provider, cfg.Model, err)
-	}
-	if strings.TrimSpace(out.Text) == "" {
-		return fmt.Errorf("preflight: provider %q returned no tokens for ping (likely silent auth failure)", cfg.Provider)
-	}
-	return nil
 }
 
 // RunWithExtra executes an agent run with additional extra template data injected.
@@ -405,13 +445,26 @@ func (e *Engine) RunSourceAnalysisParallel(ctx context.Context, cfg SourceAnalys
 		oc := e.settings.Agent.Olium
 		oliumCfg = &oc
 	}
-	sharedSession, sharedErr := e.rt().NewSession(oliumCfg, cfg.SourcePath)
+	// Build the shared session with a transcript recorder when a session dir is
+	// wired, so the explore wave's turns (the only ones that run on the parent
+	// — the format/extension forks carry no recorder by design) persist for
+	// debugging. Closed at the end of source analysis via defer below.
+	sharedSession, sharedErr := e.rt().NewSessionWithSpec(oliumCfg, SessionSpec{
+		SourcePath:   cfg.SourcePath,
+		IncludeTools: true,
+		Record:       RecordSpec{SessionDir: cfg.SessionDir, Template: "source-analysis"},
+	})
 	if sharedErr != nil {
 		// Falls back to the per-call build path below — sub-calls use Run()
 		// instead of RunOnOliumEngine() and re-append context as before.
 		zap.L().Warn("source-analysis: failed to build shared engine, falling back to per-call engines", zap.Error(sharedErr))
 		sharedSession = nil
 	}
+	defer func() {
+		if sharedSession != nil {
+			_ = sharedSession.Close()
+		}
+	}()
 
 	// --- Wave 1: Explore (reads source code once, produces notes for routes + auth) ---
 	var exploreOutput string
@@ -483,7 +536,8 @@ func (e *Engine) RunSourceAnalysisParallel(ctx context.Context, cfg SourceAnalys
 		exploreContext = exploreContext[:maxExploreBytes] + "\n\n... (truncated)"
 	}
 
-	// --- Wave 2: Format + Extensions in parallel (3 goroutines) ---
+	// --- Wave 2: Format + Extensions in parallel (up to 3 goroutines, capped
+	// by cfg.MaxConcurrency) ---
 	// streamGroup gives each parallel sub-agent a tagged, line-buffered
 	// writer. Without this, three providers streaming tokens at once
 	// produce unreadable per-character interleave on the user's terminal.
@@ -506,6 +560,17 @@ func (e *Engine) RunSourceAnalysisParallel(ctx context.Context, cfg SourceAnalys
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	// Bound the format/extension sub-agents to the configured concurrency
+	// (cfg.MaxConcurrency, from --swarm-subagent-concurrency / SAMaxConcurrency).
+	// 0 or an out-of-range value keeps the historical behavior of running all
+	// three at once. This is a per-wave cap, stricter than and independent of
+	// the process-wide provider semaphore.
+	saConcurrency := cfg.MaxConcurrency
+	if saConcurrency <= 0 || saConcurrency > 3 {
+		saConcurrency = 3
+	}
+	saSem := make(chan struct{}, saConcurrency)
+
 	printPhasePromptLine("source-analysis", formatRoutesTemplate, ResolveTemplatePath(formatRoutesTemplate, e.settings.Agent.TemplatesDir))
 	printPhasePromptLine("source-analysis", formatSessionTemplate, ResolveTemplatePath(formatSessionTemplate, e.settings.Agent.TemplatesDir))
 	printPhasePromptLine("source-analysis", extensionsTemplate, ResolveTemplatePath(extensionsTemplate, e.settings.Agent.TemplatesDir))
@@ -515,6 +580,8 @@ func (e *Engine) RunSourceAnalysisParallel(ctx context.Context, cfg SourceAnalys
 	// Call 2a: Format routes (route notes → JSONL http_records)
 	go func() {
 		defer wg.Done()
+		saSem <- struct{}{}
+		defer func() { <-saSem }()
 
 		opts := Options{
 			AgentName: cfg.AgentName,
@@ -574,6 +641,8 @@ func (e *Engine) RunSourceAnalysisParallel(ctx context.Context, cfg SourceAnalys
 	// Call 2b: Format session (auth notes → session_config JSON)
 	go func() {
 		defer wg.Done()
+		saSem <- struct{}{}
+		defer func() { <-saSem }()
 
 		opts := Options{
 			AgentName: cfg.AgentName,
@@ -632,6 +701,8 @@ func (e *Engine) RunSourceAnalysisParallel(ctx context.Context, cfg SourceAnalys
 	// Call 3: Extensions (notes → JS scanner extensions, single call)
 	go func() {
 		defer wg.Done()
+		saSem <- struct{}{}
+		defer func() { <-saSem }()
 
 		extOpts := Options{
 			AgentName: cfg.AgentName,

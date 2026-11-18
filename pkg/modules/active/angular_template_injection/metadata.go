@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Angular template injection vulnerabilities by injecting math expressions inside
-Angular template syntax (e.g., {{7*7}}) and checking if the computed result appears in
-the response. This indicates the Angular engine is evaluating user-controlled expressions,
-which can lead to arbitrary JavaScript execution.
+	ModuleDesc = `**What it means:** User input reaches an Angular (AngularJS) template and is evaluated as an expression instead of inert text. The scanner injected a math expression and saw the product returned (absent from baseline). This client-side template injection is equivalent to XSS.
 
-## Notes
-- Tests basic Angular expression evaluation ({{mathA*mathB}})
-- Tests Angular 1.x sandbox bypass via constructor chain
-- Uses double confirmation with random math anchors to reduce false positives
-- Each confirmation attempt uses different random values
-- Checks that computed result appears in response but not in baseline
+**How it's exploited:** An attacker crafts an Angular payload with a constructor-chain sandbox bypass to run arbitrary JavaScript in victims' browsers - stealing cookies and tokens, hijacking accounts, and acting as the user.
 
-## References
-- https://portswigger.net/research/xss-without-html-client-side-template-injection-with-angularjs
-- https://github.com/nicedayzhu/angular-sandbox-bypass-collection`
+**Fix:** Never interpolate untrusted input into Angular templates; treat user data as bound text and upgrade off sandbox-bypassable AngularJS versions.`
 
 	ModuleConfirmation = "Confirmed when injected Angular math expressions are evaluated and the computed result appears in the response across multiple attempts"
 	ModuleSeverity     = severity.High

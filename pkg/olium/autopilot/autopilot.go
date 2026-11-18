@@ -6,18 +6,25 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/audit/claudecost"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/olium"
 	"github.com/vigolium/vigolium/pkg/olium/engine"
 	"github.com/vigolium/vigolium/pkg/olium/provider"
+	"github.com/vigolium/vigolium/pkg/olium/sessionlog"
 	"github.com/vigolium/vigolium/pkg/olium/skill"
+	"github.com/vigolium/vigolium/pkg/olium/stream"
 	"github.com/vigolium/vigolium/pkg/olium/tool"
 	"github.com/vigolium/vigolium/pkg/olium/toollog"
 	"github.com/vigolium/vigolium/pkg/olium/vigtool"
+	"github.com/vigolium/vigolium/pkg/spitolas"
 	"github.com/vigolium/vigolium/pkg/terminal"
+	"github.com/vigolium/vigolium/pkg/utils"
 )
 
 // quotedLineWriter wraps an io.Writer and prepends prefix to every line
@@ -83,18 +90,51 @@ func (q *quotedLineWriter) Reset() { q.atNewline = true }
 // both override this on a per-run basis.
 const DefaultAutopilotMaxTurns = 200
 
-// autopilotEmptyTurnNudge is the user-role reminder appended after a
+// autopilotEmptyTurnNudge builds the user-role reminder appended after a
 // text-only turn (no tool_calls). Names halt_scan explicitly so the model
 // has both a "resume work" and a "stop cleanly" path described in one
 // sentence — the generic engine default doesn't know about autopilot's
-// halt tool by name.
-const autopilotEmptyTurnNudge = "You produced text but did not call any tool. The autopilot loop only progresses when you invoke a tool. If you are genuinely done, call halt_scan with a one-line reason. Otherwise pick the next concrete step (run_scan to scan natively, browser_probe or web_fetch to populate http_records, query_records to re-inspect what's already there, report_finding if you have evidence) and invoke it now. Do not respond with prose alone."
+// halt tool by name. Tool names track the real registry: run_native_scan is
+// the scanner tool, and the finding verb follows the mode (enforced exposes
+// propose_candidate, every other mode exposes report_finding).
+func autopilotEmptyTurnNudge(mode string) string {
+	findingStep := "report_finding if you have evidence"
+	if mode == config.AutopilotModeEnforced {
+		findingStep = "propose_candidate if you have evidence"
+	}
+	return "You produced text but did not call any tool. The autopilot loop only progresses when you invoke a tool. " +
+		"If you are genuinely done, call halt_scan with a one-line reason. Otherwise pick the next concrete step " +
+		"(run_native_scan to scan natively, browser_probe or web_fetch to populate http_records, query_records to " +
+		"re-inspect what's already there, " + findingStep + ") and invoke it now. Do not respond with prose alone."
+}
+
+// cacheKey picks the provider-side prompt-cache key for a run. The run UUID
+// is the right identity: --session-dir can point several runs at one
+// directory (see the flag's own docs), and keying on the directory name
+// would then hand them all the same cache namespace. The directory name is
+// only the fallback for callers that have no UUID.
+func cacheKey(opts Options) string {
+	if id := strings.TrimSpace(opts.AgenticScanUUID); id != "" {
+		return id
+	}
+	return engine.SessionCacheKey(opts.SessionDir)
+}
 
 // Options configures an autopilot run.
 type Options struct {
 	// Provider and model for the underlying olium engine.
 	Provider provider.Provider
 	Model    string
+
+	// MaxTokens caps each response's output tokens (0 = provider default).
+	// Mirrors agent.olium.max_tokens.
+	MaxTokens int
+
+	// ReasoningEffort is the thinking/effort level forwarded on every
+	// request (low|medium|high|xhigh|max; "" = provider default). Autopilot
+	// builds its own engine.Config, so without this the configured
+	// reasoning_effort never reaches the API on an autopilot run.
+	ReasoningEffort string
 
 	// What to audit. Target is the primary URL/hostname. SourcePath (if
 	// non-empty) enables whitebox mode — the agent knows it has
@@ -105,6 +145,15 @@ type Options struct {
 	// Scope optionally narrows the agent's attention (URL patterns,
 	// paths, subsystems). Joined into the system prompt verbatim.
 	Scope []string
+
+	// Skill selection (planner-driven loading). When SkillNames/SkillTags are
+	// set, they force-include those skills and bypass the pre-flight selection.
+	// NoSkillFilter loads the full set. AlwaysOnSkills are kept regardless of
+	// selection (empty falls back to config.DefaultAlwaysOnSkills).
+	SkillNames     []string
+	SkillTags      []string
+	NoSkillFilter  bool
+	AlwaysOnSkills []string
 
 	// Focus is a short operator-supplied directive, e.g. "prioritize
 	// the authentication and payments flows". Empty = agent decides.
@@ -119,13 +168,13 @@ type Options struct {
 	AgenticScanUUID string
 
 	// Repo is the database handle used for finding persistence and the
-	// run_scan / list_sessions / list_findings tools. *database.Repository
+	// run_native_scan / list_sessions / list_findings tools. *database.Repository
 	// satisfies the FindingSink interface report_finding wants, plus
 	// exposes the wider query surface vigtool needs.
 	Repo *database.Repository
 
 	// ConfigPath, when non-empty, is forwarded to runner.LaunchScan so
-	// run_scan / run_extension load the same vigolium-configs.yaml the
+	// run_native_scan / run_extension load the same vigolium-configs.yaml the
 	// outer CLI / server resolved. Empty falls back to default search.
 	ConfigPath string
 
@@ -144,6 +193,15 @@ type Options struct {
 	// audit needs many more tool turns than a single phase call.
 	MaxTurns int
 
+	// MaxToolCalls caps how many tool calls the run may dispatch, across
+	// every section. 0 = unlimited.
+	//
+	// This is what --max-commands means to an operator. MaxTurns bounds the
+	// model's turns, and one turn can carry any number of parallel calls, so
+	// the turn ceiling alone bounds neither the work done nor the spend: an
+	// observed run did 54 tool calls in 22 turns.
+	MaxToolCalls int
+
 	// MaxWallTime is the hard ceiling on total run duration. When > 0,
 	// the loop trips a halt with reason "wall-time budget exhausted" once
 	// the wall clock crosses this threshold (checked between turns).
@@ -156,6 +214,13 @@ type Options struct {
 	// way). When > 0, the loop trips a halt once total tokens cross this
 	// threshold. Zero means no token cap.
 	TokenBudget int64
+
+	// MaxCostUSD is the hard ceiling on the run's estimated spend in USD,
+	// priced per turn from the provider's usage (claudecost pricing for
+	// Model, cache tokens included). When > 0, the loop trips a halt once the
+	// running cost crosses it. Zero means no cost cap. Like TokenBudget it is
+	// checked after each turn, so the last turn can overshoot by its own cost.
+	MaxCostUSD float64
 
 	// Out is where streaming assistant text is written. Default: stdout.
 	Out io.Writer
@@ -180,7 +245,12 @@ type Options struct {
 	// gets a short addendum telling the model how to use the browser
 	// surface (web_fetch mode=browser, browser_probe, agent-browser
 	// SKILL.md). Off by default so blackbox HTTP-only runs stay terse.
+	// Also gates the typed browser_auth tool: false leaves it unregistered.
 	BrowserAvailable bool
+
+	// BrowserBinaryPath is agent.browser.binary_path for the typed
+	// browser_auth adapter; empty resolves agent-browser on PATH.
+	BrowserBinaryPath string
 
 	// InitialPrompt, when non-empty, replaces the auto-generated initial
 	// user message entirely. Callers that have pre-assembled a richer
@@ -188,6 +258,17 @@ type Options struct {
 	// plan + auth context) supply it here instead of relying on the
 	// terse default framing.
 	InitialPrompt string
+
+	// Mode selects the durable-autopilot behavior: "legacy" (default; empty
+	// resolves here), "shadow", or "enforced". Legacy is byte-for-byte the
+	// current path — no section rotation, report_finding writes findings
+	// directly, and the agent_sections / agent_finding_candidates tables are
+	// never touched. shadow/enforced enable bounded operator sections with
+	// context rotation; enforced additionally routes findings through the
+	// candidate → verify → promote pipeline (propose_candidate replaces
+	// report_finding), and shadow mirrors each report to a candidate row for
+	// FP-rate comparison. Rotation additionally requires SessionDir != "".
+	Mode string
 
 	// PostHaltVerify enables the post-halt coverage verification loop. When
 	// true AND CoverageProbe is set, after the model calls halt_scan the
@@ -246,11 +327,255 @@ type Result struct {
 	CacheReadTokens   int64
 	CacheCreateTokens int64
 
+	// ToolCalls counts every tool the engine dispatched across the run.
+	// Zero on a finished run means the model never used a tool at all -
+	// usually an endpoint that drops `tools` or a model without tool-calling
+	// support, not a target with nothing to test.
+	ToolCalls int
+	// Stalled reports that the run ended because the model kept replying
+	// with text-only turns after the empty-turn nudges were spent.
+	Stalled bool
+
+	// BudgetStop names the budget that ended the run, "" when none did:
+	// BudgetWallTime, BudgetTokens, BudgetCost or BudgetCommands. A halt the
+	// model chose (halt_scan) or a context-window stop is not a budget stop.
+	BudgetStop string
+	// CostUSD is the running cost estimate the MaxCostUSD check compared.
+	CostUSD float64
+
 	// Reentries counts how many times the post-halt coverage verification
 	// loop re-prompted the agent. 0 = no verification re-entry fired (most
 	// runs); ≥1 = the coverage probe surfaced enough new endpoints that
 	// the loop nudged the model to continue. Capped at maxPostHaltReentries.
 	Reentries int
+}
+
+// Budget stop kinds reported in Result.BudgetStop.
+const (
+	BudgetWallTime = "wall_time"
+	BudgetTokens   = "tokens"
+	BudgetCost     = "cost"
+	BudgetCommands = "commands"
+)
+
+// runCostUSD prices cumulative usage for model with the shared claudecost
+// table (unknown models price at the table's default).
+func runCostUSD(model string, in, out, cacheRead, cacheCreate int64) float64 {
+	return claudecost.Usage{
+		InputTokens:       in,
+		OutputTokens:      out,
+		CacheReadTokens:   cacheRead,
+		CacheCreateTokens: cacheCreate,
+	}.Price(model)
+}
+
+// skillTag is the muted "❯ autopilot │" phase prefix shared by the skill log
+// lines — matches the native-scan phase output style (terminal.PhasePrefix).
+// Colors auto-disable when the tool log is not a TTY (or NO_COLOR is set).
+func skillTag() string { return terminal.PhasePrefix("autopilot") }
+
+// logSkillsLoaded prints a one-line, color-highlighted summary of the skills
+// available to the agent: the total plus a per-source *count* breakdown. Skill
+// names are deliberately not enumerated here — they show up only on the
+// "selected" line (logSkillsSelected) so the operator sees exactly what was
+// loaded for the target instead of a wall of names up front. A source missing
+// from the breakdown (count 0) makes a mis-placed or empty skill folder
+// obvious at a glance.
+// logSkillWarnings prints skill-load / skill-validation warnings to the tool
+// log. Warnings never abort a run, so every producer routes through here
+// rather than repeating the prefix-and-format loop.
+func logSkillWarnings(w io.Writer, warnings []string) {
+	for _, warning := range warnings {
+		_, _ = fmt.Fprintf(w, "%s %s\n", skillTag(), warning)
+	}
+}
+
+func logSkillsLoaded(w io.Writer, skills *skill.Registry) {
+	if skills == nil || skills.Len() == 0 {
+		_, _ = fmt.Fprintf(w, "%s loaded %s skills\n", skillTag(), terminal.BoldYellow("0"))
+		return
+	}
+	bySource := map[skill.Source]int{}
+	for _, s := range skills.List() {
+		bySource[s.Source]++
+	}
+	parts := make([]string, 0, 4)
+	for _, src := range []skill.Source{
+		skill.SourceProjectAgents,
+		skill.SourceProjectClaude,
+		skill.SourceUserVigolium,
+		skill.SourceEmbedded,
+	} {
+		if n := bySource[src]; n > 0 {
+			// source name muted, count highlighted — the count is the point.
+			parts = append(parts, fmt.Sprintf("%s: %s", terminal.Muted(string(src)), terminal.Cyan(fmt.Sprintf("%d", n))))
+		}
+	}
+	_, _ = fmt.Fprintf(w, "%s loaded %s skills (%s)\n",
+		skillTag(), terminal.BoldCyan(fmt.Sprintf("%d", skills.Len())), strings.Join(parts, ", "))
+}
+
+// skillsPerLine caps how many skill names print on one continuation line so a
+// large selected set wraps instead of running off the right edge of the
+// terminal.
+const skillsPerLine = 4
+
+// logSkillsSelected prints which skills survived planner-driven filtering,
+// color-highlighted, and is the only place skill *names* are listed. The names
+// wrap at skillsPerLine per line (each line re-stamped with the phase prefix)
+// so a dozen-skill set stays readable. A no-op when filtering didn't reduce the
+// set (selected == all) so unfiltered runs stay quiet.
+func logSkillsSelected(w io.Writer, all, selected *skill.Registry) {
+	if selected == nil || all == nil || selected.Len() == 0 || selected.Len() == all.Len() {
+		return
+	}
+	// Header line carries the counts; names follow on wrapped continuation
+	// lines below it.
+	_, _ = fmt.Fprintf(w, "%s selected %s of %s skills for this target:\n",
+		skillTag(),
+		terminal.BoldGreen(fmt.Sprintf("%d", selected.Len())),
+		terminal.BoldCyan(fmt.Sprintf("%d", all.Len())))
+
+	names := selected.Names()
+	for i := 0; i < len(names); i += skillsPerLine {
+		end := min(i+skillsPerLine, len(names))
+		chunk := names[i:end]
+		colored := make([]string, len(chunk))
+		for j, n := range chunk {
+			colored[j] = terminal.Cyan(n)
+		}
+		line := strings.Join(colored, ", ")
+		if end < len(names) {
+			line += "," // trailing comma signals the list continues on the next line
+		}
+		_, _ = fmt.Fprintf(w, "%s   %s\n", skillTag(), line)
+	}
+}
+
+// logSkillsTip nudges the operator toward the skill-selection knobs. Shown
+// only when no explicit override is in play — a run that already passed
+// --skill / --skill-tag / --no-skill-filter doesn't need the hint. A no-op
+// when no skills are loaded at all.
+func logSkillsTip(w io.Writer, opts Options, skills *skill.Registry) {
+	if skills == nil || skills.Len() == 0 {
+		return
+	}
+	if opts.NoSkillFilter || len(opts.SkillNames) > 0 || len(opts.SkillTags) > 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(w, "%s %s pick exact skills with %s, by tag with %s, or skip filtering (load all) with %s\n",
+		skillTag(),
+		terminal.TipPrefix(),
+		terminal.Yellow("--skill <name>"),
+		terminal.Yellow("--skill-tag <tag>"),
+		terminal.Yellow("--no-skill-filter"))
+}
+
+// selectAutopilotSkills returns the skill subset to surface to the operator
+// agent. Resolution order: --no-skill-filter → full set; --skill/--skill-tag →
+// operator override (∪ always-on); otherwise a best-effort pre-flight LLM pick
+// (∪ always-on). Any failure or empty result falls back to the full set so a
+// long autonomous run never loses access to a skill it might need.
+func selectAutopilotSkills(ctx context.Context, opts Options, all *skill.Registry) *skill.Registry {
+	if all == nil || all.Len() == 0 || opts.NoSkillFilter {
+		return all
+	}
+	alwaysOn := opts.AlwaysOnSkills
+	if len(alwaysOn) == 0 {
+		alwaysOn = config.DefaultAlwaysOnSkills
+	}
+
+	// Operator hard override bypasses the LLM pre-flight entirely.
+	if len(opts.SkillNames) > 0 || len(opts.SkillTags) > 0 {
+		sel, warnings := all.Select(skill.SelectOptions{
+			Forced:     opts.SkillNames,
+			ForcedTags: opts.SkillTags,
+			AlwaysOn:   alwaysOn,
+		})
+		logSkillWarnings(opts.ToolLog, warnings)
+		if sel == nil || sel.Len() == 0 {
+			return all
+		}
+		return sel
+	}
+
+	picks := preflightSkillPicks(ctx, opts, all)
+	if len(picks) == 0 {
+		return all // pre-flight unavailable/empty — keep everything
+	}
+	sel, warnings := all.Select(skill.SelectOptions{Picks: picks, AlwaysOn: alwaysOn})
+	logSkillWarnings(opts.ToolLog, warnings)
+	if sel == nil || sel.Len() == 0 {
+		return all
+	}
+	return sel
+}
+
+// preflightSkillPicks runs one cheap, tool-less model call that maps the target
+// to matching skill names from the menu. Returns only names that resolve to a
+// registered skill; returns nil on any error (the caller then keeps the full
+// set). Bounded by a 60s timeout so a hung provider can't stall startup.
+func preflightSkillPicks(ctx context.Context, opts Options, all *skill.Registry) []string {
+	if opts.Provider == nil {
+		return nil
+	}
+	var menu strings.Builder
+	for _, s := range all.List() {
+		fmt.Fprintf(&menu, "- %s", s.Name)
+		if len(s.Tags) > 0 {
+			fmt.Fprintf(&menu, " [tags: %s]", strings.Join(s.Tags, ", "))
+		}
+		fmt.Fprintf(&menu, ": %s\n", s.Description)
+	}
+
+	sys := "You are a security-scan planner. You are given a target and a menu of skills " +
+		"(confirmation/escalation playbooks). Output ONLY the names of the skills whose description " +
+		"or tags match this target's likely attack surface — comma-separated, names only, no prose. " +
+		"When unsure, include a skill rather than omit it. Output nothing if none clearly apply."
+
+	var user strings.Builder
+	fmt.Fprintf(&user, "Target: %s\n", opts.Target)
+	if opts.SourcePath != "" {
+		user.WriteString("Application source code is available locally (whitebox).\n")
+	}
+	if opts.Focus != "" {
+		fmt.Fprintf(&user, "Operator focus: %s\n", opts.Focus)
+	}
+	if len(opts.Scope) > 0 {
+		fmt.Fprintf(&user, "Scope: %s\n", strings.Join(opts.Scope, ", "))
+	}
+	fmt.Fprintf(&user, "\nAvailable skills:\n%s\nReturn the matching skill names, comma-separated.", menu.String())
+
+	eng := engine.New(engine.Config{Provider: opts.Provider, Model: opts.Model, System: sys, MaxTurns: 1})
+	selCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	var text strings.Builder
+	for ev := range eng.Run(selCtx, user.String()) {
+		switch ev.Type {
+		case engine.EventTextDelta:
+			text.WriteString(ev.Delta)
+		case engine.EventError:
+			return nil
+		}
+	}
+
+	// Extract name-like tokens ([a-z0-9-]) and keep those that resolve to a
+	// registered skill — robust to the model wrapping names in backticks,
+	// bullets, or trailing prose.
+	lower := strings.ToLower(text.String())
+	seen := map[string]bool{}
+	var picks []string
+	isNameRune := func(r rune) bool {
+		return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-'
+	}
+	for _, tok := range strings.FieldsFunc(lower, func(r rune) bool { return !isNameRune(r) }) {
+		if !seen[tok] && all.Get(tok) != nil {
+			seen[tok] = true
+			picks = append(picks, tok)
+		}
+	}
+	return picks
 }
 
 // Run executes one autopilot session. It returns when the underlying
@@ -278,10 +603,16 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	// Skills: include ~/.vigolium/skills/ for autopilot (scan-specific
 	// security workflows belong here). Warnings are surfaced to the
 	// tool log but don't abort the run.
-	skills, warnings := olium.LoadSkillsFor(true)
-	for _, w := range warnings {
-		_, _ = fmt.Fprintf(opts.ToolLog, "[autopilot] %s\n", w)
-	}
+	allSkills, warnings := olium.LoadSkillsFor(true)
+	logSkillWarnings(opts.ToolLog, warnings)
+	logSkillsLoaded(opts.ToolLog, allSkills)
+
+	// Planner-driven filtering: pick the subset relevant to this target (or
+	// honor operator overrides). Best-effort — any failure falls back to the
+	// full set, so a long autonomous run is never starved of a skill.
+	skills := selectAutopilotSkills(ctx, opts, allSkills)
+	logSkillsSelected(opts.ToolLog, allSkills, skills)
+	logSkillsTip(opts.ToolLog, opts, allSkills)
 
 	// Autopilot-specific tool wiring.
 	halt := &HaltSignal{}
@@ -292,6 +623,13 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		AgenticScanUUID: opts.AgenticScanUUID,
 		Target:          opts.Target,
 	}
+
+	// Durable-autopilot mode gate. legacy (the default) is byte-for-byte the
+	// current behavior; rotation additionally requires a session dir (it must
+	// persist section state + write a transcript). All rotation/candidate code
+	// below is guarded on these two values so a legacy run is untouched.
+	mode := config.NormalizeAutopilotMode(opts.Mode)
+	rotationEnabled := mode != config.AutopilotModeLegacy && opts.SessionDir != ""
 
 	// Working memory: a plan + note scratchpad that survives context
 	// eviction (the engine never summarises — history grows until it hits
@@ -319,8 +657,40 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		tools.Register(tool.NewBrowserProbeWithCapture(opts.Repo, opts.ProjectUUID))
 		tools.Register(tool.NewWebFetchWithCapture(opts.Repo, opts.ProjectUUID))
 	}
+	// proposeCtx is the candidate sink for shadow/enforced mode; nil in legacy.
+	// Its SectionUUID is repointed at each rotation by the section controller.
+	// findingTool is the mode's finding tool, captured so the Claude Code
+	// sentinel path (below) dispatches through the SAME tool instead of
+	// re-deriving the mode→behavior mapping and risking drift.
+	var proposeCtx *ProposeCandidateContext
+	var findingTool tool.Tool
 	if opts.Repo != nil {
-		tools.Register(NewReportFindingTool(reportCtx))
+		switch mode {
+		case config.AutopilotModeEnforced:
+			// Enforced: the operator only ever proposes candidates; a fresh-
+			// context verifier promotes the confirmed ones into findings.
+			// report_finding is deliberately NOT registered.
+			proposeCtx = &ProposeCandidateContext{
+				Repo:            RepoCandidateSink(opts.Repo),
+				ProjectUUID:     opts.ProjectUUID,
+				AgenticScanUUID: opts.AgenticScanUUID,
+				Target:          opts.Target,
+			}
+			findingTool = NewProposeCandidateTool(proposeCtx)
+		case config.AutopilotModeShadow:
+			// Shadow: findings still land directly (unchanged behavior) but
+			// each is mirrored into a candidate so the verifier can grade it.
+			proposeCtx = &ProposeCandidateContext{
+				Repo:            RepoCandidateSink(opts.Repo),
+				ProjectUUID:     opts.ProjectUUID,
+				AgenticScanUUID: opts.AgenticScanUUID,
+				Target:          opts.Target,
+			}
+			findingTool = NewShadowReportFindingTool(reportCtx, proposeCtx)
+		default:
+			findingTool = NewReportFindingTool(reportCtx)
+		}
+		tools.Register(findingTool)
 
 		// Vigolium-aware tools: scan launching, extension execution, and
 		// session/finding queries. All require a real *database.Repository
@@ -351,9 +721,11 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		// insertion points, fetch starter payloads, replay mutated requests,
 		// and poll for OAST callbacks. Together these let the agent run a
 		// targeted explore → inspect → craft → send → confirm loop without
-		// having to fire a full run_scan every time.
+		// having to fire a full run_native_scan every time.
 		tools.Register(vigtool.NewQueryRecordsTool(sessCtx))
 		tools.Register(vigtool.NewInspectRecordTool(sessCtx))
+		tools.Register(vigtool.NewSearchBurpItemsTool(sessCtx))
+		tools.Register(vigtool.NewInspectBurpItemTool(sessCtx))
 		tools.Register(vigtool.NewReplayRequestTool(sessCtx))
 		tools.Register(vigtool.NewOASTPollTool(sessCtx))
 		// send_raw_http: exact-bytes socket primitive for smuggling/desync/
@@ -370,24 +742,38 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		tools.Register(vigtool.NewAttackKitTool())
 		// browser_auth wraps agent-browser to drive interactive login flows
 		// and persist the resulting cookies as an auth_session row. Only
-		// registers when agent-browser is on PATH; otherwise the constructor
-		// returns nil and the agent doesn't see the tool.
-		if t := vigtool.NewBrowserAuthTool(opts.Repo, opts.ProjectUUID); t != nil {
+		// registers when the browser integration is enabled for this run and
+		// the configured binary resolves; otherwise the constructor returns
+		// nil and the agent doesn't see the tool.
+		if t := vigtool.NewBrowserAuthTool(opts.Repo, opts.ProjectUUID, vigtool.BrowserToolConfig{
+			Enabled:    opts.BrowserAvailable,
+			BinaryPath: opts.BrowserBinaryPath,
+			Headed:     utils.EnvTruthy(spitolas.EnvBrowserHeaded),
+		}); t != nil {
 			tools.Register(t)
 		}
 		tools.Register(vigtool.NewListModulesTool())
 	}
 	if skills != nil && skills.Len() > 0 {
-		tools.Register(skill.NewLoadTool(skills))
+		tools.Register(skill.NewLoadTool(skills, tools))
+		// load_skill now hands each skill's allowed-tools list to the model,
+		// so a name that no longer resolves points it at a tool that cannot
+		// be called. Warn rather than fail — a stale list is an authoring
+		// slip, not a reason to abandon the run.
+		logSkillWarnings(opts.ToolLog, skill.UnknownAllowedTools(skills, tools))
 	}
 
-	eng := engine.New(engine.Config{
-		Provider: opts.Provider,
-		Tools:    tools,
-		Skills:   skills,
-		Model:    opts.Model,
-		System:   buildSystemPrompt(opts),
-		MaxTurns: opts.MaxTurns,
+	ecfg := engine.Config{
+		Provider:        opts.Provider,
+		Tools:           tools,
+		Skills:          skills,
+		Model:           opts.Model,
+		System:          buildSystemPrompt(opts),
+		MaxTurns:        opts.MaxTurns,
+		MaxToolCalls:    opts.MaxToolCalls,
+		ReasoningEffort: opts.ReasoningEffort,
+		MaxTokens:       opts.MaxTokens,
+		SessionID:       cacheKey(opts),
 		// Autopilot runs many turns against a stable system prompt and
 		// tool list; prompt caching cuts the repeated prefix tokens by
 		// roughly 90% on Anthropic. No-op on providers that don't
@@ -413,12 +799,41 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		// produce a text-only turn after the first empty query response and
 		// the engine would otherwise exit on the spot ("natural stop"). Two
 		// consecutive nudges give the model a chance to either kick off
-		// run_scan/browser_probe to populate records or admit it's done by
+		// run_native_scan/browser_probe to populate records or admit it's done by
 		// calling halt_scan. Capable models that genuinely have nothing left
 		// to do almost always halt on the first nudge — one round of waste.
 		NudgeOnEmptyToolCalls: 2,
-		NudgeOnEmptyMessage:   autopilotEmptyTurnNudge,
-	})
+		NudgeOnEmptyMessage:   autopilotEmptyTurnNudge(mode),
+	}
+
+	// Persist a Pi-style JSONL transcript beside the other session artifacts
+	// (runtime.log, scratchpad, tool-results/) for post-hoc debugging. Only
+	// attach when we have a session dir; a recorder construction failure is
+	// non-fatal — the scan proceeds without a transcript. sectionRec captures
+	// the same recorder so the section controller can emit section boundary
+	// events (nil-safe when no recorder was attached).
+	var sectionRec SectionRecorder
+	if opts.SessionDir != "" {
+		provName := ""
+		if opts.Provider != nil {
+			provName = opts.Provider.Name()
+		}
+		cwd, _ := os.Getwd()
+		if rec, rerr := sessionlog.New(filepath.Join(opts.SessionDir, sessionlog.Filename), sessionlog.Meta{
+			SessionID: filepath.Base(opts.SessionDir),
+			Provider:  provName,
+			Model:     opts.Model,
+			Cwd:       cwd,
+		}); rerr == nil {
+			ecfg.Recorder = rec
+			sectionRec = rec
+		}
+	}
+
+	eng := engine.New(ecfg)
+	// Flush + close the transcript when the run ends. No-op when no recorder
+	// was attached.
+	defer func() { _ = eng.CloseRecorder() }()
 
 	initial := buildInitialPrompt(opts)
 
@@ -452,14 +867,21 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	if isClaudeCodeProvider(opts.Provider) {
 		ccParser = &claudeCodeBlockParser{
 			onFinding: func(args map[string]any) {
-				// runCtx is reassigned across re-entries; capturing it by
-				// closure is fine because PersistFromArgs only reads ctx
-				// during the call (no goroutine retains it).
-				res := reportCtx.PersistFromArgs(runCtx, args)
+				// Dispatch through the mode's registered finding tool so the
+				// sentinel path can't drift from the real tool contract
+				// (enforced→propose_candidate, shadow→report+mirror, legacy→
+				// report). runCtx is reassigned across re-entries; capturing it
+				// by closure is fine because Execute only reads ctx during the
+				// call (no goroutine retains it).
+				if findingTool == nil {
+					_, _ = fmt.Fprintf(opts.ToolLog, "[claudecode] finding dropped: no sink configured for this run\n")
+					return
+				}
+				res, _ := findingTool.Execute(runCtx, args, nil)
 				if res.IsError {
-					_, _ = fmt.Fprintf(opts.ToolLog, "[claudecode] report_finding: %s\n", res.Message)
+					_, _ = fmt.Fprintf(opts.ToolLog, "[claudecode] finding: %s\n", res.Content)
 				} else {
-					_, _ = fmt.Fprintf(opts.ToolLog, "[claudecode] %s\n", res.Message)
+					_, _ = fmt.Fprintf(opts.ToolLog, "[claudecode] %s\n", res.Content)
 				}
 			},
 			onHalt: func(reason string) {
@@ -473,6 +895,13 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	var usage struct {
 		in, out, cacheRead, cacheCreate int64
+	}
+	// budgetStop records the first budget that tripped (Result.BudgetStop).
+	var budgetStop string
+	noteBudget := func(kind string) {
+		if budgetStop == "" {
+			budgetStop = kind
+		}
 	}
 	// Narration goes through a quoted-block writer so each line of the
 	// planning text is rendered `│ <text>`, while the planning header,
@@ -495,7 +924,38 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	// "why we initially stopped" rather than the re-entry's halt reason.
 	firstHaltReason := ""
 	reentries := 0
+	stalled := false
 	nextPrompt := initial
+
+	// --- Durable-autopilot section-rotation state (non-legacy modes only) ---
+	// Every variable here is inert in legacy: rotationEnabled is false, so
+	// runIteration never touches them and the outer loop's handoff branch is
+	// dead. controller is nil in legacy.
+	var controller *SectionController
+	missionBrief := ""
+	// Per-section counters + recent-actions ring, reset at each rotation.
+	var sectionTurns int
+	var sectionIn, sectionOut int64
+	var recentActions []string
+	var progressedThisWindow bool
+	// pendingRotation is set by runIteration when ShouldRotate fires; the outer
+	// loop performs the section handoff. rotationReason carries why.
+	var pendingRotation bool
+	var rotationReason string
+	if rotationEnabled {
+		controller = NewSectionController(opts.SessionDir, opts.Repo, opts.ProjectUUID, opts.AgenticScanUUID,
+			scratch, sectionRec, DefaultMaxTurnsPerSection, DefaultStallTurns, 0)
+		missionBrief = buildRotationMission(opts)
+		firstTask := scratch.NextOpenTask()
+		if firstTask == "" {
+			firstTask = "reconnaissance and attack-surface mapping"
+		}
+		sec := controller.BeginSection(ctx, firstTask, "operator")
+		if proposeCtx != nil {
+			u := sec.UUID
+			proposeCtx.SectionUUID = &u
+		}
+	}
 
 	// runIteration drains one full engine.Run cycle and returns (fatalErr,
 	// fatalResult). Each call owns its own cancellable context via defer
@@ -525,12 +985,35 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 			// here, so claude-code's FINDING/HALT blocks that the parser
 			// consumes don't count as visible narration.
 			tlog.HandleTool(ev)
+			// Reasoning deltas accumulate in the logger and flush as one muted
+			// `⋈ thinking` block on the tool log (stderr) — before the turn's
+			// first tool card (via start()) or, for a pure planning turn,
+			// before the assistant narration prints below. Gated on --verbose
+			// inside the logger; a no-op otherwise.
+			tlog.HandleThinking(ev)
+			// Section rotation bookkeeping (non-legacy only). A tool that
+			// creates surface / mutates durable state / records a result counts
+			// as progress (resets the stall counter); every tool result feeds
+			// the recent-actions ring carried into the next section's brief.
+			if rotationEnabled && ev.Type == engine.EventToolExecEnd {
+				if !ev.ToolIsErr && productiveTools[ev.ToolName] {
+					progressedThisWindow = true
+				}
+				recentActions = appendRecentAction(recentActions, ev.ToolName, ev.ToolResult)
+			}
 			if ev.Type == engine.EventTurnDone {
 				if ev.Usage != nil {
 					usage.in += int64(ev.Usage.Input)
 					usage.out += int64(ev.Usage.Output)
 					usage.cacheRead += int64(ev.Usage.CacheRead)
 					usage.cacheCreate += int64(ev.Usage.CacheWrite)
+					if rotationEnabled {
+						sectionIn += int64(ev.Usage.Input)
+						sectionOut += int64(ev.Usage.Output)
+					}
+				}
+				if rotationEnabled {
+					sectionTurns++
 				}
 				if hadTextThisTurn {
 					tlog.HandleTurn(ev)
@@ -558,6 +1041,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 				}
 				if delta != "" {
 					if !hadTextThisTurn {
+						// Flush any buffered reasoning before the narration so
+						// the operator reads think → answer (this turn had no
+						// tool card to trigger the flush via start()).
+						tlog.FlushThinking()
 						// First visible text in this turn — frame the
 						// narration with a header so it reads like the
 						// `▶ tool` lines (planning is just another step).
@@ -581,6 +1068,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 					reason := fmt.Sprintf("wall-time budget exhausted after %s (cap=%s)",
 						time.Since(started).Round(time.Second), opts.MaxWallTime)
 					halt.SetByBudget(reason)
+					noteBudget(BudgetWallTime)
 					_, _ = fmt.Fprintf(opts.ToolLog, "[%s]\n", reason)
 					iterCancel()
 				}
@@ -588,8 +1076,47 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 					reason := fmt.Sprintf("token budget exhausted (used=%d, cap=%d)",
 						usage.in+usage.out, opts.TokenBudget)
 					halt.SetByBudget(reason)
+					noteBudget(BudgetTokens)
 					_, _ = fmt.Fprintf(opts.ToolLog, "[%s]\n", reason)
 					iterCancel()
+				}
+				if opts.MaxCostUSD > 0 {
+					if cost := runCostUSD(opts.Model, usage.in, usage.out, usage.cacheRead, usage.cacheCreate); cost > opts.MaxCostUSD {
+						reason := fmt.Sprintf("cost budget exhausted (est. $%.4f, cap=$%.4f)", cost, opts.MaxCostUSD)
+						halt.SetByBudget(reason)
+						noteBudget(BudgetCost)
+						_, _ = fmt.Fprintf(opts.ToolLog, "[%s]\n", reason)
+						iterCancel()
+					}
+				}
+
+				// Durable-autopilot rotation check. Runs after budget/halt
+				// enforcement (which cancel iterCtx) so a real stop always
+				// wins over a rotation. When it fires, cleanly end the
+				// iteration like the halt path; the outer loop rebuilds the
+				// section. iterCtx.Err()==nil guards against re-firing when a
+				// halt/budget already cancelled this turn.
+				if rotationEnabled && controller != nil && !pendingRotation && iterCtx.Err() == nil {
+					if rotate, reason := controller.ShouldRotate(sectionTurns, sectionIn+sectionOut, progressedThisWindow); rotate {
+						// A stall that survives repeated fresh starts is
+						// terminal. Rotation resets the stall counter and
+						// re-enters, so without this a model stuck on a
+						// broken tool contract rotates until the wall clock
+						// ends the run - with nothing to show for the hours.
+						if controller.StalledOut() {
+							haltReason := fmt.Sprintf("no productive tool call across %d consecutive sections (%s) - halting rather than rotating again",
+								controller.MaxStallRotations, reason)
+							halt.SetByBudget(haltReason)
+							_, _ = fmt.Fprintf(opts.ToolLog, "[autopilot] %s\n", haltReason)
+						} else {
+							pendingRotation = true
+							rotationReason = reason
+							_, _ = fmt.Fprintf(opts.ToolLog, "[autopilot] section %d rotating (%s, turns=%d) — rebuilding context\n",
+								controller.CurrentSeq(), reason, sectionTurns)
+						}
+						iterCancel()
+					}
+					progressedThisWindow = false
 				}
 
 			case engine.EventInfo:
@@ -601,7 +1128,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 				}
 
 			case engine.EventRunDone:
-				// natural completion — handled by loop exit
+				// The run ended on its own - finished, or stalled on
+				// text-only turns. Last run wins, so a stall followed by a
+				// productive re-entry is not reported.
+				stalled = ev.Stalled
 
 			case engine.EventError:
 				// Drain any pending sentinel tail to stdout so the operator
@@ -613,11 +1143,38 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 						_, _ = io.WriteString(opts.Out, tail)
 					}
 				}
+				// The turn ceiling (--max-commands) is a budget stop, not a
+				// failure. Treating it as fatal returned early from the whole
+				// run, skipping the section close, the summary, triage and the
+				// transcript copy — so the one terminal state a runaway loop
+				// actually reaches was also the state that produced no report.
+				if ev.BudgetExhausted {
+					reason := fmt.Sprintf("budget exhausted (%s)", ev.Err)
+					halt.SetByBudget(reason)
+					noteBudget(BudgetCommands)
+					_, _ = fmt.Fprintf(opts.ToolLog, "[%s]\n", reason)
+					iterCancel()
+				}
+
+				// The conversation outgrew the model's context window.
+				// Until history compaction lands this is terminal - history
+				// only grows during a run, so every later turn would fail
+				// the same way - so stop cleanly with a reason the operator
+				// can act on instead of dying with a raw provider 400.
+				if stream.IsContextOverflow(ev.Err) {
+					reason := fmt.Sprintf("context window exhausted after %d turns - the conversation no longer fits the model (%s)",
+						sectionTurns, ev.Err)
+					halt.SetByBudget(reason)
+					_, _ = fmt.Fprintf(opts.ToolLog, "[%s]\n", reason)
+					iterCancel()
+				}
+
 				// If we already tripped the halt signal (budget enforcement,
-				// halt_scan tool, caller cancellation observed earlier), the
-				// resulting "context canceled" engine event is expected — let
-				// the outer loop's post-halt logic decide what to do next.
-				if halted, _ := halt.Halted(); !halted {
+				// halt_scan tool, caller cancellation observed earlier) OR a
+				// section rotation is pending, the resulting "context canceled"
+				// engine event is expected — let the outer loop decide what to
+				// do next (post-halt logic, or the section handoff).
+				if halted, _ := halt.Halted(); !halted && !pendingRotation {
 					fatalResult = &Result{
 						FindingCount:      reportCtx.Count.Load(),
 						Elapsed:           time.Since(started),
@@ -636,10 +1193,53 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return fatalResult, runLoopErr
 	}
 
+	// fatalErr defers a run-ending error until after the finalization tail
+	// below. Returning straight from the loop skipped the section close, the
+	// thinking flush and the populated Result - so the states that end a run
+	// badly (a provider 400, an auth failure) were also the states that
+	// produced no report at all.
+	var fatalErr error
 	for {
-		fatalResult, runLoopErr := runIteration(nextPrompt)
+		_, runLoopErr := runIteration(nextPrompt)
 		if runLoopErr != nil {
-			return fatalResult, runLoopErr
+			fatalErr = runLoopErr
+			break
+		}
+
+		// Durable-autopilot section handoff. When the rotation flag tripped
+		// (a bounded-section limit, not a halt), close the section with a
+		// cheap tool-less closing summary, reset the engine context, open a
+		// fresh section, and re-enter with a reconstructed brief. Legacy runs
+		// never set the flag, so this whole branch is dead for them.
+		if pendingRotation {
+			pendingRotation = false
+			recent := renderRecentActions(recentActions)
+			endingSeq := controller.CurrentSeq()
+			closing := summarizeSection(ctx, opts, scratch, recent)
+			controller.StoreClosingSummary(closing, endingSeq)
+			controller.EndSection(ctx, database.SectionStatusCompleted, rotationReason, closing,
+				sectionTurns, sectionIn, sectionOut)
+
+			eng.Reset()
+
+			nextTask := scratch.NextOpenTask()
+			if nextTask == "" {
+				nextTask = "continue the assessment: verify open candidates and probe uncovered surface"
+			}
+			controller.BeginSection(ctx, nextTask, "operator")
+			if proposeCtx != nil {
+				u := controller.CurrentSectionUUID()
+				proposeCtx.SectionUUID = &u
+			}
+			nextPrompt = controller.BuildReconstructedBrief(missionBrief, recent)
+
+			// Reset per-section accounting for the fresh section.
+			sectionTurns = 0
+			sectionIn = 0
+			sectionOut = 0
+			recentActions = nil
+			progressedThisWindow = false
+			continue
 		}
 
 		// Inner loop exited cleanly — decide whether to re-enter.
@@ -689,6 +1289,19 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		reentries++
 	}
 
+	// Close the final open section (durable autopilot). The run has ended
+	// (halt / natural stop / coverage-verify done), so the last section is
+	// completed rather than rotated. No-op in legacy (controller is nil).
+	if controller != nil {
+		controller.EndSection(ctx, database.SectionStatusCompleted, "run-complete", "",
+			sectionTurns, sectionIn, sectionOut)
+	}
+
+	// Flush any reasoning buffered by a final turn that produced neither a
+	// tool card nor narration (rare, but otherwise it would be silently
+	// dropped at run end).
+	tlog.FlushThinking()
+
 	// Flush any held sentinel tail. Normally Feed consumes everything but
 	// a model that ends mid-block (no <<<VIG:END>>>) would leave bytes
 	// buffered; surfacing them helps debug prompt drift.
@@ -717,7 +1330,29 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		CacheReadTokens:   usage.cacheRead,
 		CacheCreateTokens: usage.cacheCreate,
 		Reentries:         reentries,
-	}, nil
+		ToolCalls:         eng.ToolCallCount(),
+		Stalled:           stalled,
+		BudgetStop:        budgetStop,
+		CostUSD:           runCostUSD(opts.Model, usage.in, usage.out, usage.cacheRead, usage.cacheCreate),
+	}, fatalErr
+}
+
+// Diagnosis explains a run that ended without the model finishing its job,
+// or "" for a run that halted or kept working to the end. A run that never
+// dispatched a tool tested nothing, so its zero findings say nothing about
+// the target; the cause is nearly always the model or the endpoint.
+func (r *Result) Diagnosis() string {
+	if r == nil || r.Halted {
+		return ""
+	}
+	if r.ToolCalls == 0 {
+		return "the model never called a tool, so nothing was tested - check that the model supports tool calling " +
+			"and that the endpoint forwards `tools` (Open WebUI: set Function Calling to \"Native\"; Ollama: use a tool-capable model)"
+	}
+	if r.Stalled {
+		return "the model stopped calling tools and ignored every nudge to continue or halt, so coverage is likely incomplete"
+	}
+	return ""
 }
 
 // formatCoverageGapPrompt builds the user-role message the engine sees on a

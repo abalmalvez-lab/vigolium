@@ -9,28 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript and TypeScript response bodies for Next.js Server Actions that use
-.bind() to pass sensitive identifiers (IDs, slugs, resource references) as arguments.
-Bound arguments are not encrypted and can be tampered with by the client. If the action
-does not re-authorize the resource on the server side, this creates an IDOR vulnerability
-where users can modify other users' resources by changing the bound ID.
+	ModuleDesc = `**What it means:** Source-like JS/TS contains a server directive and .bind(null, identifier) using an ID-shaped name, with no recognized authorization token elsewhere in the file. Identifier names alone do not establish ownership semantics.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects .bind(null, <identifier>) patterns in server component code
-- Flags when bound values look like resource identifiers (id, userId, postId, etc.)
-- Cross-references with authorization check patterns inside the action body
-- Deduplicates by host+path
-- CWE-639: Authorization Bypass Through User-Controlled Key
+**How it's exploited:** A real IDOR requires the bound value to be attacker-tamperable, reach a resource lookup, and succeed for another principal without an ownership check. This module does not trace or replay that flow.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/data-fetching/server-actions-and-mutations#passing-additional-arguments
-- https://nextjs.org/blog/security-nextjs-server-components-actions
-- https://cwe.mitre.org/data/definitions/639.html`
+**Fix:** Re-authorize every resource inside the action body by checking the session against the bound identifier, never client IDs.`
 
-	ModuleConfirmation = "Confirmed when .bind() passes identifiers to a Server Action without re-authorization in the action body"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Candidate when a server-action file binds an ID-shaped argument without recognized auth; confirmation requires ownership-flow tracing or cross-user replay"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"nextjs", "javascript", "idor", "light"}
 )

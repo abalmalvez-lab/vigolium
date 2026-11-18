@@ -78,6 +78,44 @@ func IsCatastrophic(cmd string) bool {
 	return false
 }
 
+// BashEnvBuilder returns the complete environment ("KEY=value" entries) a bash
+// tool command runs with. See SetBashEnvBuilder.
+type BashEnvBuilder func() []string
+
+var (
+	bashEnvMu      sync.RWMutex
+	bashEnvBuilder BashEnvBuilder
+)
+
+// SetBashEnvBuilder installs the process-wide environment builder for the bash
+// tool; nil restores plain inheritance of the process environment.
+//
+// The CLI installs one that pins the commands the agent shells out to onto this
+// process's own context: `vigolium` on PATH resolves to the running binary (not
+// whatever install a login profile puts first), and the database, project and
+// config the parent resolved travel as VIGOLIUM_DB / VIGOLIUM_DB_PATH,
+// VIGOLIUM_PROJECT_UUID and VIGOLIUM_CONFIG. Without it a child `vigolium
+// finding` opened the default database and project and reported another
+// engagement's data. It is process-wide rather than per-tool because that
+// context is a property of the process, and every tool registry the agent
+// builds (autopilot, swarm phases, query) must agree on it.
+func SetBashEnvBuilder(b BashEnvBuilder) {
+	bashEnvMu.Lock()
+	bashEnvBuilder = b
+	bashEnvMu.Unlock()
+}
+
+// bashEnv returns the environment for the next command, nil to inherit.
+func bashEnv() []string {
+	bashEnvMu.RLock()
+	b := bashEnvBuilder
+	bashEnvMu.RUnlock()
+	if b == nil {
+		return nil
+	}
+	return b()
+}
+
 // NewBash constructs the bash tool. The tool runs commands without prompting
 // (yolo-by-default). Commands matching IsCatastrophic are rejected outright.
 // approve is retained in the signature for future use (e.g., plugin-installed
@@ -91,8 +129,24 @@ func (*bashTool) Name() string     { return "bash" }
 func (*bashTool) Label() string    { return "Run shell command" }
 func (*bashTool) Category() string { return CategoryBuiltin }
 func (*bashTool) IsReadOnly() bool { return false }
+
+// bashShell/bashFlag are the POSIX shell this tool uses everywhere except
+// Windows, where procutil.ShellArgv substitutes an installed POSIX bash or
+// PowerShell. The resolved shell is named in the description and schema so the
+// model writes for the dialect it will actually be run through.
+//
+// Not a login shell (-lc): a login shell sources the user's profile, which can
+// re-order PATH so `vigolium` resolves to a different install than the one
+// running the agent, defeating the pinning SetBashEnvBuilder does. A tool
+// that needs a version manager's shims (nvm, pyenv) can source it explicitly.
+const (
+	bashShell = "bash"
+	bashFlag  = "-c"
+)
+
 func (*bashTool) Description() string {
-	return "Execute a shell command with bash -lc. Returns combined stdout+stderr. Use for compilation, tests, git operations, searches, anything scriptable."
+	return fmt.Sprintf("Execute a shell command with %s. Returns combined stdout+stderr. Use for compilation, tests, git operations, searches, anything scriptable.",
+		procutil.ShellLabel(bashShell, bashFlag))
 }
 
 func (*bashTool) Schema() map[string]any {
@@ -101,7 +155,7 @@ func (*bashTool) Schema() map[string]any {
 		"properties": map[string]any{
 			"command": map[string]any{
 				"type":        "string",
-				"description": "Shell command to execute. Runs via bash -lc.",
+				"description": "Shell command to execute. Runs via " + procutil.ShellLabel(bashShell, bashFlag) + ".",
 			},
 			"timeout_seconds": map[string]any{
 				"type":        "integer",
@@ -130,15 +184,28 @@ func (*bashTool) Execute(ctx context.Context, args map[string]any, onUpdate Upda
 	if v, ok := args["timeout_seconds"].(float64); ok && v > 0 {
 		timeout = time.Duration(v) * time.Second
 	}
+	// Clamp to whatever the caller's deadline actually allows. The engine
+	// bounds every tool invocation (DefaultToolTimeout, 5m unless the tool
+	// declares otherwise), so an unclamped request produced a command that
+	// died at 5 minutes while reporting "[timed out after 10m0s]" - and the
+	// model blamed the target for a limit the harness imposed.
+	timeout = BudgetFrom(ctx, timeout, 0)
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, "bash", "-lc", cmdStr)
+	// IsCatastrophic above is written against POSIX shell syntax. On a Windows
+	// host that falls through to PowerShell it still blocks the POSIX spellings
+	// but not their PowerShell equivalents — it is a backstop, not the sandbox.
+	shellName, shellArgs := procutil.ShellArgv(bashShell, bashFlag)
+	cmd := exec.CommandContext(runCtx, shellName, append(append([]string{}, shellArgs...), cmdStr)...)
 	// Kill the whole process group on timeout/cancel, and give children a short
 	// grace window to drain the pipe before Wait gives up on them.
 	procutil.SetupProcessGroup(cmd)
 	cmd.WaitDelay = 2 * time.Second
+	if env := bashEnv(); env != nil {
+		cmd.Env = env
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

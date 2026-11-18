@@ -2,37 +2,60 @@ package cli
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/vigolium/vigolium/internal/config"
-	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/jsext"
 )
 
 var (
 	evalStdin   bool
 	evalExtFile string
+	evalTimeout time.Duration
 )
 
 var extensionsEvalCmd = &cobra.Command{
 	Use:     "eval [code]",
-	Aliases: []string{"run", "exec"},
+	Aliases: []string{"exec"},
 	Short:   "Evaluate JavaScript code with vigolium.* APIs available",
-	Long:    `Run ad-hoc JavaScript with access to the full vigolium.* API surface.`,
-	Args:    cobra.MaximumNArgs(1),
-	RunE:    runExtensionsEval,
+	Long: `Run ad-hoc JavaScript with access to the full vigolium.* API surface.
+
+Takes the code as a positional argument, from a file (--ext-file, .ts is
+transpiled), or on stdin (--stdin). See also "vigolium js", which runs the
+same API surface and additionally sets a TARGET variable (--target) and
+selects an output format (--format).
+
+With --record-uuid it runs an extension instead: the one named with --ext,
+loaded as a scan loads it, against a stored record, offline unless
+--allow-network. That mode is "vigolium ext run"; see its help.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runExtensionsEval,
 }
 
 func init() {
 	extensionsEvalCmd.Flags().BoolVar(&evalStdin, "stdin", false, "Read JS code from stdin")
 	extensionsEvalCmd.Flags().StringVar(&evalExtFile, "ext-file", "", "Path to JS file to evaluate")
+	extensionsEvalCmd.Flags().DurationVar(&evalTimeout, "timeout", 30*time.Second, "Execution timeout")
 }
 
 func runExtensionsEval(cmd *cobra.Command, args []string) error {
+	// --record-uuid (and its companions) switch eval to `ext run`: one
+	// extension (--ext) against one stored record.
+	if extRunFlagsSet(cmd) {
+		if len(args) > 0 || evalStdin || evalExtFile != "" {
+			return usageErrorf("--record-uuid runs the extension named with --ext against a stored record; " +
+				"it does not take code (an argument, --ext-file or --stdin)")
+		}
+		// The output is ext run's, so the document names ext run (and its
+		// schema applies), whichever spelling ran it: runExtensionOnRecord
+		// emits under extensionsRunCmd.
+		return runExtensionOnRecord(cmd, "")
+	}
+
 	defer syncLogger()
 
 	// Determine JS source — exactly one input method required
@@ -42,40 +65,31 @@ func runExtensionsEval(cmd *cobra.Command, args []string) error {
 	}
 
 	// Load settings
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return err
 	}
 
-	// Build API options
-	opts := jsext.APIOptions{
-		ScriptID:    "eval",
-		ConfigVars:  settings.DynamicAssessment.Extensions.Variables,
-		AllowExec:   settings.DynamicAssessment.Extensions.AllowExec,
-		SandboxDir:  config.ExpandPath(settings.DynamicAssessment.Extensions.SandboxDir),
-		ExecTimeout: settings.DynamicAssessment.Extensions.ExecTimeout(),
+	// Build the API surface (DB, scope, HTTP stack) shared with
+	// `vigolium js`.
+	opts, cleanup, err := buildJSEvalOptions("eval", settings)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
 
-	// Set up optional database repository
-	db, err := getDB()
-	if err == nil && db != nil {
-		defer closeDatabaseOnExit()
-		opts.Repository = database.NewRepository(db)
-	}
-
-	// Set up scope if configured
-	if settings.Scope.Host.Include != nil || settings.Scope.Path.Include != nil {
-		matcher := config.NewScopeMatcher(settings.Scope)
-		opts.ScopeMatcher = matcher
-		opts.ScopeConfig = &settings.Scope
-	}
-
-	// Evaluate
-	result := jsext.Eval(source, opts)
+	// Evaluate under the same bounded-execution helper as `vigolium js`,
+	// so an accidental infinite loop in a pasted snippet cannot hang the
+	// process.
+	result := evalWithTimeout(source, opts, "", evalTimeout)
 	if result.Error != nil {
 		return fmt.Errorf("eval error: %w", result.Error)
 	}
 
+	if globalJSON {
+		// The same document as `js -j`: items:[{"value": …}].
+		return emitJSEvalResult(cmd, result.Value)
+	}
 	if result.Value != "" {
 		fmt.Println(result.Value)
 	}
@@ -97,7 +111,7 @@ func resolveEvalSource(args []string) (string, error) {
 	}
 
 	if inputs == 0 {
-		return "", fmt.Errorf("no input provided; use a positional argument, --ext-file, or --stdin")
+		return "", usageErrorf("no input provided; use a positional argument, --ext-file, or --stdin")
 	}
 	if inputs > 1 {
 		return "", fmt.Errorf("multiple inputs provided; use only one of: positional argument, --ext-file, or --stdin")
@@ -105,7 +119,7 @@ func resolveEvalSource(args []string) (string, error) {
 
 	switch {
 	case evalStdin:
-		data, err := io.ReadAll(os.Stdin)
+		data, err := readStdin()
 		if err != nil {
 			return "", fmt.Errorf("failed to read stdin: %w", err)
 		}

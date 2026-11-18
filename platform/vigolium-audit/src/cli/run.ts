@@ -8,10 +8,19 @@ import { ClaudeCliAdapter } from "../adapters/claude-cli.js";
 import { ClaudeSdkAdapter } from "../adapters/claude-sdk.js";
 import { CodexCliAdapter } from "../adapters/codex-cli.js";
 import { CodexSdkAdapter } from "../adapters/codex-sdk.js";
-import { chooseAdapter } from "../adapters/detect.js";
+import {
+  chooseAdapter,
+  resolveAgentTransport,
+  type ResolvedAdapterChoice,
+} from "../adapters/detect.js";
+import {
+  detectClaudeVersionDrift,
+  probeClaudeBinaryVersion,
+  sdkTargetClaudeVersion,
+} from "../adapters/version-check.js";
 import { getContentLoader } from "../content-loader.js";
 import { Orchestrator, type OrchestratorResult } from "../engine/orchestrator.js";
-import { stripRawArtifacts } from "../engine/strip-artifacts.js";
+import { finalizeOutput } from "../engine/redact-artifacts.js";
 import { ClaudeHandoff } from "../engine/claude-handoff.js";
 import { CodexHandoff, isCodexHandoffMode } from "../engine/codex-handoff.js";
 import type { OrchestratorEvent } from "../engine/events.js";
@@ -26,10 +35,18 @@ import {
   findInProgressRefreshAudit,
 } from "./refresh-detect.js";
 import { resolveResultsDirSeed, type ResultsDirSeedHandle } from "./seed.js";
+import { premergeResults } from "../engine/premerge.js";
+import { normalizeDirInputs } from "./merge.js";
 import { cloneRemoteTarget, isRemoteTargetUrl } from "./clone-target.js";
 import type { ResumeOptions } from "./resume.js";
 import { compact } from "../engine/util.js";
-import { parsePositiveUsd, statusArrow } from "./util.js";
+import { cleanupConfirmationResources } from "../engine/confirmation-cleanup.js";
+import {
+  resolveCompletedKnowledgeBaseOutput,
+  resolveKnowledgeBaseInput,
+  type ResolvedKnowledgeBase,
+} from "../engine/knowledge-base.js";
+import { parseCloneDepth, parsePositiveUsd, statusArrow } from "./util.js";
 import { resolveModel } from "./run-models.js";
 import { runInteractive } from "./run-interactive.js";
 import {
@@ -43,7 +60,16 @@ import {
 
 const MAX_CONTEXT_BYTES = 32 * 1024;
 
-const VALID_MODES: AuditMode[] = ["lite", "balanced", "deep", "diff", "confirm", "merge", "revisit", "reinvest", "longshot", "refresh"];
+const VALID_MODES: AuditMode[] = ["lite", "balanced", "deep", "knowledge-base", "diff", "confirm", "merge", "revisit", "reinvest", "longshot", "refresh"];
+const KNOWLEDGE_BASE_MODES = new Set<AuditMode>(["lite", "balanced", "deep", "knowledge-base"]);
+
+export function modeSupportsKnowledgeBase(mode: AuditMode): boolean {
+  return KNOWLEDGE_BASE_MODES.has(mode);
+}
+
+export function modeMayResolveKnowledgeBase(mode: AuditMode): boolean {
+  return modeSupportsKnowledgeBase(mode) || mode === "refresh";
+}
 
 /**
  * Routing decision produced when `--mode refresh` is invoked. The
@@ -55,6 +81,7 @@ interface RefreshRouting {
   excludePhases?: string[];
   triggeredVia: string;
   resume?: boolean;
+  resumeAuditId?: string;
 }
 
 export async function runCommand(opts: RunOptions): Promise<void> {
@@ -79,6 +106,21 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     }
   }
 
+  // --clone-depth: shallow-clone depth for a remote --target (0/"full" = full
+  // history). Validate up front so a typo fails fast even though it only
+  // applies to remote URL targets (no-op for local paths).
+  let cloneDepth: number | undefined;
+  if (opts.cloneDepth !== undefined) {
+    const parsed = parseCloneDepth(opts.cloneDepth);
+    if (parsed === null) {
+      fail(
+        `--clone-depth must be a non-negative integer, or 0/"full" for full history (got ${JSON.stringify(opts.cloneDepth)})`,
+      );
+    } else {
+      cloneDepth = parsed;
+    }
+  }
+
   // --target / --source: when it's a remote git URL (https://github.com/...,
   // https://gitlab.com/..., git@host:..., etc.), clone it into
   // ./<repo-slug>/ under the current working directory and continue against
@@ -96,7 +138,10 @@ export async function runCommand(opts: RunOptions): Promise<void> {
       fail(`--resume is incompatible with a remote --target (a fresh clone has no resume state).`);
     }
     try {
-      const cloned = cloneRemoteTarget(opts.target);
+      const cloned = cloneRemoteTarget(
+        opts.target,
+        cloneDepth !== undefined ? { depth: cloneDepth } : {},
+      );
       opts.target = cloned.clonedTargetDir;
       if (!json) console.log(chalk.blue("[clone]") + ` ${cloned.summary}`);
     } catch (err) {
@@ -129,6 +174,11 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   if (platform !== "claude" && platform !== "codex") {
     fail(`--agent must be "claude" or "codex"`);
   }
+  try {
+    opts.transport = resolveAgentTransport(opts.transport);
+  } catch (err) {
+    fail((err as Error).message);
+  }
 
   // Tell Claude Code it's running in a sandboxed context so it doesn't refuse
   // to start as root. Inherited by every claude child (CLI adapter spawn,
@@ -156,10 +206,23 @@ export async function runCommand(opts: RunOptions): Promise<void> {
         `Run without -i, or invoke modes one at a time.`,
     );
   }
+  if (opts.interactive && opts.transport === "sdk") {
+    fail(`--transport sdk is incompatible with -i/--interactive; interactive mode uses the native agent CLI`);
+  }
   if (opts.interactive && requestedModes[0] === "refresh") {
     fail(
       `--mode refresh is headless-only (it dispatches to revisit or deep at startup). ` +
         `Run without -i, or invoke the resolved mode directly.`,
+    );
+  }
+  if (
+    opts.interactive
+    && platform === "codex"
+    && !isCodexHandoffMode(requestedModes[0]!)
+  ) {
+    fail(
+      `--mode ${requestedModes[0]} has no Codex interactive dispatch. ` +
+        `Run without -i to use the phase orchestrator.`,
     );
   }
   const noGit = opts.git === false;
@@ -190,6 +253,42 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     }
   }
 
+  // --mode merge --dir A --dir B: run the deterministic pre-merge first, then
+  // dispatch the LLM normalization (merge mode) against the consolidated folder.
+  // The pre-merge consolidates into the first --dir in place (the standalone
+  // `vigolium-audit merge --output` exists for a non-destructive destination).
+  let mergeTargetOverride: string | undefined;
+  const mergeInputs = normalizeDirInputs(opts.dir);
+  if (mergeInputs.length > 0) {
+    if (requestedModes.length !== 1 || requestedModes[0] !== "merge") {
+      fail(`--dir is only valid with --mode merge (got mode ${requestedModes.join(",")})`);
+    }
+    if (opts.target !== undefined && opts.target !== ".") {
+      fail(
+        `--mode merge --dir derives the destination from the first --dir; drop --target ` +
+          `(or use \`vigolium-audit merge --dir … --output <dir>\` for a separate destination)`,
+      );
+    }
+    if (opts.fromResultsDir !== undefined) fail(`--mode merge --dir is incompatible with --from-results-dir`);
+    if (opts.resume === true) fail(`--mode merge --dir is incompatible with --resume`);
+    try {
+      const pre = await premergeResults({ inputs: mergeInputs, ...(opts.force ? { force: true } : {}) });
+      mergeTargetOverride = pre.destProjectDir;
+      if (json) {
+        emitJsonEvent({ kind: "premerge", ...pre });
+      } else {
+        console.log(
+          chalk.blue("[merge]") +
+            ` consolidated ${pre.sources.length} folders → ${chalk.cyan(pre.destResultsDir)} ` +
+            `(${pre.findingsCopied} findings copied, ${pre.idRemap.length} renamed)` +
+            (pre.backup ? chalk.dim(` · state backed up to ${pre.backup}`) : ""),
+        );
+      }
+    } catch (err) {
+      fail((err as Error).message);
+    }
+  }
+
   // --from-results-dir: clone the recorded repo at the recorded commit, copy
   // the seed vigolium-results/ into the clone, and run against that. The seed
   // handle's cleanup() syncs the result back to the original input dir on exit.
@@ -215,7 +314,46 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     }
   }
 
-  const targetDir = seedHandle ? seedHandle.clonedTargetDir : resolve(opts.target ?? ".");
+  const targetDir = seedHandle
+    ? seedHandle.clonedTargetDir
+    : mergeTargetOverride !== undefined
+      ? resolve(mergeTargetOverride)
+      : resolve(opts.target ?? ".");
+
+  const acceptsKnowledgeBase = requestedModes.some(modeMayResolveKnowledgeBase);
+  if ((opts.knowledgeBase !== undefined || opts.knowledgeBaseRaw !== undefined) && !acceptsKnowledgeBase) {
+    fail(
+      `--knowledge-base and --knowledge-base-raw are supported with modes: ` +
+        `${[...KNOWLEDGE_BASE_MODES].join(", ")}`,
+    );
+  }
+  let knowledgeBase: ResolvedKnowledgeBase | undefined;
+  if (acceptsKnowledgeBase) {
+    try {
+      knowledgeBase = await resolveKnowledgeBaseInput({
+        targetDir,
+        // A fresh standalone builder should inspect the current repository and
+        // any discovered docs, not recursively seed itself from its last report.
+        adoptPriorRun: requestedModes[0] !== "knowledge-base",
+        ...compact({
+          path: opts.knowledgeBase,
+          raw: opts.knowledgeBaseRaw,
+          resume: opts.resume || undefined,
+          resumeMode: opts.resume ? requestedModes[0] : undefined,
+          resumeAuditId: opts.resume ? opts.resumeAuditId : undefined,
+        }),
+      });
+      if (knowledgeBase !== undefined && !json) {
+        console.log(
+          chalk.blue("[knowledge-base]") +
+            ` ${knowledgeBase.files.length} file${knowledgeBase.files.length === 1 ? "" : "s"}, ` +
+            `${knowledgeBase.totalBytes} bytes (${knowledgeBase.sourceKind})`,
+        );
+      }
+    } catch (err) {
+      fail((err as Error).message);
+    }
+  }
 
   // Auth overrides must be applied before any adapter / subprocess work — env
   // vars and file swaps must be in place when the SDK reads them or when
@@ -258,11 +396,15 @@ export async function runCommand(opts: RunOptions): Promise<void> {
         mode: requestedModes[0]!,
         targetDir,
         noGit,
+        tmux: !!opts.tmux,
         ...compact({
           liveTarget: opts.liveTarget,
           model: opts.model,
           focus: interactiveAuditContext.focus,
           expectedBehaviors: interactiveAuditContext.expectedBehaviors,
+          knowledgeBase,
+          agentBinary: opts.agentBinary,
+          disallowedTools: opts.disallowedTools,
         }),
       });
     }
@@ -272,6 +414,7 @@ export async function runCommand(opts: RunOptions): Promise<void> {
       targetDir,
       opts,
       noGit,
+      ...(knowledgeBase !== undefined ? { knowledgeBase } : {}),
     });
   } finally {
     authHandle?.restore();
@@ -349,6 +492,7 @@ export function isResumeAlias(opts: RunOptions): boolean {
 function toResumeOptions(opts: RunOptions): ResumeOptions {
   return compact({
     agent: opts.agent,
+    transport: opts.transport,
     strict: opts.strict,
     maxCost: opts.maxCost,
     output: opts.output,
@@ -356,8 +500,11 @@ function toResumeOptions(opts: RunOptions): ResumeOptions {
     oauthCredFile: opts.oauthCredFile,
     apiKey: opts.apiKey,
     stripRaw: opts.stripRaw,
+    keepSecrets: opts.keepSecrets,
     focusFile: opts.focusFile,
     expectedBehaviorsFile: opts.expectedBehaviorsFile,
+    knowledgeBase: opts.knowledgeBase,
+    knowledgeBaseRaw: opts.knowledgeBaseRaw,
     serial: opts.serial,
     json: opts.json,
     debug: opts.debug,
@@ -378,7 +525,11 @@ async function resolveRefreshRouting(
   if (inProgress) {
     return {
       mode: inProgress.mode,
-      routing: { triggeredVia: TRIGGERED_VIA_REFRESH, resume: true },
+      routing: {
+        triggeredVia: TRIGGERED_VIA_REFRESH,
+        resume: true,
+        resumeAuditId: inProgress.auditId,
+      },
       logLine: `resuming in-progress audit ${inProgress.auditId} (mode=${inProgress.mode})`,
     };
   }
@@ -420,7 +571,7 @@ async function pruneCompletedArtifacts(args: {
   json: boolean;
 }): Promise<void> {
   if (!shouldPruneCompletedArtifacts({ mode: args.mode, opts: args.opts })) return;
-  await stripRawArtifacts(args.resultsDir, {
+  const report = await finalizeOutput(args.resultsDir, {
     // Only lite needs historical draft promotion. Deep/balanced/confirm have
     // canonical finalized finding directories; promoting raw drafts would
     // pollute `findings/` with intermediate chamber output.
@@ -429,12 +580,49 @@ async function pruneCompletedArtifacts(args: {
     // env logs, test fallback output). For other modes, remove stale prior
     // confirm workspaces so the output reflects the just-finished mode.
     keepConfirmWorkspace: args.mode === "confirm",
+    // Sweep scanner scratch and (unless --keep-secrets) drop DB snapshots +
+    // scrub confirm-workspace secrets as part of the same final pass.
+    ...(args.opts.keepSecrets ? { keepSecrets: true } : {}),
   });
   if (args.json) {
-    emitJsonEvent({ kind: "cleanup", mode: args.mode, resultsDir: args.resultsDir });
+    emitJsonEvent({ kind: "cleanup", mode: args.mode, resultsDir: args.resultsDir, redaction: report });
   } else {
-    console.log(chalk.blue("[cleanup]") + ` pruned raw artifacts under ${chalk.dim(args.resultsDir)}`);
+    const secretsNote = args.opts.keepSecrets
+      ? " (secrets retained)"
+      : report.valuesMasked > 0 || report.artifactsDropped.length > 0
+        ? ` (redacted ${report.valuesMasked} secret(s), dropped ${report.artifactsDropped.length} snapshot(s))`
+        : "";
+    console.log(
+      chalk.blue("[cleanup]") + ` pruned raw artifacts under ${chalk.dim(args.resultsDir)}${secretsNote}`,
+    );
   }
+}
+
+/**
+ * Warn when the vendored Agent SDK's target claude-code version has drifted far
+ * enough from the installed binary to risk truncating an SDK-driven headless
+ * audit mid-run (see `src/adapters/version-check.ts`). The claude SDK adapter
+ * drives the binary over the Agent SDK's stdio control protocol; interactive
+ * (`-i`) and the `--print` CLI adapter speak the binary's own native protocol,
+ * so only the claude SDK path needs this. Strictly advisory — never blocks.
+ */
+function warnClaudeVersionDrift(choice: ResolvedAdapterChoice, json: boolean): void {
+  const drift = detectClaudeVersionDrift(
+    sdkTargetClaudeVersion(),
+    probeClaudeBinaryVersion(choice.binaryPath ?? ""),
+  );
+  if (!drift) return;
+  if (json) {
+    emitJsonEvent({ kind: "versionDrift", ...drift });
+    return;
+  }
+  console.log(
+    chalk.yellow("[warn]") +
+      `     Agent SDK targets claude-code ${chalk.cyan(drift.sdkTarget)} but the installed ` +
+      `binary is ${chalk.cyan(drift.binary)}. This version gap can cause SDK-driven (headless) ` +
+      `runs to stop mid-audit; upgrade vigolium-audit, or use ${chalk.cyan("-i")} (interactive), ` +
+      `which is unaffected.`,
+  );
 }
 
 async function runHeadless(args: {
@@ -443,11 +631,13 @@ async function runHeadless(args: {
   targetDir: string;
   opts: RunOptions;
   noGit: boolean;
+  knowledgeBase?: ResolvedKnowledgeBase;
 }): Promise<void> {
   const { platform, modes, targetDir, opts, noGit } = args;
+  let activeKnowledgeBase = args.knowledgeBase;
   const json = !!opts.json;
   const isChain = modes.length > 1;
-  const choice = chooseAdapter(platform);
+  const choice = chooseAdapter(platform, opts.transport);
 
   if (!json) {
     const git = noGit
@@ -502,6 +692,8 @@ async function runHeadless(args: {
       : chalk.dim("runtime default");
     console.log(`${statusArrow("Model")} Model:     ${modelLabel}`);
   }
+
+  if (platform === "claude" && choice.flavor === "sdk") warnClaudeVersionDrift(choice, json);
 
   let auditContext: { focus?: string; expectedBehaviors?: string };
   try {
@@ -708,7 +900,10 @@ async function runHeadless(args: {
             debug: opts.debug || undefined,
             focus: auditContext.focus,
             expectedBehaviors: auditContext.expectedBehaviors,
+            knowledgeBase: KNOWLEDGE_BASE_MODES.has(m) ? activeKnowledgeBase : undefined,
             liveTarget: opts.liveTarget,
+            model: effectiveModel,
+            noGit: noGit || undefined,
           });
           const driver: { on: typeof Orchestrator.prototype.on; run: () => Promise<OrchestratorResult> } =
             platform === "claude"
@@ -743,6 +938,7 @@ async function runHeadless(args: {
                     ...compact({
                       maxCost: perModeBudget,
                       stripRaw: opts.stripRaw || undefined,
+                      keepSecrets: opts.keepSecrets || undefined,
                       parallel: opts.serial ? false : undefined,
                       noGit: noGit || undefined,
                     }),
@@ -765,6 +961,13 @@ async function runHeadless(args: {
           } catch (err) {
             if (lineLogger) await lineLogger.drain();
             throw err;
+          } finally {
+            if (m === "confirm") {
+              const cleanupDir = platform === "claude" || useCodexHandoffM
+                ? join(targetDir, "vigolium-results")
+                : resultsDir;
+              await cleanupConfirmationResources(cleanupDir).catch(() => {});
+            }
           }
         }),
       ).catch((err: Error) => {
@@ -792,6 +995,40 @@ async function runHeadless(args: {
         refreshRouting = routed.routing;
         if (!json) {
           console.log(chalk.green("[refresh]") + ` ${routed.logLine}`);
+        }
+        if (
+          !modeSupportsKnowledgeBase(mode)
+          && (opts.knowledgeBase !== undefined || opts.knowledgeBaseRaw !== undefined)
+          && !modes.some(modeSupportsKnowledgeBase)
+        ) {
+          fatalError = new Error(
+            "knowledge-base input cannot be applied because refresh routed to revisit; " +
+              "run a lite, balanced, deep, or knowledge-base mode instead",
+          );
+          stoppedReason = "fatal";
+          break;
+        }
+      }
+
+      if (
+        modeSupportsKnowledgeBase(mode) &&
+        refreshRouting?.resume === true
+      ) {
+        try {
+          activeKnowledgeBase = await resolveKnowledgeBaseInput({
+            targetDir,
+            resume: true,
+            resumeMode: mode,
+            ...compact({
+              resumeAuditId: refreshRouting.resumeAuditId,
+              path: opts.knowledgeBase,
+              raw: opts.knowledgeBaseRaw,
+            }),
+          });
+        } catch (err) {
+          fatalError = err as Error;
+          stoppedReason = "fatal";
+          break;
         }
       }
 
@@ -829,6 +1066,7 @@ async function runHeadless(args: {
           platform,
           excludePhases: refreshRouting?.excludePhases ?? [],
           noGit,
+          knowledgeBaseAvailable: modeSupportsKnowledgeBase(mode) && activeKnowledgeBase !== undefined,
         });
         const { estimateCost } = await import("./cost-preflight.js");
         const est = await estimateCost({ targetDir, mode, runnablePhases: runnable });
@@ -841,8 +1079,8 @@ async function runHeadless(args: {
       // single CLI/SDK call when the runtime can dispatch sub-agents itself:
       //   - claude → `/vigolium-audit:vigolium-audit:<mode>` slash command + plugin.
       //   - codex  → AGENTS.md dispatch + ~/.codex/agents/* + ~/.codex/skills/*.
-      // Codex's dispatch fragment only covers lite/balanced/deep/revisit/
-      // confirm — for diff/merge/reinvest/longshot we fall back to the
+      // Codex's dispatch fragment only covers knowledge-base/lite/balanced/
+      // deep/revisit/confirm — for diff/merge/reinvest/longshot we fall back to the
       // per-phase Orchestrator since there's no codex-shaped methodology
       // for those yet.
       const useCodexHandoff = platform === "codex" && isCodexHandoffMode(mode);
@@ -856,10 +1094,14 @@ async function runHeadless(args: {
         debug: opts.debug || undefined,
         focus: auditContext.focus,
         expectedBehaviors: auditContext.expectedBehaviors,
+        knowledgeBase: KNOWLEDGE_BASE_MODES.has(mode) ? activeKnowledgeBase : undefined,
         liveTarget: opts.liveTarget,
+        model: effectiveModel,
+        noGit: noGit || undefined,
         excludePhases: refreshRouting?.excludePhases,
         triggeredVia: refreshRouting?.triggeredVia,
         resume: opts.resume === true || refreshRouting?.resume === true ? true : undefined,
+        resumeAuditId: refreshRouting?.resumeAuditId ?? opts.resumeAuditId,
       });
       const driver: { on: typeof Orchestrator.prototype.on; run: () => Promise<OrchestratorResult> } =
         platform === "claude"
@@ -892,6 +1134,7 @@ async function runHeadless(args: {
                 ...compact({
                   maxCost: remainingBudget,
                   stripRaw: opts.stripRaw || undefined,
+                  keepSecrets: opts.keepSecrets || undefined,
                   resume:
                     opts.resume === true || refreshRouting?.resume === true
                       ? true
@@ -916,6 +1159,10 @@ async function runHeadless(args: {
         stoppedReason = "fatal";
         if (lineLogger) await lineLogger.drain();
         break;
+      } finally {
+        if (mode === "confirm") {
+          await cleanupConfirmationResources(resultsDir).catch(() => {});
+        }
       }
       if (lineLogger) await lineLogger.drain();
       if (result === null) {
@@ -945,6 +1192,19 @@ async function runHeadless(args: {
       if (abortController.signal.aborted) {
         stoppedReason = "aborted";
         break;
+      }
+      if (mode === "knowledge-base" && i + 1 < modes.length) {
+        try {
+          const generated = await resolveCompletedKnowledgeBaseOutput(targetDir, result.auditId);
+          if (generated === undefined) {
+            throw new Error("completed knowledge-base mode did not produce a reusable knowledge-base report");
+          }
+          activeKnowledgeBase = generated;
+        } catch (err) {
+          fatalError = err as Error;
+          stoppedReason = "fatal";
+          break;
+        }
       }
     }
   } finally {
@@ -1057,6 +1317,7 @@ async function countRunnablePhases(args: {
   platform: AgentPlatform;
   excludePhases: string[];
   noGit?: boolean;
+  knowledgeBaseAvailable: boolean;
 }): Promise<number> {
   const loader = getContentLoader();
   const variant = args.platform === "codex" ? "sdk" : "default";
@@ -1065,6 +1326,7 @@ async function countRunnablePhases(args: {
   const exclude = new Set(args.excludePhases);
   return command.phases.filter((p) => {
     if (p.requires_git && !gitAvailable) return false;
+    if (p.requires_knowledge_base && !args.knowledgeBaseAvailable) return false;
     if (exclude.has(p.id)) return false;
     return true;
   }).length;

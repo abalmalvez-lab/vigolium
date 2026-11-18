@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Rails Action Mailbox ingress endpoints for multiple email service providers.
-These endpoints receive inbound emails via HTTP and may be accessible without proper
-authentication or provider signature validation.
+	ModuleDesc = `**What it means:** A Ruby on Rails application exposes Action Mailbox ingress endpoints, which receive inbound emails over HTTP from providers such as SendGrid, Mailgun, and Postmark. The module confirms POST-only routes via a Rails Allow: POST response and the conductor UI by its HTML, reachable without authentication.
 
-## Notes
-- Uses OPTIONS and POST requests to check for accessible ingress endpoints
-- Tests relay, SendGrid, Mailgun, Mandrill, and Postmark ingress paths
-- Checks for WWW-Authenticate headers indicating basic auth protection
-- Fingerprints 404 responses to avoid false positives
+**How it's exploited:** An attacker submits forged inbound-email payloads to the ingress endpoint, bypassing the provider, to inject spoofed messages into application workflows. The conductor UI leaks received emails.
 
-## References
-- https://guides.rubyonrails.org/action_mailbox_basics.html
-- https://api.rubyonrails.org/classes/ActionMailbox.html`
+**Fix:** Require provider signature validation on ingress routes and disable the conductor UI in production.`
 
 	ModuleConfirmation = "Confirmed when Action Mailbox ingress endpoints respond to requests without authentication"
 	ModuleSeverity     = severity.Medium

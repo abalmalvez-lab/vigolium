@@ -9,21 +9,20 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects NoSQL injection vulnerabilities by injecting MongoDB/NoSQL operators and
-syntax into parameters and analyzing response bodies for database error messages.
+	ModuleDesc = `**What it means:** A request parameter flows unsanitized into a NoSQL query. Injected operators made a database-specific error appear that was absent from the original body, proving input reaches the query engine - an injection flaw on par with classic SQL injection.
 
-## Notes
-- Tests each insertion point with NoSQL-specific payloads
-- Detects MongoDB, CouchDB, and Cassandra error patterns
-- Uses request deduplication to avoid redundant checks
+**How it's exploited:** An attacker shapes operator payloads to authenticate without credentials, read other users' records, extract data via boolean or error-based oracles, or run server-side JavaScript where allowed, leading to data theft.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/05.6-Testing_for_NoSQL_Injection
-- https://portswigger.net/web-security/nosql-injection`
+**Fix:** Never build queries from raw input. Use parameterized, operator-safe driver APIs, reject objects where a scalar is expected, and disable server-side JavaScript evaluation.`
 
 	ModuleConfirmation = "Confirmed when injected NoSQL operators trigger database error patterns in the response body"
-	ModuleSeverity     = severity.Critical
-	ModuleConfidence   = severity.Certain
-	ModuleTags         = []string{"injection", "sqli", "moderate"}
+	// Error-string matching is inherently heuristic — a driver-error pattern can
+	// surface in non-exploitable contexts (a reflected message, an upstream
+	// component's log line, an incidental token in a bundle) even after the
+	// static-asset, corroboration, reproduce, and clean-control gates. Report
+	// High/Tentative so the finding is treated as a lead to verify, not a
+	// definitive injection.
+	ModuleSeverity   = severity.Suspect
+	ModuleConfidence = severity.Tentative
+	ModuleTags       = []string{"injection", "sqli", "moderate"}
 )

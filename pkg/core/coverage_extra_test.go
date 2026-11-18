@@ -4,7 +4,6 @@ import (
 	goruntime "runtime"
 	"testing"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/work"
 )
@@ -116,40 +115,10 @@ func TestResponseBufferPool_Reuse(t *testing.T) {
 	}
 }
 
-// --- executor config helpers -------------------------------------------------
-
-func TestDefaultExecutorConfig(t *testing.T) {
-	cfg := DefaultExecutorConfig()
-	if cfg.Workers != goruntime.NumCPU() {
-		t.Errorf("Workers = %d, want NumCPU=%d", cfg.Workers, goruntime.NumCPU())
-	}
-}
-
-func TestSuggestWorkerCount(t *testing.T) {
-	tests := []struct {
-		name        string
-		moduleCount int
-		maxWorkers  int
-		want        int
-	}{
-		{"floor at 2", 0, 100, 2},
-		{"scales 2x modules", 5, 100, 10},
-		{"capped at maxWorkers", 50, 16, 16},
-		{"single module floored", 0, 1, 1}, // suggested 2 but cap 1
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := SuggestWorkerCount(tt.moduleCount, tt.maxWorkers); got != tt.want {
-				t.Errorf("SuggestWorkerCount(%d,%d) = %d, want %d", tt.moduleCount, tt.maxWorkers, got, tt.want)
-			}
-		})
-	}
-}
-
 // --- NewExecutor + stats getters ---------------------------------------------
 
 func TestNewExecutor_QuiescentGetters(t *testing.T) {
-	e := NewExecutor(DefaultExecutorConfig(), &sliceSource{}, nil, nil)
+	e := NewExecutor(ExecutorConfig{}, &sliceSource{}, nil, nil)
 
 	if got := e.Processed(); got != 0 {
 		t.Errorf("Processed() = %d, want 0", got)
@@ -185,18 +154,25 @@ func TestNewExecutor_QuiescentGetters(t *testing.T) {
 // --- executor_adapters.go ----------------------------------------------------
 
 func TestExecutorFeeder_FeedAndDrop(t *testing.T) {
-	f := &executorFeeder{ch: make(chan *work.WorkItem, 1)}
+	f := &executorFeeder{ch: make(chan *work.WorkItem, 1), overflowCap: 1}
 	rr := &httpmsg.HttpRequestResponse{}
 
 	if !f.Feed(rr) {
 		t.Error("first Feed into empty channel should succeed")
 	}
-	// channel now full (cap 1) -> next Feed is dropped
+	// channel now full (cap 1) -> next Feed waits in the overflow list
+	if !f.Feed(rr) {
+		t.Error("Feed into full channel should overflow, not drop")
+	}
+	// overflow full (cap 1) -> dropped
 	if f.Feed(rr) {
-		t.Error("Feed into full channel should be dropped (return false)")
+		t.Error("Feed past the overflow cap should be dropped (return false)")
 	}
 	if got := f.Dropped(); got != 1 {
 		t.Errorf("Dropped() = %d, want 1", got)
+	}
+	if got := len(f.takeOverflow(0)); got != 1 {
+		t.Errorf("takeOverflow = %d items, want 1", got)
 	}
 }
 
@@ -220,12 +196,12 @@ func TestExecutorIPProvider_GetInsertionPoints(t *testing.T) {
 	}
 
 	// with cache: first call is a miss (computes + stores), second is a hit.
-	cache, _ := lru.New[string, []httpmsg.InsertionPoint](16)
+	cache := NewInsertionPointCache(16)
 	cached := &executorIPProvider{cache: cache}
 	if _, err := cached.GetInsertionPoints(raw, "req-2", true); err != nil {
 		t.Fatalf("GetInsertionPoints (cache miss) error = %v", err)
 	}
-	if cache.Len() == 0 {
+	if cache.Stats().Entries == 0 {
 		t.Error("expected cache to be populated after miss")
 	}
 	hit, err := cached.GetInsertionPoints(raw, "req-2", true)
@@ -240,7 +216,7 @@ func TestExecutorIPProvider_GetInsertionPoints(t *testing.T) {
 	if _, err := cached.GetInsertionPoints(raw, "req-2", false); err != nil {
 		t.Fatalf("GetInsertionPoints (shallow) error = %v", err)
 	}
-	if cache.Len() < 2 {
-		t.Errorf("shallow variant should add a distinct key; cache len = %d", cache.Len())
+	if entries := cache.Stats().Entries; entries < 2 {
+		t.Errorf("shallow variant should add a distinct key; cache len = %d", entries)
 	}
 }

@@ -82,6 +82,17 @@ func (m *Module) ScanPerInsertionPoint(
 	// 	return nil, nil
 	// }
 
+	// Behavioral diffing on a cache/CDN-fronted response or a large rendered HTML
+	// page is unreliable: cache HIT/MISS swings and per-request dynamic content
+	// (ads, recommendations, rotating blocks) manufacture phantom break-vs-escape
+	// differentials. Skip such surfaces before the expensive, many-probe baseline
+	// build — this is the slowest active module, so gating here also saves
+	// significant scan time. (Cosmetic/unconsumed insertion points are already
+	// handled downstream by the VerySimilar(softBase, crudeFuzz) baseline guard.)
+	if modkit.DifferentialSurfaceUnreliable(ctx.Response()) {
+		return nil, nil
+	}
+
 	httpService := ctx.Service()
 	if httpService == nil {
 		return nil, nil
@@ -155,18 +166,32 @@ func (m *Module) ScanPerInsertionPoint(
 		return nil, nil
 	}
 
-	bestSeverity := getBestSeverity(results)
+	// Every signal in that report is a response diff, so it means nothing on an
+	// endpoint that answers the SAME unmodified request two different ways: a host
+	// round-robining between mismatched backends (a parked pool serving either a
+	// 5.9 KB or an 11.3 KB Apache default page) makes the break and escape probes
+	// diverge on every metric the differ tracks. Checked only once a report exists,
+	// and memoized per record, so the probing above is unaffected.
+	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+		return nil, nil
+	}
 
 	zap.L().Info("SmartBehavior: Found issues",
 		zap.String("param", paramName),
 		zap.Int("count", len(results)/2))
 
+	// All findings from this module are emitted at Info severity. Diff-based
+	// behavioral injection detection is a low-confidence triage heuristic
+	// (it compares response behavior between semantically equivalent vs.
+	// different payloads), so it is surfaced as an informational lead for a
+	// human to confirm rather than an actionable issue. The per-probe
+	// break/escape payloads and response metrics remain in the report body.
 	return []*output.ResultEvent{{
 		URL:              urlx.String(),
 		Request:          string(ctx.Request().Raw()),
 		FuzzingParameter: paramName,
 		Info: output.Info{
-			Severity:    intToSeverity(bestSeverity),
+			Severity:    severity.Info,
 			Description: report,
 		},
 	}}, nil
@@ -341,15 +366,4 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
-}
-
-func intToSeverity(sev int) severity.Severity {
-	switch {
-	case sev >= 7:
-		return severity.High
-	case sev >= 3:
-		return severity.Medium
-	default:
-		return severity.Low
-	}
 }

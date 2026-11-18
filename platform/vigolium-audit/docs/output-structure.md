@@ -33,7 +33,8 @@ vigolium-results/
   reinvest-report.md
 ```
 
-Not every command creates every path. Lite runs create `audit-state.json`,
+Not every command creates every path. Knowledge-base mode creates only durable
+application-model and attack-surface context. Lite runs create `audit-state.json`,
 `attack-surface/lite-recon.md`, severity-prefixed `findings/<C|H|M><N>-<slug>/`
 directories with `draft.md` + `poc.*` + `evidence/`, and the candidate drafts
 that produced them. Balanced and deep runs add the full `attack-surface/`
@@ -47,6 +48,31 @@ to a delivery-oriented layout. Large/raw workspaces such as
 agent-generated helper `scripts/` are removed after success. Failed/aborted runs
 keep raw workspaces so they can be resumed or debugged.
 
+The same pass also performs **redaction** by default (see
+[Cleanup & redaction](#cleanup--redaction) below): a recursive sweep removes
+scanner scratch (`*.sarif`, `*.bqrs`, stray `tmp/`) left inside kept
+directories, the high-risk `db-snapshot.*` dumps are dropped, and secret values
+(passwords, tokens, API keys, connection strings) in the `confirm-workspace/`
+JSON + log files are masked to `***`. Pass `--keep-secrets` to retain those, or
+`--keep-raw` to skip the whole prune. The on-demand `vigolium-audit strip <path>`
+command applies the identical strip + sweep + redact pass.
+
+## Cleanup & redaction
+
+| Surface | Junk sweep (`*.sarif`/`*.bqrs`/`tmp/`) | DB snapshots (`db-snapshot.*`) | Secret scrub (`confirm-workspace/` JSON+logs) | Raw dirs / drafts |
+| --- | --- | --- | --- | --- |
+| default (deep/confirm auto-prune, `vigolium-audit strip`) | removed | dropped | masked to `***` | removed |
+| `--keep-secrets` | removed | **kept** | **skipped** | removed |
+| `--keep-raw` (run/confirm/resume) | kept | kept | kept | kept |
+
+Redaction is scoped to `confirm-workspace/` so durable state files
+(`audit-state.json`, `file-state.json`) that downstream tooling parses are never
+rewritten. JSON values are masked by exact secret key name (`password`, `token`,
+`api_key`, `authorization`, …), preserving `null`/empty and JSON shape; log
+lines are masked for `KEY=VALUE`/`KEY: VALUE` secret assignments, inline-credential
+URLs (`scheme://user:***@host`), and well-known token shapes (JWT, `sk-…`,
+`ghp_…`, `AKIA…`, `xox…`). All operations are idempotent.
+
 ## Durable outputs
 
 These paths are the primary outputs to keep after a run:
@@ -54,10 +80,12 @@ These paths are the primary outputs to keep after a run:
 | Path | Produced by | Description |
 | --- | --- | --- |
 | `vigolium-results/audit-state.json` | every audit mode | Run history, mode, status, phases, retry metadata, repository identity, model + agent SDK, and (when present) usage totals. The orchestrator reads/writes this on every phase transition. |
-| `vigolium-results/file-state.json` | every audit mode | Per-source-file scan record with SHA-256, the audits each file appeared in, and the phases it was scanned by. Used by `/vigolium-audit:diff` to compute incremental scope. |
+| `vigolium-results/file-state.json` | every audit mode | Per-source-file SHA-256 baseline, the audits each file appeared in, and `audit_phases` — the phases that ran in the audit that stamped the file (identical for every file in a run; not per-file attribution). Written by the engine after a complete audit over git-tracked files only; read by `vigolium-audit incremental-scope`. |
 | `vigolium-results/revisit-audit-state.json` | revisit | Round-N revisit state, kept separately so the original `audit-state.json` from round 1 stays intact. |
-| `vigolium-results/attack-surface/` | lite, balanced, deep, diff, revisit, merge | Durable knowledge base used by later phases: recon, advisories, KB, SAST, probes, chamber summaries, authz/concurrency/spec audits, intent reconciliation, and merge summaries. |
-| `vigolium-results/attack-surface/knowledge-base-report.md` | balanced, deep, revisit | The central KB document. Many phases append sections to it in-place rather than creating new files (see "knowledge-base-report.md" below). |
+| `vigolium-results/attack-surface/` | knowledge-base, lite, balanced, deep, diff, revisit, merge | Durable knowledge base used by later phases: staged application docs, recon, advisories, KB, SAST, probes, chamber summaries, authz/concurrency/spec audits, intent reconciliation, and merge summaries. |
+| `vigolium-results/attack-surface/knowledge-base-input/` | conditional KB0 in knowledge-base/lite/balanced/deep | Immutable exact source copies plus `manifest.json` and `corpus.md`. Present only when a flag, auto-discovered `knowledge-base/` folder, or adopted standalone report supplied input. |
+| `vigolium-results/attack-surface/knowledge-base-seed.md` | conditional KB0 in knowledge-base/lite/balanced/deep | Provenance-linked extraction of documented roles, auth/login flows, business rules, trust assumptions, contradictions, and open questions. |
+| `vigolium-results/attack-surface/knowledge-base-report.md` | knowledge-base, balanced, deep, revisit | The central KB document. Many phases append sections to it in-place rather than creating new files (see "knowledge-base-report.md" below). |
 | `vigolium-results/findings/` | lite, balanced, deep, revisit, merge | Final finding directories promoted from reviewed drafts (severity-prefixed `<C\|H\|M><N>-<slug>/`). |
 | `vigolium-results/final-audit-report.md` | balanced, deep, revisit, merge | Consolidated final report across finalized findings. |
 | `vigolium-results/confirmation-report.md` | confirm, deep P15+ followups | Confirmation verdict report for existing findings. |
@@ -115,8 +143,13 @@ Common files:
 
 | File | Produced by | Description |
 | --- | --- | --- |
+| `knowledge-base-input/manifest.json` | KB0 driver staging | Source kind, safe label, aggregate hash, file count/bytes, and logical-to-staged file map. |
+| `knowledge-base-input/corpus.md` | KB0 driver staging | Combined immutable Markdown corpus with source boundaries and per-source hashes. Treat as documentation data, not agent instructions. |
+| `knowledge-base-input/sources/*.md` | KB0 driver staging | Exact source copies used for line-level citations and resume hash verification. |
+| `knowledge-base-seed.md` | knowledge-base/lite/balanced/deep KB0 | Cited security-oriented extraction of application documentation. Claims still require source-code verification and do not automatically suppress findings. |
 | `lite-recon.md` | lite L1 | Source snapshot, manifests, frameworks, entry points, git status, scan exclusions. |
-| `knowledge-base-report.md` | balanced B1-B2, deep D4 + many later | The central KB. See section below. |
+| `unauthenticated-surface.md` | knowledge-base K2, lite L1, balanced B2, deep D4 (seed) → deep D7 (final) | The subset of the attack surface reachable by an anonymous attacker (no session/token/API key): pre-auth routes and non-route entry points, each tagged `by-design` / `missing-guard` / `middleware-gap`. Present in every intensity. In deep, the access-auditor supersedes the threat-modeler's seed with an exhaustive matrix-derived version. |
+| `knowledge-base-report.md` | knowledge-base K1-K2, balanced B1-B2, deep D4 + many later | The central KB. See section below. |
 | `commit-recon-report.md` | deep D2 | Commit-archaeology high-risk patches and bypass candidates. |
 | `authz-matrix.md` | deep D7 | One row per endpoint with expected vs. actual authorization checks. |
 | `authz-coverage-gaps.md` | deep D7 | Endpoints the auditor did not feel confident classifying. |
@@ -128,19 +161,20 @@ Common files:
 
 ### `knowledge-base-report.md`
 
-This single markdown file is the spine of every balanced and deep audit. Many
+This single markdown file is the standalone knowledge-base mode's primary output
+and the spine of every balanced and deep audit. Many
 phases append in-place sections rather than creating new files. Typical
 sections, in the order they tend to be written:
 
 | Section | Written by |
 | --- | --- |
-| `## Advisory Intelligence` | balanced B1, deep D1 |
+| `## Advisory Intelligence` | knowledge-base K1, balanced B1, deep D1 |
 | `## Commit Archaeology` | deep D2 |
 | `## Bypass Analysis` | deep D3 (merged from `bypass-analysis/`) |
-| `## Architecture Model` | balanced B2, deep D4 |
-| `## DFD/CFD Slices` | balanced B2, deep D4 |
-| `## Attack Surface` | balanced B2, deep D4 |
-| `## Domain Attack Research` | balanced B2, deep D4 |
+| `## Architecture Model` | knowledge-base K2, balanced B2, deep D4 |
+| `## DFD/CFD Slices` | knowledge-base K2, balanced B2, deep D4 |
+| `## Attack Surface` | knowledge-base K2, balanced B2, deep D4 |
+| `## Domain Attack Research` | knowledge-base K2, balanced B2, deep D4 |
 | `## Spec Gap Candidates` | deep D4 |
 | `## Known False-Positive Sources` | balanced B2, deep D4 |
 | `## High-Risk DFD Slices` / `## High-Risk CFD Slices` | balanced B2, deep D4 |
@@ -424,8 +458,9 @@ vigolium-results/tmp/on-demand.bqrs
 
 | Mode | Primary outputs |
 | --- | --- |
-| `lite` | `attack-surface/lite-recon.md`, `findings-draft/l2-*.md`, `findings-draft/l3-*.md`, severity-prefixed `findings/<C\|H\|M><N>-<slug>/` (`draft.md`, `poc.*`, `evidence/`) |
-| `balanced` | `attack-surface/knowledge-base-report.md` + advisory/KB/SAST/probe/chamber sections, `attack-surface/intent-reconciliation.md`, `findings/<id>-<slug>/`, `findings-theoretical/<id>-<slug>/`, `final-audit-report.md` |
+| `knowledge-base` | `attack-surface/knowledge-base-report.md`, `attack-surface/sbom.json`, `attack-surface/unauthenticated-surface.md`, and conditional `attack-surface/knowledge-base-input/` + `knowledge-base-seed.md`; no finding tree or vulnerability report |
+| `lite` | `attack-surface/lite-recon.md`, `attack-surface/unauthenticated-surface.md`, `findings-draft/l2-*.md`, `findings-draft/l3-*.md`, severity-prefixed `findings/<C\|H\|M><N>-<slug>/` (`draft.md`, `poc.*`, `evidence/`) |
+| `balanced` | `attack-surface/knowledge-base-report.md` + advisory/KB/SAST/probe/chamber sections, `attack-surface/unauthenticated-surface.md`, `attack-surface/intent-reconciliation.md`, `findings/<id>-<slug>/`, `findings-theoretical/<id>-<slug>/`, `final-audit-report.md` |
 | `deep` | Full `attack-surface/` corpus (incl. `intent-corpus.json` + `intent-reconciliation.md`), `findings/`, `findings-theoretical/`, `file-state.json`, `final-audit-report.md`; raw chamber/SAST workspaces exist only until successful cleanup |
 | `confirm` | `confirmation-report.md`, `confirm-workspace/*.json`, verdict-grouped `confirm-workspace/report-ready/` + `needs-review/` staging copies, updated `<inventory.dir>/report.md` in either `findings/` or `findings-theoretical/`, evidence under `<inventory.dir>/confirm-evidence/`, optional `confirm-test*` fallback artifacts |
 | `diff` | Re-runs a subset of deep phases against a changed-file scope; produces deltas under the same paths the underlying deep phases use |
@@ -441,9 +476,16 @@ For a completed audit, start with:
 1. `vigolium-results/final-audit-report.md`
 2. `vigolium-results/findings/<ID>-<slug>/report.md` and `vigolium-results/findings-theoretical/<ID>-<slug>/report.md`
 3. `vigolium-results/attack-surface/knowledge-base-report.md`
-4. `vigolium-results/attack-surface/intent-reconciliation.md` (balanced/deep — why a finding was treated as intentional/feature vs a real bug)
-5. `vigolium-results/attack-surface/authz-matrix.md` (if deep)
-6. `vigolium-results/audit-state.json`
+4. `vigolium-results/attack-surface/unauthenticated-surface.md` (all intensities — what an anonymous attacker can reach; triage pre-auth findings first)
+5. `vigolium-results/attack-surface/intent-reconciliation.md` (balanced/deep — why a finding was treated as intentional/feature vs a real bug)
+6. `vigolium-results/attack-surface/authz-matrix.md` (if deep)
+7. `vigolium-results/audit-state.json`
+
+For a standalone knowledge-base run, start with
+`attack-surface/knowledge-base-report.md`, then
+`attack-surface/unauthenticated-surface.md`; use `knowledge-base-seed.md` and
+`knowledge-base-input/manifest.json` to trace user-supplied claims back to the
+immutable source copy.
 
 For confirmation results, start with:
 

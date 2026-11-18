@@ -9,28 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans client-side JavaScript bundles for evidence that server-only code has leaked
-into the browser. Server-side modules (database clients, internal API helpers, crypto
-operations, environment secrets) should use the 'server-only' package to enforce the
-boundary. When this guard is missing, Next.js may accidentally bundle server code into
-the client, exposing proprietary logic, internal endpoints, and potentially credentials.
+	ModuleDesc = `**What it means:** A Next.js client bundle contains two server-oriented import/URL patterns, or one substantive credential-shaped database URI. Import strings can survive dead code and do not prove executable server logic.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Scans JS response bodies under /_next/static/ paths
-- Detects server-side module identifiers in client bundles (prisma, drizzle, knex, etc.)
-- Detects internal API endpoint patterns (localhost, 127.0.0.1, internal service URLs)
-- Detects server crypto/auth module usage (bcrypt, jsonwebtoken, jose)
-- Deduplicates by host+path
+**How it's exploited:** Real impact requires useful internal detail, runtime reachability, or a live credential. The module performs no call-graph or provider validation, so results remain candidates; obvious placeholder URIs are suppressed.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/rendering/composition-patterns#keeping-server-only-code-out-of-the-client-environment
-- https://cwe.mitre.org/data/definitions/200.html
-- https://cwe.mitre.org/data/definitions/540.html`
+**Fix:** Wrap server-only modules with the server-only package and keep secrets and internal URLs out of client code.`
 
-	ModuleConfirmation = "Confirmed when client-side JavaScript bundles contain server-only module identifiers or internal service references"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Candidate after two server-oriented signals or one non-placeholder credentialed database URI; runtime reachability and credential validity remain unconfirmed"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"nextjs", "javascript", "info-disclosure", "light"}
 )

@@ -9,22 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-The descriptions of MCP tools, prompts, and resources are normally rendered
-verbatim into a downstream LLM's context. A malicious or compromised MCP
-server can use these strings as a free side-channel into the agent: encode
-imperative-style instructions, hide instructions in bidi/zero-width unicode,
-or embed base64 payloads.
+	ModuleDesc = `**What it means:** An MCP server advertises tool, prompt, or resource descriptions containing prompt-injection content: direct LLM imperatives, hidden bidi-control or zero-width unicode, or base64 blobs decoding to ASCII instructions. These render verbatim into a downstream LLM agent - a tool-poisoning risk.
 
-This module passively scans ` + "`tools/list`" + `, ` + "`prompts/list`" + `, and
-` + "`resources/list`" + ` responses (or any MCP-shaped response that contains a
-` + "`description`" + ` field) for these markers.
+**How it's exploited:** The description field injects commands into any connecting agent, steering it to leak its system prompt, exfiltrate keys or data, or invoke other tools - hidden unicode and base64 hide the payload from UI review.
 
-## References
-- https://owasp.org/www-project-top-10-for-large-language-model-applications/
-- https://simonwillison.net/2024/Mar/13/prompt-injection-attacks-against-mcp-servers/`
+**Fix:** Avoid untrusted MCP servers, and sanitize imperatives, control/zero-width unicode, and encoded blobs before descriptions reach the LLM context.`
 
-	ModuleConfirmation = "Confirmed when an MCP description contains direct LLM imperatives, bidi-control or zero-width unicode, or a base64 blob that decodes to ASCII instructions"
+	ModuleConfirmation = "Candidate for direct or decoded imperative payloads; obfuscation-only unicode remains an observation, and confirmation requires downstream model behavior or tool/data impact"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"mcp", "prompt-injection", "supply-chain", "light"}

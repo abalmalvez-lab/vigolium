@@ -9,20 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Server-Side Template Injection vulnerabilities by injecting math expressions
-(e.g., {{7*7}}) and checking if the computed result appears in the response.
+	ModuleDesc = `**What it means:** Server-Side Template Injection: user input reaches a template engine (Jinja2, Twig, Freemarker, Velocity, ERB) and is evaluated as code rather than rendered as text - a critical server-side code-evaluation flaw.
 
-## Notes
-- Tests multiple template engine syntaxes (Jinja2, Twig, Freemarker, etc.)
-- Uses unique random values to avoid false positives from cached responses
-- Confirmed by matching computed mathematical results in the response
+**How it's exploited:** The scanner injects a math expression like {{1970*2024}} across many engine delimiters and confirms only when the product (3987280) appears, re-verified against a clean baseline. From arithmetic an attacker escalates to reading server-side variables and, on most engines, full remote code execution.
 
-## References
-- https://portswigger.net/research/server-side-template-injection`
+**Fix:** Never pass user input into template source; render untrusted data only through context-safe variables, and sandbox the engine.`
 
 	ModuleConfirmation = "Confirmed when injected math expressions (e.g., {{7*7}}=49) are evaluated and the computed result appears in the response"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Certain
-	ModuleTags         = []string{"injection", "ssti", "moderate"}
+	ModuleTags         = []string{"injection", "ssti", "heavy"}
 )

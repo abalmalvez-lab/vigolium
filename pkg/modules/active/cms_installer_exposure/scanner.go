@@ -16,10 +16,15 @@ import (
 )
 
 type probe struct {
-	path        string
-	name        string
-	cms         string
-	markers     []string
+	path string
+	name string
+	cms  string
+	// markers are AND-of-OR groups (matched via modkit.MatchAllGroups): the body
+	// must satisfy EVERY group (at least one substring per group). Group 1 is the
+	// CMS-name anchor and group 2 is installer-specific context. Requiring the
+	// co-occurrence stops a normal 200 page that merely contains a generic word
+	// like "language" or "database" from being reported as an exposed installer.
+	markers     [][]string
 	antiMarkers []string
 	desc        string
 }
@@ -27,45 +32,60 @@ type probe struct {
 var probes = []probe{
 	// WordPress
 	{
-		path:        "/wp-admin/install.php",
-		name:        "WordPress Installer",
-		cms:         "wordpress",
-		markers:     []string{"WordPress", "wp-install", "language", "setup-config", "install.php"},
+		path: "/wp-admin/install.php",
+		name: "WordPress Installer",
+		cms:  "wordpress",
+		markers: [][]string{
+			{"WordPress"},
+			{"wp-install", "setup-config", "five-minute", "installation process", "?step=", "language-chooser", "Select a default language"},
+		},
 		antiMarkers: []string{"Log In", "wp-login", "already installed"},
 		desc:        "WordPress installation wizard is publicly accessible, potentially allowing CMS re-installation",
 	},
 	{
-		path:        "/wp-admin/setup-config.php",
-		name:        "WordPress Setup Config",
-		cms:         "wordpress",
-		markers:     []string{"WordPress", "setup-config", "database", "wp-config"},
+		path: "/wp-admin/setup-config.php",
+		name: "WordPress Setup Config",
+		cms:  "wordpress",
+		markers: [][]string{
+			{"WordPress"},
+			{"setup-config", "wp-config", "DB_NAME", "Below you should enter your database", "database connection details"},
+		},
 		antiMarkers: []string{"Log In", "wp-login"},
 		desc:        "WordPress setup configuration wizard is publicly accessible",
 	},
 	// Drupal 7
 	{
-		path:        "/install.php",
-		name:        "Drupal 7 Installer",
-		cms:         "drupal",
-		markers:     []string{"Drupal", "Choose language", "installation profile", "install_configure_form"},
+		path: "/install.php",
+		name: "Drupal 7 Installer",
+		cms:  "drupal",
+		markers: [][]string{
+			{"Drupal"},
+			{"install_configure_form", "installation profile", "Choose language", "Select an installation profile", "?profile="},
+		},
 		antiMarkers: []string{"already installed", "Access denied"},
 		desc:        "Drupal 7 installation wizard is publicly accessible, potentially allowing CMS re-installation",
 	},
 	// Drupal 8+
 	{
-		path:        "/core/install.php",
-		name:        "Drupal 8+ Installer",
-		cms:         "drupal",
-		markers:     []string{"Drupal", "Choose language", "Select an installation profile", "install_configure_form"},
+		path: "/core/install.php",
+		name: "Drupal 8+ Installer",
+		cms:  "drupal",
+		markers: [][]string{
+			{"Drupal"},
+			{"install_configure_form", "Select an installation profile", "Choose language", "?langcode=", "?profile="},
+		},
 		antiMarkers: []string{"already installed", "Access denied"},
 		desc:        "Drupal 8+ installation wizard is publicly accessible, potentially allowing CMS re-installation",
 	},
 	// Joomla
 	{
-		path:        "/installation/index.php",
-		name:        "Joomla Installer",
-		cms:         "joomla",
-		markers:     []string{"Joomla", "installation", "Configuration", "Database", "site_name"},
+		path: "/installation/index.php",
+		name: "Joomla Installer",
+		cms:  "joomla",
+		markers: [][]string{
+			{"Joomla"},
+			{"site_name", "Pre-Installation Check", "joomla.javascript", "installation", "Configuration"},
+		},
 		antiMarkers: []string{"404", "not found"},
 		desc:        "Joomla installation wizard is publicly accessible, potentially allowing CMS re-installation or reconfiguration",
 	},
@@ -124,11 +144,8 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -137,7 +154,7 @@ func (m *Module) ScanPerRequest(
 
 	var results []*output.ResultEvent
 	for _, p := range probes {
-		if result := m.probeInstaller(ctx, httpClient, p, fp); result != nil {
+		if result := m.probeInstaller(ctx, httpClient, scanCtx, p, fp); result != nil {
 			results = append(results, result)
 		}
 	}
@@ -160,11 +177,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -183,6 +198,7 @@ func (m *Module) fingerprint404(
 func (m *Module) probeInstaller(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	p probe,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
@@ -195,11 +211,9 @@ func (m *Module) probeInstaller(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -249,20 +263,42 @@ func (m *Module) probeInstaller(
 		}
 	}
 
-	// Require status 200 and at least one marker match
+	// Require status 200 and the full co-occurrence of CMS anchor + installer
+	// context (every marker group must have a hit). A normal 200 page that
+	// merely contains one generic word does not satisfy all groups.
 	if status != 200 {
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
+	matchedMarkers, ok := modkit.MatchAllGroups(body, p.markers)
+	if !ok {
+		return nil
 	}
-	if !matched {
+
+	// Soft-404 / SPA-shell gate: reject a marker match that is just the host's
+	// wildcard shell (the same 200 body served for any random path), mirroring
+	// wp_misconfig. Fails open on a transient probe error.
+	location := resp.Response().Header.Get("Location")
+	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), location) {
+		return nil
+	}
+
+	// Extension-scoped catch-all / truncated-tail echo gate. A genuine installer
+	// hit is an HTML wizard page, so content-type cannot discriminate it; instead
+	// disprove a wildcard host that answers every /<dir>/<anything>.php with the
+	// same 200 installer-shaped shell. Such a host defeats the root 404 fingerprint
+	// AND the soft-404 gate above — both key on a body hash/length that a per-path
+	// reflection (or a gzip/Content-Length:0 transport quirk leaving only a
+	// reflecting tail fragment) perturbs just enough to slip through. Re-request a
+	// guaranteed-nonexistent decoy under the SAME directory and .php extension: if
+	// it returns the same 200 status and still satisfies the CMS-anchor +
+	// installer-context marker groups, the markers are the host's catch-all, not a
+	// real installer, so drop. A real installer's decoy 404s, leaving the finding.
+	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, 2,
+		func(decoyBody string) bool {
+			_, ok := modkit.MatchAllGroups(decoyBody, p.markers)
+			return ok
+		}) {
 		return nil
 	}
 

@@ -11,7 +11,10 @@ import (
 
 	"github.com/sourcegraph/conc"
 	"github.com/vigolium/vigolium/pkg/deparos/discovery/queue"
+	"github.com/vigolium/vigolium/pkg/deparos/discovery/tracker"
 	pkghttp "github.com/vigolium/vigolium/pkg/deparos/http"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/sourcemap"
 	"github.com/vigolium/vigolium/pkg/deparos/responsechain"
 	"github.com/vigolium/vigolium/pkg/deparos/spider"
 	"github.com/vigolium/vigolium/pkg/deparos/storage"
@@ -23,8 +26,16 @@ import (
 //
 // Architecture:
 //   - Expander goroutine pulls tasks from queue, expands payloads × extensions into WorkItems
+//   - Each expansion runs in its own producer goroutine feeding a small pull
+//     channel, so the expander can suspend a long expansion between items when a
+//     more urgent task is queued (see coordinator_expander.go)
 //   - WorkItems are sent to workChan (buffered channel)
 //   - N workers pull from workChan and execute HTTP requests concurrently
+//   - Brute-force WorkItems (wordlist and FUZZ-template tasks) go to their own
+//     bruteChan and worker pool when SetBruteForceWorkers sized one, so
+//     wordlist fuzzing can run wider than the rest of discovery
+//   - Inline tasks (JS replay, form submission, case-sense detection) run on a
+//     small dedicated inline worker pool, never on the expander goroutine
 //
 // Benefits over previous design:
 //   - No task boundary blocking - workers always busy if work available
@@ -38,20 +49,39 @@ type PayloadCoordinator struct {
 	// Work channel - all workers pull from this
 	workChan chan *WorkItem
 
+	// bruteChan and bruteWorkers are the brute-force lane (see
+	// SetBruteForceWorkers); bruteChan is nil when brute-force items share
+	// workChan.
+	bruteChan    chan *WorkItem
+	bruteWorkers int
+
+	// Inline task channel - the inline worker pool pulls from this
+	inlineChan chan Task
+
 	// Metrics
 	metrics CoordinatorMetrics
 
 	// Lifecycle
-	wg conc.WaitGroup
+	wg       conc.WaitGroup
+	inlineWG conc.WaitGroup
 }
 
 // CoordinatorMetrics tracks execution statistics.
 type CoordinatorMetrics struct {
-	PayloadsProcessed atomic.Uint64
-	TasksCompleted    atomic.Uint64
-	RequestsSent      atomic.Uint64
-	ActiveWorkers     atomic.Int32
-	InFlightItems     atomic.Int32 // Tracks work items being processed
+	PayloadsProcessed    atomic.Uint64
+	TasksCompleted       atomic.Uint64
+	RequestsSent         atomic.Uint64
+	ActiveWorkers        atomic.Int32
+	InFlightItems        atomic.Int32 // Tracks work items being processed
+	InlineInFlight       atomic.Int32 // Inline tasks (replay/form/case-sense) handed to or running on the inline workers
+	ExpansionsInFlight   atomic.Int32 // Expansions started and not finished, including suspended ones
+	SuspendedExpansions  atomic.Int32 // Expansions parked on the suspended stack by a more urgent task
+	Preemptions          atomic.Uint64
+	JSReplayExact        atomic.Uint64
+	JSReplayConservative atomic.Uint64
+	JSReplaySucceeded    atomic.Uint64
+	JSReplayFailed       atomic.Uint64
+	JSReplayDeduped      atomic.Uint64
 }
 
 // NewPayloadCoordinator creates a new coordinator with callbacks for execution.
@@ -61,6 +91,7 @@ func NewPayloadCoordinator(q *queue.TaskQueue, workerCount int, callbacks *Callb
 		workerCount: workerCount,
 		callbacks:   callbacks,
 		workChan:    make(chan *WorkItem, workerCount*2),
+		inlineChan:  make(chan Task, inlineQueueSize),
 	}
 }
 
@@ -69,15 +100,36 @@ func (c *PayloadCoordinator) Run(ctx context.Context) error {
 	// Start workers
 	for i := 0; i < c.workerCount; i++ {
 		c.wg.Go(func() {
-			c.runWorker(ctx)
+			c.runWorker(ctx, c.workChan)
+		})
+	}
+	for i := 0; i < c.bruteWorkers; i++ {
+		c.wg.Go(func() {
+			c.runWorker(ctx, c.bruteChan)
 		})
 	}
 
-	// Run expander (blocks until queue stops or context cancelled)
+	// Start the inline workers (JS replay, form submission, case-sense)
+	for i := 0; i < inlineWorkerCount; i++ {
+		c.inlineWG.Go(func() {
+			c.runInlineWorker(ctx)
+		})
+	}
+
+	// Run expander (blocks until queue stops or context cancelled). It returns
+	// only after every producer goroutine it started has exited.
 	c.runExpander(ctx)
 
-	// Close workChan to signal workers to exit
+	// Close inlineChan and wait for queued inline tasks to finish (they skip
+	// sending once ctx is cancelled).
+	close(c.inlineChan)
+	c.inlineWG.Wait()
+
+	// Close the work channels to signal workers to exit
 	close(c.workChan)
+	if c.bruteChan != nil {
+		close(c.bruteChan)
+	}
 
 	// Wait for workers to finish processing remaining items
 	c.wg.Wait()
@@ -88,93 +140,39 @@ func (c *PayloadCoordinator) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// runExpander pulls tasks from queue and expands them into WorkItems.
-func (c *PayloadCoordinator) runExpander(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		taskInfo, err := c.queue.Dequeue(ctx)
-		if err != nil {
-			if errors.Is(err, queue.ErrQueueStopped) || ctx.Err() != nil {
-				return
-			}
-			continue
-		}
-		if taskInfo == nil {
-			continue
-		}
-
-		task, ok := taskInfo.(Task)
-		if !ok {
-			logger.Error("Dequeued item is not a Task", zap.Any("taskInfo", taskInfo))
-			continue
-		}
-
-		logger.Info("Starting task expansion",
-			zap.String("description", task.Description()),
-			zap.String("baseURL", string(task.FullURL())),
-			zap.String("extension", task.Extension()),
-			zap.Uint8("priority", task.Priority()))
-
-		// CaseSenseDetectionTask: execute inline, skip workChan
-		if csTask, ok := task.(*CaseSenseDetectionTask); ok {
-			c.executeCaseSenseDetectionTask(ctx, csTask)
-			c.metrics.TasksCompleted.Add(1)
-			continue
-		}
-
-		// JSExtractedRequestTask: execute inline with custom Method/Body handling
-		if jsExtTask, ok := task.(*JSExtractedRequestTask); ok {
-			c.executeJSExtractedRequestTask(ctx, jsExtTask)
-			c.metrics.TasksCompleted.Add(1)
-			continue
-		}
-
-		// FormSubmissionTask: execute inline with custom Method/Body handling
-		if formTask, ok := task.(*FormSubmissionTask); ok {
-			c.executeFormSubmissionTask(ctx, formTask)
-			c.metrics.TasksCompleted.Add(1)
-			continue
-		}
-
-		// Expand task into WorkItems
-		c.expandTask(ctx, task)
-		c.metrics.TasksCompleted.Add(1)
-
-		// Don't log completion if context was cancelled during expansion
-		if ctx.Err() != nil {
-			return
-		}
-
-		logger.Info("Task expansion completed",
-			zap.String("description", task.Description()),
-			zap.String("baseURL", string(task.FullURL())))
+// executeInlineTask runs one inline task type (case-sensitivity detection,
+// JS-extracted replay, form submission) on an inline worker. These send their
+// HTTP requests directly rather than through workChan, so they run off the
+// expander goroutine: a JS replay never waits behind a wordlist expansion.
+func (c *PayloadCoordinator) executeInlineTask(ctx context.Context, task Task) {
+	switch t := task.(type) {
+	case *CaseSenseDetectionTask:
+		c.executeCaseSenseDetectionTask(ctx, t)
+	case *JSExtractedRequestTask:
+		// Custom Method/Body handling per replay variant.
+		c.executeJSExtractedRequestTask(ctx, t)
+	case *FormSubmissionTask:
+		// Custom Method/Body handling per form variant.
+		c.executeFormSubmissionTask(ctx, t)
+	default:
+		logger.Error("Non-inline task routed to inline worker",
+			zap.String("description", task.Description()))
+		return
 	}
-}
-
-// expandTask delegates URL expansion to the task's own Expand method.
-// Each task type knows how to build its own URLs correctly.
-func (c *PayloadCoordinator) expandTask(ctx context.Context, task Task) {
-	_ = task.Expand(ctx, func(url string, depth uint16) {
-		c.sendWorkItem(ctx, task, url, depth)
-		c.metrics.PayloadsProcessed.Add(1)
-	})
+	c.metrics.TasksCompleted.Add(1)
 }
 
 // sendWorkItem sends a URL to workChan.
 // Skips queueing if the URL's prefix has been tripped by the breaker — saves
 // an HTTP request and a downstream worker slot for known-dead prefixes.
+// Application-referenced URLs are exempt; see isReferencedProvenance.
 func (c *PayloadCoordinator) sendWorkItem(
 	ctx context.Context,
 	task Task,
 	urlStr string,
 	depth uint16,
 ) {
-	if c.callbacks.PrefixBreaker != nil {
+	if c.callbacks.PrefixBreaker != nil && !TaskIsReferenced(task) {
 		if u, err := url.Parse(urlStr); err == nil && c.callbacks.PrefixBreaker.IsDead(u) {
 			return
 		}
@@ -187,14 +185,45 @@ func (c *PayloadCoordinator) sendWorkItem(
 		Callbacks: c.callbacks,
 	}
 
+	ch := c.workChan
+	if c.bruteChan != nil && isBruteForceTask(task) {
+		ch = c.bruteChan
+	}
 	select {
-	case c.workChan <- item:
+	case ch <- item:
 	case <-ctx.Done():
 	}
 }
 
-// runWorker pulls WorkItems from channel and executes them.
-func (c *PayloadCoordinator) runWorker(ctx context.Context) {
+// SetBruteForceWorkers gives brute-force WorkItems (isBruteForceTask) their own
+// pool of n workers; n <= 0 keeps them on the shared workers. Call before Run.
+//
+// The lane is what lets wordlist fuzzing run wider than the rest of discovery
+// without the spider, observed-word variants and validation probes speeding
+// up with it: those keep the coordinator's workerCount.
+func (c *PayloadCoordinator) SetBruteForceWorkers(n int) {
+	if n <= 0 {
+		c.bruteChan, c.bruteWorkers = nil, 0
+		return
+	}
+	c.bruteWorkers = n
+	c.bruteChan = make(chan *WorkItem, n*2)
+}
+
+// isBruteForceTask reports the tasks that guess paths from a wordlist: the
+// built-in file/directory lists (with or without extensions) and a FUZZ-marker
+// template. Observed-word, extension-variant and numeric tasks derive from what
+// the target already showed and stay on the shared workers.
+func isBruteForceTask(task Task) bool {
+	switch task.(type) {
+	case *WordlistTask, *FuzzTask:
+		return true
+	}
+	return false
+}
+
+// runWorker pulls WorkItems from ch and executes them.
+func (c *PayloadCoordinator) runWorker(ctx context.Context, ch <-chan *WorkItem) {
 	c.metrics.ActiveWorkers.Add(1)
 	defer c.metrics.ActiveWorkers.Add(-1)
 
@@ -202,7 +231,7 @@ func (c *PayloadCoordinator) runWorker(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case item, ok := <-c.workChan:
+		case item, ok := <-ch:
 			if !ok {
 				return
 			}
@@ -227,7 +256,8 @@ func (c *PayloadCoordinator) executeWorkItem(ctx context.Context, item *WorkItem
 	}
 
 	// Send request
-	rc, ok := c.sendDiscoveryRequest(ctx, req, item.URL, cb)
+	_, jsFetch := item.Task.(*JSFetchTask)
+	rc, ok := c.sendDiscoveryRequest(ctx, req, item.URL, jsFetch, cb)
 	if !ok {
 		return
 	}
@@ -236,21 +266,19 @@ func (c *PayloadCoordinator) executeWorkItem(ctx context.Context, item *WorkItem
 	// Feed prefix breaker with this probe outcome. Done before any analyzer
 	// gating so soft-200 / soft-403 traps still register signal even when the
 	// fingerprinter classifies them out.
-	if cb.PrefixBreaker != nil {
-		resp := rc.Response()
-		body := rc.BodyBytes()
-		reason, tripped := cb.PrefixBreaker.Observe(req.URL, resp.StatusCode, resp.Header.Get("Content-Type"), int64(len(body)))
-		if tripped {
-			logger.Info("Prefix breaker tripped — stopping further probes under this prefix",
-				zap.String("host", reason.Host),
-				zap.String("prefix", reason.Prefix),
-				zap.Int("samples", reason.Samples),
-				zap.Int("dominant_status", reason.DominantStatus),
-				zap.String("dominant_content_type", reason.DominantCT),
-				zap.Int64("dominant_length_bucket_lower", reason.DominantLenLower),
-				zap.Int("dominant_count", reason.DominantCount))
-		}
-	}
+	observePrefixBreaker(cb.PrefixBreaker, req.URL, rc)
+
+	// Source maps are handled here, above the task-type dispatch, because which
+	// fetch path sees a given asset is incidental: the asset graph queues a
+	// JSFetchTask for a bundle's .js.map, but link extraction also finds the
+	// literal "<bundle>.js.map" string in the body and fetches it first as an
+	// ordinary record — whereupon the shared RequestCache drops the JSFetchTask.
+	// Handling this on one branch is what made the whole pipeline dead code; one
+	// choke point above the split makes that impossible to reintroduce. It also
+	// runs before the Analyzer gate, so a catch-all host's soft-404 verdict cannot
+	// discard a map that parsed cleanly, and it covers stylesheets, which never
+	// reach the JS-fetch path at all.
+	c.processSourceMapLeads(ctx, req.URL, rc, cb)
 
 	// JSFetchTask: custom validation (status 200 + JS content-type)
 	// Skip Analyzer + verification - just validate and process
@@ -276,8 +304,20 @@ func (c *PayloadCoordinator) executeWorkItem(ctx context.Context, item *WorkItem
 		return
 	}
 
-	// Discovery callbacks
-	c.triggerDiscoveryCallbacks(item.URL, item.Depth, cb)
+	// Discovery callbacks. This is the generic brute-force path (wordlist/fuzz/
+	// observed-recombination/ext-variant/numeric tasks), so confirmExt is keyed on
+	// the task's provenance — guessed paths must not confirm an extension off a
+	// catch-all 200.
+	foundBy := item.Task.FoundByName()
+	c.triggerDiscoveryCallbacks(item.URL, item.Depth, cb, foundByConfirmsExtension(foundBy))
+
+	// An extensionless 200 (/api) is treated as a file and never recursed
+	// into; one probe of its directory form (/api/) lets recursion find out.
+	if cb.QueueReferencedURL != nil && rc.Response().StatusCode == stdhttp.StatusOK {
+		if dirURL, ok := dirFormProbeURL(item.URL); ok {
+			cb.QueueReferencedURL(dirURL, item.Depth)
+		}
+	}
 
 	// Result callback
 	if cb.OnResult != nil {
@@ -285,7 +325,7 @@ func (c *PayloadCoordinator) executeWorkItem(ctx context.Context, item *WorkItem
 			URL:     parseURL(item.URL),
 			Request: &storage.RequestData{Method: req.Method},
 			Metadata: &storage.DiscoveryMetadata{
-				FoundBy:   item.Task.FoundByName(),
+				FoundBy:   foundBy,
 				Depth:     item.Depth,
 				Timestamp: time.Now(),
 			},
@@ -305,6 +345,51 @@ func hasJavaScriptExtension(u *url.URL) bool {
 	return strings.HasSuffix(p, ".js") ||
 		strings.HasSuffix(p, ".mjs") ||
 		strings.HasSuffix(p, ".cjs")
+}
+
+// processSourceMapLeads handles everything source-map about one fetched asset.
+//
+// Two cases, one entry point: the asset either IS a map, in which case it is
+// parsed, or it may POINT AT one, in which case the candidates it names (and,
+// failing that, its conventional sibling) are queued. Both were previously
+// written twice — once per fetch path — which is how the pipeline came to be
+// reachable on only one of them.
+//
+// Candidate selection itself lives in the sourcemap package so the crawl and the
+// scanning-phase module cannot disagree about which maps an asset is worth
+// asking for.
+func (c *PayloadCoordinator) processSourceMapLeads(
+	ctx context.Context,
+	assetURL *url.URL,
+	rc *responsechain.ResponseChain,
+	cb *Callbacks,
+) {
+	resp := rc.Response()
+	if assetURL == nil || resp == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
+
+	if sourcemap.IsMapPath(assetURL.Path) {
+		body := rc.BodyBytes()
+		if cb.ProcessSourceMap != nil && len(body) > 0 && len(body) <= sourcemap.MaxMapBytes {
+			cb.ProcessSourceMap(ctx, assetURL, body)
+		}
+		return
+	}
+
+	// Path check before the body is touched: the generic path runs this for every
+	// wordlist and fuzz probe, and only .js/.mjs/.cjs/.css can carry a map.
+	if cb.ProcessSourceMapCandidates == nil || !sourcemap.IsMappableAssetPath(assetURL.Path) {
+		return
+	}
+	body := rc.BodyBytes()
+	if len(body) > maxJSSize {
+		return
+	}
+	candidates := sourcemap.CandidatesFor(assetURL.String(), resp.Header.Get, body)
+	if len(candidates) > 0 {
+		cb.ProcessSourceMapCandidates(ctx, assetURL.String(), candidates)
+	}
 }
 
 // executeJSFetchItem handles JSFetchTask responses with custom validation.
@@ -341,18 +426,25 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 		return
 	}
 
-	// Validate: JavaScript content-type, with a .js-extension fallback for
-	// bundles served as text/plain or application/octet-stream.
-	if !isJavaScriptContentType(resp.Header.Get("Content-Type")) && !hasJavaScriptExtension(jsURL) {
-		logger.Debug("JS returned non-JS content-type and lacks a JS extension",
+	// Validate: JavaScript or JSON content-type, with a .js/.json-extension
+	// fallback for assets served as text/plain or application/octet-stream. JSON
+	// is accepted because the JS-bundle sweep also harvests sibling config/data
+	// files (config.json, settings.json, …): jstangle no-ops on them, but
+	// linkfinder still extracts embedded paths and the file is recorded as an
+	// http_record (so secret-scanning and later phases see its body).
+	ct := resp.Header.Get("Content-Type")
+	isSourceMap := sourcemap.IsMapPath(jsURL.Path)
+	if !isJavaScriptContentType(ct) && !isJSONContentType(ct) &&
+		!hasJavaScriptExtension(jsURL) && !hasJSONExtension(jsURL) && !isSourceMap {
+		logger.Debug("JS-fetch target is neither JavaScript nor JSON",
 			zap.String("url", item.URL),
-			zap.String("content-type", resp.Header.Get("Content-Type")))
+			zap.String("content-type", ct))
 		return
 	}
 
 	body := rc.BodyBytes()
 
-	// CDN/library bundles still get jsscan endpoint extraction (the API calls
+	// CDN/library bundles still get jstangle endpoint extraction (the API calls
 	// they make are real regardless of where the JS is hosted); only their
 	// path→wordlist extraction is suppressed to avoid flooding the bruteforcer.
 	skipPathExtraction := spider.ShouldSkipJSPathExtraction(jsURL)
@@ -365,31 +457,35 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 		logger.Debug("JS too large, skipping parse",
 			zap.String("url", item.URL),
 			zap.Int("size", len(body)))
+	case isSourceMap:
+		// Already parsed by processSourceMapLeads, above the task dispatch.
 	default:
 		// Content to pass to linkfinder (default: raw body, may be replaced by CodeRecord)
 		contentForLinkfinder := body
 
-		// Run jsscan to extract HTTP requests and transformed code (always,
+		// Run jstangle to extract HTTP requests and transformed code (always,
 		// even for CDN-hosted bundles).
-		if cb.JSScanScanner != nil && cb.JSScanSem != nil {
-			// Acquire semaphore
-			select {
-			case cb.JSScanSem <- struct{}{}:
-				defer func() { <-cb.JSScanSem }()
-			case <-ctx.Done():
-				return
+		if cb.JSTangleService != nil {
+			// Run through the shared broker; it owns weighted admission and cache.
+			options := jstangle.ScanOptions{Profile: jstangle.ProfileDiscovery, SourceURL: item.URL}
+			if cb.JSTangleOptions != nil {
+				options = cb.JSTangleOptions(jstangle.ProfileDiscovery, item.URL)
 			}
-
-			// Run jsscan
-			scanResult, err := cb.JSScanScanner.Scan(ctx, body)
+			scanResult, err := cb.JSTangleService.ScanWithOptions(ctx, body, options)
 			if err != nil {
-				logger.Debug("jsscan failed",
+				logger.Debug("jstangle failed",
 					zap.String("url", item.URL),
 					zap.Error(err))
 			} else {
-				// Store extracted requests with dedup
+				// Retain typed source/provenance when protocol v2 facts are present.
 				newRequests := 0
-				if cb.AddExtractedRequest != nil {
+				if len(scanResult.RequestFacts) > 0 && cb.AddRequestFact != nil {
+					for i := range scanResult.RequestFacts {
+						if cb.AddRequestFact(item.URL, scanResult.RequestFacts[i]) {
+							newRequests++
+						}
+					}
+				} else if cb.AddExtractedRequest != nil {
 					for i := range scanResult.Requests {
 						if cb.AddExtractedRequest(&scanResult.Requests[i]) {
 							newRequests++
@@ -398,11 +494,13 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 				}
 
 				// Persist to database
-				if cb.StoreJSScanRequests != nil && len(scanResult.Requests) > 0 {
-					cb.StoreJSScanRequests(jsURL, scanResult.Requests)
+				if cb.StoreJSTangleFacts != nil && len(scanResult.RequestFacts) > 0 {
+					cb.StoreJSTangleFacts(jsURL, scanResult.RequestFacts)
+				} else if cb.StoreJSTangleRequests != nil && len(scanResult.Requests) > 0 {
+					cb.StoreJSTangleRequests(jsURL, scanResult.Requests)
 				}
 
-				logger.Debug("jsscan extracted requests",
+				logger.Debug("jstangle extracted requests",
 					zap.String("url", item.URL),
 					zap.Int("total", len(scanResult.Requests)),
 					zap.Int("new", newRequests))
@@ -410,10 +508,16 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 				// Use CodeRecord.Content if available (transformed JS code)
 				if scanResult.HasCode() {
 					contentForLinkfinder = []byte(scanResult.Code.Content)
-					logger.Debug("Using jsscan transformed code for linkfinder",
+					logger.Debug("Using jstangle transformed code for linkfinder",
 						zap.String("url", item.URL),
 						zap.Int("original_size", len(body)),
 						zap.Int("transformed_size", len(contentForLinkfinder)))
+				}
+				if cb.ProcessAssetFacts != nil && len(scanResult.AssetFacts) > 0 {
+					cb.ProcessAssetFacts(ctx, item.URL, body, scanResult.AssetFacts)
+				}
+				if cb.ProcessJSTangleCapabilities != nil {
+					cb.ProcessJSTangleCapabilities(item.URL, scanResult)
 				}
 			}
 		}
@@ -445,6 +549,15 @@ func (c *PayloadCoordinator) executeJSFetchItem(
 		}
 	}
 
+	// SPA/PWA asset manifest or service worker: parse its asset list (lazy
+	// webpack chunks, workers) and fan the listed files back through the JSFetch
+	// pipeline so each is fetched and recorded. These chunk filenames are built
+	// at runtime and so are invisible to link extraction — the manifest is the
+	// only place they appear literally. Dispatches per framework by URL shape.
+	if !isSourceMap {
+		harvestSPAManifest(jsURL, body, cb)
+	}
+
 	// Call OnResult to create finding (always, regardless of path extraction)
 	if cb.OnResult != nil {
 		cb.OnResult(&Result{
@@ -466,8 +579,22 @@ func isJavaScriptContentType(ct string) bool {
 	return strings.Contains(ct, "javascript") || strings.Contains(ct, "ecmascript")
 }
 
+// isJSONContentType checks if the content-type indicates JSON (application/json,
+// text/json, application/ld+json, …). "javascript" does not contain "json".
+func isJSONContentType(ct string) bool {
+	return strings.Contains(strings.ToLower(ct), "json")
+}
+
+// hasJSONExtension reports whether the URL path ends in .json.
+func hasJSONExtension(u *url.URL) bool {
+	return strings.HasSuffix(strings.ToLower(u.Path), ".json")
+}
+
 // triggerDiscoveryCallbacks invokes OnFileDiscovered or OnDirectoryDiscovered.
-func (c *PayloadCoordinator) triggerDiscoveryCallbacks(urlStr string, depth uint16, cb *Callbacks) {
+// confirmExt (derived from the task's provenance via foundByConfirmsExtension)
+// tells OnFileDiscovered whether the served extension may be trusted as proof the
+// server runs that stack — true only for genuine application references.
+func (c *PayloadCoordinator) triggerDiscoveryCallbacks(urlStr string, depth uint16, cb *Callbacks, confirmExt bool) {
 	if strings.HasSuffix(urlStr, "/") {
 		if cb.OnDirectoryDiscovered != nil {
 			if err := cb.OnDirectoryDiscovered(urlStr, depth); err != nil {
@@ -476,10 +603,65 @@ func (c *PayloadCoordinator) triggerDiscoveryCallbacks(urlStr string, depth uint
 		}
 	} else {
 		if cb.OnFileDiscovered != nil {
-			if err := cb.OnFileDiscovered(urlStr, depth); err != nil {
+			if err := cb.OnFileDiscovered(urlStr, depth, confirmExt); err != nil {
 				logger.Warn("File callback error", zap.String("url", urlStr), zap.Error(err))
 			}
 		}
+	}
+}
+
+// foundByConfirmsExtension reports whether a discovery's provenance is a genuine
+// application reference whose *served* extension can be trusted as proof the
+// server runs that stack — and may therefore confirm the extension and trigger a
+// wordlist fuzz for hidden <word>.<ext> files.
+//
+// Only references the application itself emitted qualify: a spider <a href>, a
+// JS-extracted request, a form action, a server-issued redirect target. Every
+// brute-forced provenance — the fuzz wordlist, the dir/file wordlists, observed-
+// name recombinations, extension variants, numeric fuzzing — is a *guess*. On a
+// catch-all / SPA-shell / over-permissive host those guesses return a non-soft-404
+// 200 for paths the server never serves (e.g. a fuzz.txt /axis2/…/HappyAxis.jsp
+// answered 200 by a Next.js shell), so letting them confirm an extension is
+// circular: the fuzzer's own guess bootstraps more fuzzing of that extension.
+// Such paths are still harvested for names/paths — only the extension
+// confirmation is withheld. The allow-list is conservative: an unknown/new task
+// type defaults to a guess (no confirmation) rather than risking a false confirm
+// — so a renamed FoundByName fails safe (a missed confirm, never a false one).
+//
+// This is the served-path (FoundBy-keyed) sibling of Engine.extensionConfirmAllowed,
+// which gates the legacy link-time path on spider.LinkSourceType.IsGenuineReference.
+func foundByConfirmsExtension(foundBy string) bool {
+	switch foundBy {
+	case "spider", "js-extracted", "jsfetch", "form", "redirect":
+		return true
+	default:
+		return false
+	}
+}
+
+// isReferencedProvenance is the prefix breaker's fallback for task types that do
+// not track their own provenance (see TaskIsReferenced).
+//
+// The breaker exists to stop discovery recursing into a trap directory that
+// answers uniformly for every guess. A referenced asset — a source map, a lazy
+// chunk, a worker — is exempt: the application published that exact URL, so a
+// dead prefix says nothing about it. Without the exemption, a bundle under a
+// hashed-asset dir like /static/js/ (where a handful of 404 guesses trip the
+// breaker within seconds) silently lost its .js.map, and with it every endpoint
+// the recovered sources would have named.
+//
+// This list deliberately excludes "jsfetch", which foundByConfirmsExtension
+// includes: that queue carries both referenced assets and the bundle sweep's
+// guesses, so JSFetchTask answers for itself via IsReferenced. The two
+// predicates are near-identical today and must stay separate — they answer
+// different questions ("may this extension be trusted as proof of a stack?" vs
+// "did the app publish this URL?") and are free to diverge.
+func isReferencedProvenance(foundBy string) bool {
+	switch foundBy {
+	case "spider", "js-extracted", "form", "redirect":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -503,10 +685,78 @@ func (c *PayloadCoordinator) executeCaseSenseDetectionTask(ctx context.Context, 
 func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, task *JSExtractedRequestTask) {
 	cb := c.callbacks
 	variants := task.GenerateAllVariants()
+	foundBy := task.FoundByName()
 
 	logger.Info("Executing JS extracted request task",
 		zap.String("directory", task.DirURL().Path),
 		zap.Int("variant_count", len(variants)))
+
+	// GenerateAllVariants destructively claimed these templates from the pending
+	// set. Track each claimed template and requeue any that never reach a
+	// definitive outcome (a genuine send failure, or an early cancellation) so a
+	// later end-of-scan flush round retries it instead of losing the work. A
+	// template settles once any of its variants is handled definitively: a
+	// response, a scope skip, a cache-dedup hit, an empty URL, or a deterministic
+	// build failure — only transient send failures and cancellation leave it
+	// unsettled.
+	type replayRef struct{ sourceURL, templateID string }
+	claimed := make(map[string]replayRef, len(variants))
+	settled := make(map[string]struct{}, len(variants))
+	templateKey := func(v RequestVariant) (string, bool) {
+		if v.TemplateID == "" || v.SourceURL == "" {
+			return "", false
+		}
+		return v.SourceURL + "\x00" + v.TemplateID, true
+	}
+	markSettled := func(v RequestVariant) {
+		if k, ok := templateKey(v); ok {
+			settled[k] = struct{}{}
+		}
+	}
+	for _, variant := range variants {
+		if k, ok := templateKey(variant); ok {
+			claimed[k] = replayRef{variant.SourceURL, variant.TemplateID}
+		}
+	}
+	// note records the template's outcome for the integrated source, which
+	// persists every template (not only found ones) after the crawl.
+	note := func(v RequestVariant, n ReplayNote) {
+		if cb.NoteReplayOutcome == nil || v.TemplateID == "" {
+			return
+		}
+		if n.Method == "" {
+			n.Method = v.Method
+		}
+		if n.URL == "" {
+			n.URL = v.URL
+		}
+		cb.NoteReplayOutcome(v.SourceURL, v.TemplateID, n)
+	}
+	// evidence captures a not-found replay's response for its note, leaving the
+	// body out once the evidence budget is spent (NoteReplayOutcome would drop it).
+	evidence := func(rc *responsechain.ResponseChain) *storage.ResponseData {
+		keepBody := cb.ReplayEvidenceSpent == nil || !cb.ReplayEvidenceSpent()
+		return captureReplayResponse(rc, keepBody)
+	}
+	defer func() {
+		if cb.RequeueReplayTemplate == nil || len(settled) >= len(claimed) {
+			return
+		}
+		requeued := 0
+		for k, ref := range claimed {
+			if _, isSettled := settled[k]; isSettled {
+				continue
+			}
+			if cb.RequeueReplayTemplate(ref.sourceURL, ref.templateID) {
+				requeued++
+			}
+		}
+		if requeued > 0 {
+			logger.Debug("Requeued unsent JS replay templates for retry",
+				zap.Int("count", requeued),
+				zap.String("directory", task.DirURL().Path))
+		}
+	}()
 
 	for _, variant := range variants {
 		select {
@@ -516,6 +766,8 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 		}
 
 		if variant.URL == "" {
+			markSettled(variant)
+			note(variant, ReplayNote{Outcome: TemplateUnresolvable, Reason: "empty-url"})
 			continue
 		}
 
@@ -525,13 +777,24 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 			if parseErr == nil && !cb.ScopeChecker.IsInScope(variantURL) {
 				logger.Debug("Skipping out-of-scope JS extracted request",
 					zap.String("url", variant.URL))
+				markSettled(variant) // out-of-scope is definitive; a retry won't help
+				note(variant, ReplayNote{Outcome: TemplateOutOfScope})
 				continue
 			}
 		}
 
-		// Dedup check with method and body (for variants with same URL but different bodies)
-		if cb.RequestCache.IsSeen(variant.Method, variant.URL, variant.Body) {
+		// Replay identity includes safe semantic headers as well as method/URL/body.
+		dedupBody := variant.Body + "\x00" + strings.Join(variant.Headers, "\x00")
+		if cb.RequestCache.IsSeen(variant.Method, variant.URL, dedupBody) {
+			c.metrics.JSReplayDeduped.Add(1)
+			markSettled(variant) // already sent elsewhere; definitive
+			note(variant, ReplayNote{Outcome: TemplateDeduped})
 			continue
+		}
+		if variant.ReplayTier == "exact" {
+			c.metrics.JSReplayExact.Add(1)
+		} else {
+			c.metrics.JSReplayConservative.Add(1)
 		}
 
 		// Build HTTP request with method, body, and content-type
@@ -546,21 +809,37 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 
 		req, err := reqBuilder.Build()
 		if err != nil {
+			c.metrics.JSReplayFailed.Add(1)
 			logger.Debug("Failed to build JS extracted request",
 				zap.String("url", variant.URL),
 				zap.String("method", variant.Method),
 				zap.Error(err))
+			markSettled(variant) // build failure is deterministic; a retry won't help
+			note(variant, ReplayNote{Outcome: TemplateUnresolvable, Reason: "build-error"})
 			continue
 		}
 
 		// Set Content-Type header if specified
 		if variant.ContentType != "" && variant.Body != "" {
-			req.Header.Set("Content-Type", variant.ContentType)
+			if req.Header.Get("Content-Type") == "" {
+				req.Header.Set("Content-Type", variant.ContentType)
+			}
+		}
+		for _, header := range variant.Headers {
+			name, value := splitHeader(header)
+			// Explicit scan/auth configuration always wins over literals recovered
+			// from a public bundle.
+			if name != "" && req.Header.Get(name) == "" {
+				req.Header.Set(name, value)
+			}
 		}
 
-		// Send request with tracking
+		// Send request with tracking. A send failure (network/WAF/timeout) is left
+		// unsettled so the template is requeued for a retry round; every other
+		// outcome below is definitive.
 		rc, err := c.sendTrackedRequest(ctx, req, variant.URL, cb)
 		if err != nil {
+			c.metrics.JSReplayFailed.Add(1)
 			logger.Debug("JS extracted request failed",
 				zap.String("url", variant.URL),
 				zap.String("method", variant.Method),
@@ -568,7 +847,9 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 			continue
 		}
 
+		markSettled(variant) // got a response; definitive regardless of analysis outcome
 		c.metrics.RequestsSent.Add(1)
+		c.metrics.JSReplaySucceeded.Add(1)
 
 		// Analyze response
 		found, err := cb.Analyzer.Analyze(ctx, req, rc)
@@ -577,28 +858,41 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 				zap.String("url", variant.URL),
 				zap.String("method", variant.Method),
 				zap.Error(err))
+			note(variant, ReplayNote{Outcome: TemplateReplayedNotFound, Reason: "analysis-error",
+				Status: rc.Response().StatusCode, Response: evidence(rc)})
 			rc.Close()
 			continue
 		}
 
 		if !found {
+			// The route did not exist by the Analyzer's standard (404, a
+			// request-shape 4xx, or a soft-404). Keep the response: the stub the
+			// source persists for this template carries it as evidence.
+			note(variant, ReplayNote{Outcome: TemplateReplayedNotFound,
+				Status: rc.Response().StatusCode, Response: evidence(rc)})
 			rc.Close()
 			continue
 		}
+		// A found template becomes a siteMap node below, which carries the full
+		// response; the note only needs the status.
+		note(variant, ReplayNote{Outcome: TemplateReplayedFound, Status: rc.Response().StatusCode})
 
-		// Discovery callbacks
-		c.triggerDiscoveryCallbacks(variant.URL, task.Depth(), cb)
+		// Discovery callbacks. This task's provenance is a genuine application
+		// reference, so a served extension confirms (keyed on provenance for
+		// self-documentation rather than a bare true).
+		c.triggerDiscoveryCallbacks(variant.URL, task.Depth(), cb, foundByConfirmsExtension(foundBy))
 
 		// Result callback
 		if cb.OnResult != nil {
 			cb.OnResult(&Result{
 				URL: parseURL(variant.URL),
 				Request: &storage.RequestData{
-					Method: variant.Method,
-					Body:   []byte(variant.Body),
+					Method:  variant.Method,
+					Headers: headerSliceToMap(variant.Headers),
+					Body:    []byte(variant.Body),
 				},
 				Metadata: &storage.DiscoveryMetadata{
-					FoundBy:   task.FoundByName(),
+					FoundBy:   foundBy,
 					Depth:     task.Depth(),
 					Timestamp: time.Now(),
 				},
@@ -615,6 +909,7 @@ func (c *PayloadCoordinator) executeJSExtractedRequestTask(ctx context.Context, 
 func (c *PayloadCoordinator) executeFormSubmissionTask(ctx context.Context, task *FormSubmissionTask) {
 	cb := c.callbacks
 	variants := task.GenerateAllVariants()
+	foundBy := task.FoundByName()
 
 	logger.Info("Executing form submission task",
 		zap.String("source", task.SourceURL().Path),
@@ -698,8 +993,10 @@ func (c *PayloadCoordinator) executeFormSubmissionTask(ctx context.Context, task
 			continue
 		}
 
-		// Discovery callbacks
-		c.triggerDiscoveryCallbacks(variant.URL, task.Depth(), cb)
+		// Discovery callbacks. This task's provenance is a genuine application
+		// reference, so a served extension confirms (keyed on provenance for
+		// self-documentation rather than a bare true).
+		c.triggerDiscoveryCallbacks(variant.URL, task.Depth(), cb, foundByConfirmsExtension(foundBy))
 
 		// Result callback
 		if cb.OnResult != nil {
@@ -710,7 +1007,7 @@ func (c *PayloadCoordinator) executeFormSubmissionTask(ctx context.Context, task
 					Body:   []byte(variant.Body),
 				},
 				Metadata: &storage.DiscoveryMetadata{
-					FoundBy:   task.FoundByName(),
+					FoundBy:   foundBy,
 					Depth:     task.Depth(),
 					Timestamp: time.Now(),
 				},
@@ -767,17 +1064,31 @@ func (c *PayloadCoordinator) sendTrackedRequest(
 	return rc, nil
 }
 
+// jsFetchDedupKey namespaces JS-fetch requests in the request cache.
+const jsFetchDedupKey = "\x00js-fetch"
+
 // sendDiscoveryRequest sends an HTTP request for discovery tasks with dedup, error tracking, WAF detection, and metrics.
 // Returns (ResponseChain, ok). If ok is false, caller should return early.
 // CRITICAL: Caller MUST call rc.Close() when done with the ResponseChain.
+//
+// A JS fetch dedups in its own namespace: only it runs jstangle on the body, so
+// it must not be dropped because a plain file probe reached the same URL first
+// (seenJSURLs already keeps each bundle to one fetch). It still marks the shared
+// key, so a later plain probe of that URL stays deduped.
 func (c *PayloadCoordinator) sendDiscoveryRequest(
 	ctx context.Context,
 	req *stdhttp.Request,
 	urlStr string,
+	jsFetch bool,
 	cb *Callbacks,
 ) (*responsechain.ResponseChain, bool) {
 	// Dedup - single point of truth for all HTTP requests
-	if cb.RequestCache.IsSeen(req.Method, urlStr, "") {
+	if jsFetch {
+		_ = cb.RequestCache.IsSeen(req.Method, urlStr, "")
+		if cb.RequestCache.IsSeen(req.Method, urlStr, jsFetchDedupKey) {
+			return nil, false
+		}
+	} else if cb.RequestCache.IsSeen(req.Method, urlStr, "") {
 		return nil, false
 	}
 
@@ -866,13 +1177,29 @@ func (c *PayloadCoordinator) handleRedirect(
 
 		if redirectInfo.ExtractedFilename != "" && cb.OnFileDiscovered != nil {
 			fileURL := normalizeRedirectForDiscovery(urlStr, redirectInfo.ResolvedLocation)
-			_ = cb.OnFileDiscovered(fileURL, depth)
+			// A redirect only *confirms* a server-side extension when the server
+			// points us at a genuinely different resource. A path-preserving
+			// bounce — the host 3xx'ing /x.php back to /x.php (scheme upgrade,
+			// auth/cookie round-trip, host/trailing-slash normalization) — fires
+			// at the gateway before any handler runs, so it is no proof the server
+			// executes that extension. The per-path-distinct Location also slips
+			// past the wildcard soft-404 filter above, so on a catch-all/SPA
+			// gateway that bounces every path to itself this would otherwise
+			// confirm (and wordlist-fuzz) every guessed stack extension at once.
+			// Names/paths are still harvested; only the extension confirmation is
+			// withheld.
+			confirmExt := foundByConfirmsExtension("redirect") &&
+				!redirectPreservesPath(urlStr, fileURL)
+			_ = cb.OnFileDiscovered(fileURL, depth, confirmExt)
 		}
 
-		// Create Result for non-trailing-slash redirect
+		// The 3xx is the SOURCE URL's response: record it under the source
+		// (storing it under the Location URL paired the target with someone
+		// else's response). The target is fetched on its own as a referenced
+		// task, so it is recorded with its own response.
 		if cb.OnResult != nil {
 			cb.OnResult(&Result{
-				URL:     parseURL(redirectInfo.ResolvedLocation),
+				URL:     parseURL(urlStr),
 				Request: &storage.RequestData{Method: req.Method},
 				Metadata: &storage.DiscoveryMetadata{
 					FoundBy:   "redirect",
@@ -881,6 +1208,9 @@ func (c *PayloadCoordinator) handleRedirect(
 				},
 				rc: rc,
 			})
+		}
+		if cb.QueueReferencedURL != nil && !redirectPreservesPath(urlStr, redirectInfo.ResolvedLocation) {
+			cb.QueueReferencedURL(redirectInfo.ResolvedLocation, depth)
 		}
 	}
 
@@ -891,7 +1221,7 @@ func (c *PayloadCoordinator) handleRedirect(
 			return
 		}
 
-		targetRc, ok := c.sendDiscoveryRequest(ctx, targetReq, redirectInfo.ResolvedLocation, cb)
+		targetRc, ok := c.sendDiscoveryRequest(ctx, targetReq, redirectInfo.ResolvedLocation, false, cb)
 		if !ok {
 			return
 		}
@@ -950,9 +1280,39 @@ func normalizeRedirectForDiscovery(originalURL, redirectURL string) string {
 	return redirectURL
 }
 
+// redirectPreservesPath reports whether a redirect merely sends the request back
+// to the same path it asked for (ignoring scheme, host and query, tolerating a
+// trailing slash). Such a self-bounce — an HTTP→HTTPS upgrade, an auth/cookie
+// round-trip, host or trailing-slash normalization — is not a discovery of a new
+// resource, so its extension must not be trusted to confirm a server-side stack.
+func redirectPreservesPath(originalURL, redirectTargetURL string) bool {
+	o, err := url.Parse(originalURL)
+	if err != nil {
+		return false
+	}
+	r, err := url.Parse(redirectTargetURL)
+	if err != nil {
+		return false
+	}
+	trim := func(p string) string {
+		if len(p) > 1 {
+			return strings.TrimRight(p, "/")
+		}
+		return p
+	}
+	return trim(o.Path) == trim(r.Path)
+}
+
 // IsIdle returns true if no work is pending and no items are being processed.
+// This accounts for worker-pool items (InFlightItems), inline tasks queued to or
+// running on the inline workers (InlineInFlight), and every started expansion,
+// including suspended ones (ExpansionsInFlight), so quiescence isn't declared
+// while a JS replay is mid-flight or a preempted wordlist still has items left.
 func (c *PayloadCoordinator) IsIdle() bool {
-	return len(c.workChan) == 0 && c.metrics.InFlightItems.Load() == 0
+	return len(c.workChan) == 0 && len(c.bruteChan) == 0 &&
+		c.metrics.InFlightItems.Load() == 0 &&
+		c.metrics.InlineInFlight.Load() == 0 &&
+		c.metrics.ExpansionsInFlight.Load() == 0
 }
 
 // Metrics returns coordinator metrics.
@@ -976,4 +1336,50 @@ func (c *PayloadCoordinator) CurrentTask() Task {
 func parseURL(urlStr string) *url.URL {
 	u, _ := url.Parse(urlStr)
 	return u
+}
+
+// observePrefixBreaker feeds one probe outcome to the prefix breaker. Statuses
+// the analyzer already treats as hard misses (404/400/414/421/431) are skipped:
+// a directory whose misses are ordinary 404s is not a trap, and counting them
+// made any subtree with a hit rate under 10% trip eventually. The
+// breaker exists for soft-200/soft-403 black holes the fingerprinter misses.
+func observePrefixBreaker(b *tracker.PrefixBreaker, u *url.URL, rc *responsechain.ResponseChain) {
+	if b == nil || rc == nil || !rc.Has() {
+		return
+	}
+	resp := rc.Response()
+	if pkghttp.IsHardNotFound(resp.StatusCode) {
+		return
+	}
+	body := rc.BodyBytes()
+	reason, tripped := b.Observe(u, resp.StatusCode, resp.Header.Get("Content-Type"), int64(len(body)))
+	if tripped {
+		logger.Info("Prefix breaker tripped — stopping further probes under this prefix",
+			zap.String("host", reason.Host),
+			zap.String("prefix", reason.Prefix),
+			zap.Int("samples", reason.Samples),
+			zap.Int("dominant_status", reason.DominantStatus),
+			zap.String("dominant_content_type", reason.DominantCT),
+			zap.Int64("dominant_length_bucket_lower", reason.DominantLenLower),
+			zap.Int("dominant_count", reason.DominantCount))
+	}
+}
+
+// dirFormProbeURL returns the directory form ("/api/") of an extensionless
+// file URL ("/api"), without its query. ok is false for directories, the root
+// and paths with an extension.
+func dirFormProbeURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.Path == "" || u.Path == "/" || strings.HasSuffix(u.Path, "/") {
+		return "", false
+	}
+	last := u.Path[strings.LastIndex(u.Path, "/")+1:]
+	if last == "" || strings.Contains(last, ".") {
+		return "", false
+	}
+	d := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path + "/", RawPath: ""}
+	if u.RawPath != "" {
+		d.RawPath = u.RawPath + "/"
+	}
+	return d.String(), true
 }

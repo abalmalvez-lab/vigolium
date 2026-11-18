@@ -69,10 +69,8 @@ func TestRTDBURLRegex(t *testing.T) {
 func TestSecretPatterns(t *testing.T) {
 	t.Parallel()
 	samples := map[string]string{
-		// Google API Key pattern needs exactly "AIza" + 35 chars.
-		"Google API Key": "AIza" + "01234567890123456789012345678901234",
-		"Private Key":    "-----BEGIN PRIVATE KEY-----",
-		"Slack Token":    "xoxb-1234-abcd",
+		"Private Key": "-----BEGIN PRIVATE KEY-----",
+		"Slack Token": "xoxb-1234-" + "abcd",
 	}
 	// Drive from the known samples (not the pattern list) so a renamed or removed
 	// pattern fails the test instead of silently asserting nothing.
@@ -86,5 +84,48 @@ func TestSecretPatterns(t *testing.T) {
 			}
 		}
 		assert.Truef(t, found, "no secret pattern named %q (renamed or removed?)", name)
+	}
+	for _, pattern := range secretPatterns {
+		assert.NotEqual(t, "Google API Key", pattern.name, "Firebase/Google client API keys are publishable identifiers, not private secrets")
+	}
+}
+
+func TestAssessRTDBDataSeparatesShallowKeysFromSensitiveValues(t *testing.T) {
+	t.Parallel()
+	assert.Empty(t, assessRTDBData(`{"users":true,"tokens":true}`), "shallow=true key markers are not sensitive values")
+
+	labels := assessRTDBData(`{"users":{"u1":{"email":"alice@example.test","password":"correct horse battery staple"}}}`)
+	assert.Contains(t, labels, "sensitive field: email")
+	assert.Contains(t, labels, "sensitive field: password")
+
+	googleKey := "AIza" + "01234567890123456789012345678901234"
+	assert.Empty(t, assessRTDBData(`{"apiKey":"`+googleKey+`"}`), "a publishable Google client key alone is not a secret finding")
+}
+
+// TestLooksLikeRTDBData covers the strict structural gate that decides whether a
+// 200 from a Firebase host is genuine, non-trivial database data.
+func TestLooksLikeRTDBData(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"real object tree", `{"users":{"u1":{"name":"a"}}}`, true},
+		{"non-empty array", `[{"id":1},{"id":2}]`, true},
+		{"empty object", `{}`, false},
+		{"empty array", `[]`, false},
+		{"null", `null`, false},
+		{"blank", `   `, false},
+		{"error envelope", `{"error":"Permission denied"}`, false},
+		{"html error page with 200", `<!DOCTYPE html><html><body>Not Found</body></html>`, false},
+		{"bare scalar string", `"hello"`, false},
+		{"bare scalar bool", `true`, false},
+		{"bare scalar number", `42`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, looksLikeRTDBData(tc.body))
+		})
 	}
 }

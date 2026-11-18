@@ -1,6 +1,6 @@
 import { resolve } from "path";
 import { failCli, parsePositiveUsd } from "./util.js";
-import type { AgentPlatform, RunOptions } from "../engine/types.js";
+import type { AgentPlatform, AgentTransport, RunOptions } from "../engine/types.js";
 
 /**
  * Subset of `run` flags that `vigolium-audit confirm` accepts and forwards to
@@ -12,6 +12,7 @@ import type { AgentPlatform, RunOptions } from "../engine/types.js";
  */
 export interface ConfirmOptions {
   agent?: string;
+  transport?: AgentTransport;
   model?: string;
   interactive?: boolean;
   fromAudit?: string;
@@ -23,6 +24,7 @@ export interface ConfirmOptions {
   apiKey?: string;
   stripRaw?: boolean;
   keepRaw?: boolean;
+  keepSecrets?: boolean;
   focusFile?: string;
   expectedBehaviorsFile?: string;
   liveTarget?: string;
@@ -53,6 +55,7 @@ function buildRunOptions(args: { targetDir: string; opts: ConfirmOptions }): Run
     target: targetDir,
   };
   if (opts.agent !== undefined) runOpts.agent = opts.agent as AgentPlatform;
+  if (opts.transport !== undefined) runOpts.transport = opts.transport;
   if (opts.model !== undefined) runOpts.model = opts.model;
   if (opts.interactive !== undefined) runOpts.interactive = opts.interactive;
   if (opts.fromAudit !== undefined) runOpts.fromAudit = opts.fromAudit;
@@ -70,6 +73,7 @@ function buildRunOptions(args: { targetDir: string; opts: ConfirmOptions }): Run
   if (opts.apiKey !== undefined) runOpts.apiKey = opts.apiKey;
   if (opts.stripRaw !== undefined) runOpts.stripRaw = opts.stripRaw;
   if (opts.keepRaw !== undefined) runOpts.keepRaw = opts.keepRaw;
+  if (opts.keepSecrets !== undefined) runOpts.keepSecrets = opts.keepSecrets;
   if (opts.focusFile !== undefined) runOpts.focusFile = opts.focusFile;
   if (opts.expectedBehaviorsFile !== undefined) runOpts.expectedBehaviorsFile = opts.expectedBehaviorsFile;
   if (opts.liveTarget !== undefined) runOpts.liveTarget = opts.liveTarget;

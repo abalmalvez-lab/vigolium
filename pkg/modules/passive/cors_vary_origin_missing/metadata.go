@@ -9,25 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects responses with a dynamic Access-Control-Allow-Origin header that are missing
-the Vary: Origin header. When a server reflects a specific origin in ACAO without
-including Vary: Origin, shared caches may serve the response to requests from different
-origins, enabling cache poisoning attacks.
+	ModuleDesc = `**What it means:** The server reflects the request's Origin into Access-Control-Allow-Origin but omits Vary: Origin. The CORS header varies per origin while the cache key does not, so a shared cache (CDN, proxy) can store one origin's response and serve it to another - web cache poisoning.
 
-## Notes
-- Flags responses where ACAO is a specific origin (not wildcard) without Vary: Origin
-- Severity is upgraded to Medium when Access-Control-Allow-Credentials: true is also present
-- Cache poisoning with credentials amplifies the impact significantly
-- Complements CORS header detection with cache-specific misconfiguration checks
+**How it's exploited:** An attacker primes the cache from a malicious origin so the cached response names their site; victims receive it, letting the attacker's page read cross-origin data. With Access-Control-Allow-Credentials: true, authenticated data leaks.
 
-## References
-- https://portswigger.net/research/exploiting-cors-misconfigurations-for-bitcoins-and-bounties
-- https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Vary
-- https://www.w3.org/TR/cors/#resource-implementation`
+**Fix:** Add Vary: Origin wherever the Origin is reflected, and exclude credentialed CORS responses from shared caching.`
 
-	ModuleConfirmation = "Confirmed when a dynamic CORS response lacks the Vary: Origin header required for correct cache behavior"
+	ModuleConfirmation = "Confirmed when a response reflects the request Origin into ACAO but omits the Vary: Origin header required for correct shared-cache behavior"
 	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"misconfiguration", "header-security", "cache-poisoning", "light"}
+	ModuleTags         = []string{"misconfiguration", "header-security", "cache-poisoning", "hygiene", "light"}
 )

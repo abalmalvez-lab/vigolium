@@ -2,7 +2,11 @@
 
 export interface PaginatedResponse<T> {
   project_uuid?: string;
+  /** Rows. v2 bodies carry them as `items`; client.ts aliases them here. */
   data: T[];
+  items?: T[];
+  schema_version?: number;
+  command?: string;
   total: number;
   limit: number;
   offset: number;
@@ -158,9 +162,15 @@ export interface ScanResponse {
   repo_path?: string; // legacy, prefer source
 }
 
+/**
+ * An error body in either server version: v1 has a string `error`, the HTTP
+ * status in `code` and the string code in `error_code`; v2 has an `error`
+ * object carrying the string code.
+ */
 export interface ErrorResponse {
-  error: string;
+  error: string | { code: string; message: string; status: number; details?: string };
   code?: number;
+  error_code?: string;
   details?: string;
 }
 
@@ -182,6 +192,7 @@ export interface FindingsQueryParams {
 export type FindingStatus =
   | 'draft'
   | 'triaged'
+  | 'confirmed'
   | 'false_positive'
   | 'accepted_risk'
   | 'fixed';
@@ -189,6 +200,7 @@ export type FindingStatus =
 export const FINDING_STATUSES: FindingStatus[] = [
   'draft',
   'triaged',
+  'confirmed',
   'false_positive',
   'accepted_risk',
   'fixed',
@@ -630,10 +642,35 @@ export interface AgentRunListResponse {
   total: number;
 }
 
-// Mirrors `pkg/server/handlers_agent.go:isTerminalAgentStatus` — keep in sync.
+// Mirrors `database.TerminalAgenticScanStatuses` (pkg/database/
+// repository_agentic_scans.go). A status missing here keeps every poll for
+// that run alive forever; TestWorkbenchTerminalStatusesMatchServer in
+// pkg/server fails when the two lists drift.
 export const TERMINAL_AGENT_STATUSES: ReadonlySet<string> = new Set([
-  'completed', 'failed', 'cancelled', 'timeout', 'error',
+  'completed', 'completed_with_errors', 'completed_with_warnings', 'failed', 'cancelled', 'timeout',
+  'budget_exhausted', 'error',
 ]);
+
+/** A run that finished but was degraded (a driver failed, the model never
+ *  called a tool...) or stopped at a limit (--max-duration: 'timeout'; a
+ *  command/token/cost budget: 'budget_exhausted'). Shown amber with its
+ *  warnings, not as a clean pass. */
+export function isWarningAgentStatus(status?: string): boolean {
+  return status === 'completed_with_errors' || status === 'completed_with_warnings'
+    || status === 'timeout' || status === 'budget_exhausted';
+}
+
+/** How an agent run status should read at a glance; each theme maps a tone
+ *  to its own color. */
+export type AgentStatusTone = 'ok' | 'warn' | 'fail' | 'running' | 'idle';
+
+export function agentStatusTone(status?: string): AgentStatusTone {
+  if (status === 'completed') return 'ok';
+  if (isWarningAgentStatus(status)) return 'warn';
+  if (status === 'failed' || status === 'error') return 'fail';
+  if (status === 'running') return 'running';
+  return 'idle';
+}
 
 export function isTerminalAgentStatus(status?: string): boolean {
   return !!status && TERMINAL_AGENT_STATUSES.has(status);
@@ -657,6 +694,8 @@ export interface AgentSession {
   started_at: string;
   completed_at?: string;
   created_at: string;
+  /** Failure reason, or the joined warnings of a degraded run. */
+  error_message?: string;
 }
 
 // GET /api/agent/sessions/:id
@@ -753,6 +792,9 @@ export interface ScanLogsResponse {
   project_uuid?: string;
   logs: ScanLog[];
   total: number;
+  /** Raw runtime.log tail, set when the server answers with the log file
+   *  (every scan that has one) rather than structured DB rows. */
+  text?: string;
 }
 
 export interface ScanLogsQueryParams {

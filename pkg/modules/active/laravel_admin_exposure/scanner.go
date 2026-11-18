@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/vigolium/vigolium/pkg/authsig"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -21,90 +22,146 @@ type probe struct {
 	body        string
 	contentType string
 	name        string
-	markers     []string
+	// markers is an AND-of-OR group set (see modkit.MatchAllGroups): the body must
+	// contain at least one substring from EVERY group. The first group is always a
+	// framework/endpoint-specific anchor (e.g. "laravel-nova", `"openapi"`) that a
+	// generic application shell, login wall, or i18n catch-all cannot satisfy;
+	// later groups corroborate. A bare generic token ("login", "email", "admin",
+	// "data") never appears as a standalone group — that single-OR-token model is
+	// exactly what let a Salesforce/Visualforce login shell match "/nova/login" on
+	// the word "login" alone (see scan_detect_test.go).
+	markers     [][]string
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
 	refs        []string
+	// requireUnauth marks a probe that claims unauthenticated access to a
+	// privileged surface (an admin panel). A page that renders a login form is
+	// gated, not exposed, so for these probes a login wall is a false positive —
+	// the separate "*/login" probes cover the "framework is installed" signal.
+	requireUnauth bool
 }
 
 var probes = []probe{
 	// Admin panels
 	{
-		path:        "/nova",
-		name:        "Laravel Nova",
-		markers:     []string{"Nova", "nova", "laravel-nova", "inertia"},
-		antiMarkers: []string{"404 Not Found"},
-		sev:         severity.High,
-		desc:        "Laravel Nova admin panel is accessible without authentication",
-		refs:        []string{"https://nova.laravel.com/docs"},
+		path: "/nova",
+		name: "Laravel Nova",
+		// Anchor on Nova-unique strings only — a bare "nova" substring matches
+		// "innovation"/"Casanova" and "inertia" is used by many non-Nova SPAs.
+		markers:       [][]string{{"laravel-nova", "Laravel Nova", "/nova-api/", "data-nova", "window.Nova"}},
+		antiMarkers:   []string{"404 Not Found"},
+		sev:           severity.High,
+		desc:          "Laravel Nova admin panel is accessible without authentication",
+		refs:          []string{"https://nova.laravel.com/docs"},
+		requireUnauth: true,
 	},
 	{
-		path:        "/nova/login",
-		name:        "Laravel Nova Login",
-		markers:     []string{"Nova", "nova", "login", "email", "password"},
+		path: "/nova/login",
+		name: "Laravel Nova Login",
+		// Require the Nova anchor AND a login-form signal. The old list let a bare
+		// "login"/"email"/"password" match any login wall (the Salesforce shell FP).
+		markers: [][]string{
+			{"laravel-nova", "Laravel Nova", "/nova-api/", "data-nova", "window.Nova"},
+			{"password", "Password", `name="email"`, "Sign in", "Log in"},
+		},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.Low,
 		desc:        "Laravel Nova admin login page is publicly accessible, confirming Nova is installed",
 		refs:        []string{"https://nova.laravel.com/docs"},
 	},
 	{
-		path:        "/filament",
-		name:        "Laravel Filament",
-		markers:     []string{"filament", "Filament", "filament-panels", "livewire"},
-		antiMarkers: []string{"404 Not Found"},
-		sev:         severity.High,
-		desc:        "Laravel Filament admin panel is accessible without authentication",
-		refs:        []string{"https://filamentphp.com/docs"},
+		path: "/filament",
+		name: "Laravel Filament",
+		// Anchor ONLY on Filament-unique structural strings a real panel renders:
+		// the "filament-panels" Livewire component tag, the "/filament/assets/"
+		// bundled CSS/JS URLs, the "fi-*" body/layout classes. The bare words
+		// "filament"/"Filament" were REMOVED — "filament" is the probe's own last
+		// path segment (/…/filament), and a content site that reflects the requested
+		// slug into the page (a topic route rendering "Filament Lenses", JSON-LD, a
+		// breadcrumb, a canonical <link>) contains that word without any Filament
+		// install. Stripping the full reflected path does not remove the standalone
+		// slug word, and the sibling catch-all guard cannot see it (a random sibling
+		// reflects a DIFFERENT slug), so the bare token self-matched the reflection.
+		markers:       [][]string{{"filament-panels", "/filament/assets/", "fi-sidebar"}},
+		antiMarkers:   []string{"404 Not Found"},
+		sev:           severity.High,
+		desc:          "Laravel Filament admin panel is accessible without authentication",
+		refs:          []string{"https://filamentphp.com/docs"},
+		requireUnauth: true,
 	},
 	{
-		path:        "/filament/login",
-		name:        "Laravel Filament Login",
-		markers:     []string{"filament", "Filament", "login", "email"},
+		path: "/filament/login",
+		name: "Laravel Filament Login",
+		// Same reasoning as /filament: bare "filament"/"Filament" is the reflected
+		// probe slug, not a Filament signal — require a structural anchor.
+		markers: [][]string{
+			{"filament-panels", "/filament/assets/", "fi-sidebar"},
+			{"password", "Password", `name="email"`, "Sign in", "Log in"},
+		},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.Low,
 		desc:        "Laravel Filament admin login page is publicly accessible, confirming Filament is installed",
 		refs:        []string{"https://filamentphp.com/docs"},
 	},
 	{
-		path:        "/admin",
-		name:        "Admin Panel (generic)",
-		markers:     []string{"dashboard", "Dashboard", "admin", "Admin", "backpack", "Backpack", "voyager", "Voyager"},
-		antiMarkers: []string{"404 Not Found"},
-		sev:         severity.High,
-		desc:        "Admin panel at /admin is accessible without authentication",
+		path: "/admin",
+		name: "Admin Panel (generic)",
+		// A bare "admin"/"dashboard" word is hopeless for confirmation — a path-
+		// routing app reflects the probe path ("/.../admin") into a <form action>/
+		// breadcrumb, and the word appears verbatim on unrelated pages. So this
+		// probe only fires when a NAMED Laravel admin package is identifiable
+		// (Backpack, Voyager); a generic /admin that we cannot attribute to a
+		// framework is left to the dedicated dashboard/exposure modules.
+		markers:       [][]string{{"backpack", "Backpack", "laravel-backpack", "voyager", "Voyager", "laravel-voyager"}},
+		antiMarkers:   []string{"404 Not Found"},
+		sev:           severity.High,
+		desc:          "Laravel admin panel (Backpack/Voyager) at /admin is accessible without authentication",
+		requireUnauth: true,
 	},
 	{
-		path:        "/backoffice",
-		name:        "Back Office",
-		markers:     []string{"dashboard", "Dashboard", "admin", "backoffice"},
-		antiMarkers: []string{"404 Not Found"},
-		sev:         severity.High,
-		desc:        "Back office panel is accessible without authentication",
+		path: "/backoffice",
+		name: "Back Office",
+		// Same reasoning as /admin: require a named admin package, not the bare
+		// "backoffice"/"admin" word (which is also the reflected probe path).
+		markers:       [][]string{{"backpack", "Backpack", "laravel-backpack", "voyager", "Voyager", "laravel-voyager"}},
+		antiMarkers:   []string{"404 Not Found"},
+		sev:           severity.High,
+		desc:          "Laravel back-office admin panel (Backpack/Voyager) is accessible without authentication",
+		requireUnauth: true,
 	},
 	// API documentation
 	{
-		path:        "/api/documentation",
-		name:        "Swagger API Documentation (L5)",
-		markers:     []string{"swagger", "Swagger", "openapi", "api-docs"},
+		path: "/api/documentation",
+		name: "Swagger API Documentation (L5)",
+		// Anchor on the Swagger-UI bootstrap strings, not the bare word "swagger"
+		// (which appears in unrelated docs/changelogs) or "openapi".
+		markers:     [][]string{{"swagger-ui", "SwaggerUIBundle", "swagger-initializer", "Swagger UI"}},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.Low,
 		desc:        "Swagger API documentation (L5-Swagger) is publicly accessible, increasing attack surface discovery",
 		refs:        []string{"https://github.com/DarkaOnLine/L5-Swagger"},
 	},
 	{
-		path:        "/docs/api",
-		name:        "Scramble API Documentation",
-		markers:     []string{"scramble", "Scramble", "openapi", "api"},
+		path: "/docs/api",
+		name: "Scramble API Documentation",
+		// Require the Scramble anchor AND an API-doc signal; "api" alone is far too
+		// generic to confirm anything.
+		markers: [][]string{
+			{"Scramble", "dedoc/scramble", "dedoc"},
+			{"openapi", "swagger", "stoplight", "elements-api"},
+		},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.Low,
 		desc:        "Scramble API documentation is publicly accessible",
 		refs:        []string{"https://scramble.dedoc.co/"},
 	},
 	{
-		path:        "/openapi.json",
-		name:        "OpenAPI Spec (JSON)",
-		markers:     []string{"openapi", "paths", "info", "components"},
+		path: "/openapi.json",
+		name: "OpenAPI Spec (JSON)",
+		// A real spec carries the version key AND a paths object — require both, and
+		// drop bare "info"/"components" (generic JSON keys present in many payloads).
+		markers:     [][]string{{`"openapi"`, `"swagger"`}, {`"paths"`}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Low,
 		desc:        "OpenAPI specification is publicly accessible, revealing all API endpoints and schemas",
@@ -112,7 +169,7 @@ var probes = []probe{
 	{
 		path:        "/openapi.yaml",
 		name:        "OpenAPI Spec (YAML)",
-		markers:     []string{"openapi:", "paths:", "info:"},
+		markers:     [][]string{{"openapi:", "swagger:"}, {"paths:"}},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
 		sev:         severity.Low,
 		desc:        "OpenAPI specification (YAML) is publicly accessible, revealing all API endpoints and schemas",
@@ -124,7 +181,9 @@ var probes = []probe{
 		body:        `{"query":"{ __schema { queryType { name } } }"}`,
 		contentType: "application/json",
 		name:        "GraphQL Introspection",
-		markers:     []string{"__schema", "queryType", "data"},
+		// Require the introspection-result shape (__schema AND a schema-type field).
+		// Bare "data" matched any JSON object with a top-level data key.
+		markers:     [][]string{{"__schema"}, {"queryType", "mutationType", `"types"`}},
 		antiMarkers: []string{"introspection", "disabled", "not allowed"},
 		sev:         severity.Medium,
 		desc:        "GraphQL endpoint with introspection enabled, revealing the full API schema and all available operations",
@@ -185,17 +244,29 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
+	urlx, err := ctx.URL()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Walk the web root plus any context-path prefixes of the observed URL so an
+	// admin panel mounted under a sub-directory install (e.g. /blog/admin) is
+	// reached, not just the root. Claim each (host, base) pair up front so a
+	// fully-deduped request issues no traffic — including the soft-404 fingerprint.
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
 		return nil, nil
 	}
 
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
-	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p, fp); result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, p := range probes {
+			if result := m.probeEndpoint(ctx, httpClient, p, base+p.path, fp); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 	return results, nil
@@ -216,11 +287,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -247,6 +316,7 @@ func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	p probe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	method := p.method
@@ -258,7 +328,7 @@ func (m *Module) probeEndpoint(
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, p.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
@@ -276,11 +346,9 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -321,6 +389,16 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Catch-all / shell guard: a body textually equivalent to the page originally
+	// observed means "the same with or without the probe" — the app routed this
+	// sub-path back to its standard shell (a login wall, a landing page) rather
+	// than serving a distinct admin surface. The soft-404 fingerprint above only
+	// catches a random *root* path; this catches a sub-path that re-renders the
+	// observed page (e.g. /tai-khoan/dang-nhap/admin == /tai-khoan/dang-nhap/).
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
 			return nil
@@ -331,20 +409,35 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
+	// Login-wall guard: an admin-panel probe claims unauthenticated access, but a
+	// page rendering a password field is gated — reaching the login form is not
+	// reaching the panel. The "*/login" probes intentionally match these at low
+	// severity, so only drop for the unauthenticated-access probes.
+	if p.requireUnauth && authsig.BodyLooksLikeLogin([]byte(body)) {
+		return nil
 	}
-	if !matched {
+
+	// Self-reflection guard: a path-routing app echoes the probe path back into the
+	// page (a <form action>, a canonical link, a breadcrumb), so the literal path
+	// segment — e.g. "admin" inside action="/.../admin" — appears in the body of an
+	// unrelated page and trips a weak marker. Strip the reflected probe path before
+	// matching so a marker only counts when it comes from the endpoint's own
+	// content, not from our own request.
+	matchBody := modkit.StripReflectedProbePath(body, probePath)
+
+	// Structural confirmation: the body must satisfy EVERY marker group (an anchor
+	// group plus any corroboration), not just contain one weak token — this keeps a
+	// generic login shell / API JSON from matching on "login" or "data". Then drop
+	// the finding if a nonexistent sibling under the same parent satisfies the SAME
+	// groups (a sub-directory catch-all that 200s every child path with one shell).
+	// Root-level probes are already covered by the random-path 404 fingerprint above.
+	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, matchBody, p.markers)
+	if !ok {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	refs := p.refs
 	if len(refs) == 0 {

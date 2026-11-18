@@ -9,16 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests various techniques to bypass 403 Forbidden and 401 Unauthorized responses, including path manipulation,
-header injection, HTTP method tampering, method override headers, and URL encoding tricks.
+	ModuleDesc = `**What it means:** A resource returning 401 or 403 can be reached anyway via a simple request trick, so its access-control check does not hold. A tweaked request turned the forbidden response into a 200 with distinct content.
 
-## Notes
-- Only activates when the original response returns 401 or 403 status
-- Tests multiple bypass vectors: path traversal, special headers, HTTP method changes, method override headers
+**How it's exploited:** An attacker reaches a protected page or API by mutating the path (added segments, encoded slashes, case changes), spoofing headers like X-Forwarded-For, X-Original-URL, or X-Forwarded-User, or abusing the Next.js x-middleware-subrequest bypass (CVE-2025-29927).
 
-## References
-- https://book.hacktricks.wiki/en/network-services-pentesting/pentesting-web/403-and-401-bypasses.html`
+**Fix:** Enforce authorization at the application layer for every request regardless of path encoding, method, or proxy/identity headers, and strip untrusted forwarding headers.`
 
 	ModuleConfirmation = "Confirmed when a bypass technique produces a non-403 response with valid content for a previously forbidden resource"
 	ModuleSeverity     = severity.Medium

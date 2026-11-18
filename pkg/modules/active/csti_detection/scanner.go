@@ -45,6 +45,18 @@ func New() *Module {
 	return m
 }
 
+// ConfirmsByBodyDifferential opts this module into the executor's body-
+// differential safety net: a candidate finding is re-confirmed by replaying the
+// probe request and requiring the reflected template expression to reappear as
+// stable content absent from the clean baseline. The probe is reflected
+// literally, so this guards against non-reproducible reflections (flapping or
+// cached pages), not against reflection itself.
+func (m *Module) ConfirmsByBodyDifferential() bool { return true }
+
+// VulnClass enables cross-module (param, class) dedup: once any csti module
+// reports a parameter, the others in the class skip it.
+func (m *Module) VulnClass() string { return modkit.VulnClassCSTI }
+
 // ScanPerInsertionPoint tests a single insertion point for CSTI.
 func (m *Module) ScanPerInsertionPoint(
 	ctx *httpmsg.HttpRequestResponse,
@@ -94,11 +106,9 @@ func (m *Module) ScanPerInsertionPoint(
 		probe, markers := buildCSTIProbe()
 
 		fuzzedRaw := ip.BuildRequest([]byte(probe))
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-		if err != nil {
-			return nil, nil
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
+		// BuildRequest produces well-formed raw, so wrap directly instead of
+		// re-parsing on this hot path.
+		fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 		if err != nil {
@@ -110,7 +120,22 @@ func (m *Module) ScanPerInsertionPoint(
 
 		attackBody := resp.Body().String()
 		fullResponse := resp.FullResponseString()
+		attackContentType := ""
+		if resp.Response() != nil {
+			attackContentType = resp.Response().Header.Get("Content-Type")
+		}
 		resp.Close()
+
+		// CSTI confirmation here is pure LITERAL reflection of the {{...}} probe
+		// (not an evaluated product), so it only holds when the response is an HTML
+		// rendering context the framework will actually interpret. A non-HTML
+		// response (a JSON API echoing the probe in a validation error) reflects the
+		// braces as a data value that no template engine renders — and the per-host
+		// framework fingerprint is inherited from a sibling HTML page, so without
+		// this gate a JSON endpoint on a framework host false-positives.
+		if modkit.IsNonHTMLReflectionContext(attackContentType) {
+			break
+		}
 
 		// Check for literal reflection (not HTML-encoded)
 		reflected := false
@@ -169,8 +194,8 @@ func (m *Module) ScanPerInsertionPoint(
 
 // buildCSTIProbe generates a template expression probe with random anchors.
 func buildCSTIProbe() (probe string, markers []string) {
-	left := randomString(6)
-	right := randomString(6)
+	left := modkit.RandomAlnum(6)
+	right := modkit.RandomAlnum(6)
 	mathA := 1970 + rand.IntN(100)
 	mathB := 2024 + rand.IntN(100)
 	expr := fmt.Sprintf("%d*%d", mathA, mathB)
@@ -195,12 +220,7 @@ func isHTMLEncoded(body, marker string) bool {
 	return strings.Contains(body, encoded) || strings.Contains(body, altEncoded)
 }
 
-// randomString generates a random alphanumeric string of the given length.
-func randomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.IntN(len(charset))]
-	}
-	return string(b)
-}
+// RequiresReflection opts into the executor's shared reflection probe
+// (modkit.ReflectionAware): the oracle reads the payload back, so a
+// point whose value does not come back is skipped.
+func (m *Module) RequiresReflection() modkit.ReflectionNeed { return modkit.ReflectBody }

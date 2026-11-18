@@ -9,16 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects CRLF injection vulnerabilities in HTTP headers by injecting carriage return and
-line feed characters and checking if they appear in response headers.
+	ModuleDesc = `**What it means:** The application reflects a URL parameter into HTTP response headers without stripping carriage-return/line-feed (CRLF) characters, letting an attacker inject new header lines. Proven by smuggling a Set-Cookie header through the parameter.
 
-## Notes
-- Tests URL parameters for header injection via CRLF sequences
-- Can lead to HTTP response splitting and header injection attacks
+**How it's exploited:** An attacker crafts a link whose parameter holds CRLF sequences (raw or encoded %0d%0a) plus a malicious header. The server emits it verbatim, letting the attacker set arbitrary headers, fixate session cookies, poison caches, or inject XSS.
 
-## References
-- https://owasp.org/www-community/vulnerabilities/CRLF_Injection`
+**Fix:** Reject or URL-encode CR and LF in user input before it reaches a response header, and use a header API that forbids line breaks.`
 
 	ModuleConfirmation = "Confirmed when injected CRLF sequences appear in HTTP response headers, indicating header injection"
 	ModuleSeverity     = severity.Medium

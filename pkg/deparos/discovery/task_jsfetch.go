@@ -8,7 +8,7 @@ import (
 	"io"
 
 	"github.com/vigolium/vigolium/pkg/deparos/discovery/payload"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan/linkfinder"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/linkfinder"
 )
 
 // JSFetchTask fetches and parses JavaScript files to extract API paths.
@@ -25,11 +25,20 @@ import (
 type JSFetchTask struct {
 	provider   payload.Provider
 	cachedHash uint64
+	provenance TaskProvenance
 }
 
 // JSFetchTaskConfig contains configuration for creating a batched JSFetchTask.
 type JSFetchTaskConfig struct {
 	JSURLs []string // List of JS URLs to fetch
+
+	// Provenance records whether the application named these URLs or discovery
+	// guessed them. The queue carries both: a bundle's own .js.map and the chunks
+	// a manifest enumerates are references, while the JS-bundle name sweep and the
+	// <asset>.map sibling probe are guesses. Gates that exist to rein in guessing —
+	// the per-prefix circuit breaker above all — must be able to tell them apart,
+	// and the task type alone cannot.
+	Provenance TaskProvenance
 }
 
 // NewJSFetchTask creates a new batched JS fetch task.
@@ -42,7 +51,8 @@ func NewJSFetchTask(cfg *JSFetchTaskConfig) *JSFetchTask {
 	provider, _ := payload.NewStaticListProvider(cfg.JSURLs)
 
 	task := &JSFetchTask{
-		provider: provider,
+		provider:   provider,
+		provenance: cfg.Provenance,
 	}
 	task.cachedHash = task.computeHash()
 	return task
@@ -62,8 +72,10 @@ func (t *JSFetchTask) computeHash() uint64 {
 	h.Write([]byte{PriorityJSFetch})
 	h.Write([]byte{0})
 
-	// Include task type marker
+	// Include task type marker and provenance: the same URL reached as a reference
+	// and as a guess are different work, because they face different gates.
 	h.Write([]byte("jsfetch-batch"))
+	h.Write([]byte{byte(t.provenance)})
 	h.Write([]byte{0})
 
 	// Include provider content hash (sorted URLs)
@@ -74,6 +86,9 @@ func (t *JSFetchTask) computeHash() uint64 {
 
 	return h.Sum64()
 }
+
+// IsReferenced reports whether the application published these URLs.
+func (t *JSFetchTask) IsReferenced() bool { return t.provenance == ProvenanceReferenced }
 
 // Priority returns the task's priority level (0 = highest, same as spider).
 func (t *JSFetchTask) Priority() uint8 {
@@ -141,7 +156,17 @@ func (t *JSFetchTask) Expand(ctx context.Context, callback func(url string, dept
 }
 
 // ExtractPathsFromContent extracts paths from content using linkfinder.
-// Content can be raw JS body or transformed code from jsscan's CodeRecord.
+// Content can be raw JS body or transformed code from jstangle's CodeRecord.
 func (t *JSFetchTask) ExtractPathsFromContent(content []byte) []string {
+	return ExtractJSPaths(content)
+}
+
+// ExtractJSPaths is the linkfinder pass discovery runs over every fetched
+// script, seeding observed paths and names. It is exported so
+// `kit js-beautify --extract` reports exactly the paths a scan would seed:
+// two callers of one function cannot drift apart the way two extractors would.
+//
+// The result is unordered and may hold duplicates; callers sort and dedupe.
+func ExtractJSPaths(content []byte) []string {
 	return linkfinder.ExtractPaths(content)
 }

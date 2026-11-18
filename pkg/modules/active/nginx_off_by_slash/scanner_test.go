@@ -6,19 +6,22 @@ import (
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/stretchr/testify/assert"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/modules/modtest"
 	"github.com/vigolium/vigolium/pkg/types/severity"
-	"go.uber.org/goleak"
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	// The end-to-end scan tests drive a real requester via modtest, which starts
+	// process-lifetime infra goroutines; ignore those so leak detection still
+	// covers this module's own code.
+	modtest.VerifyNoLeaks(m)
 }
 
 func TestNew(t *testing.T) {
 	m := New()
 	assert.Equal(t, "nginx-off-by-slash", m.ID())
 	assert.Equal(t, "Nginx Off-by-Slash", m.Name())
-	assert.Equal(t, severity.High, m.Severity())
+	assert.Equal(t, severity.Suspect, m.Severity(), "Tentative implies Suspect")
 	assert.Equal(t, severity.Tentative, m.Confidence())
 	assert.Equal(t, modkit.ScanScopeRequest, m.ScanScopes())
 }

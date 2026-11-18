@@ -1,0 +1,345 @@
+package runner
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/url"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/vigolium/vigolium/pkg/authsig"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/clientroute"
+	"github.com/vigolium/vigolium/pkg/deparos/tag"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
+)
+
+// respiderInput is the decoded view of a discovered record the evaluator needs.
+// Built from a record's URL, parsed raw response, and stored content-type.
+type respiderInput struct {
+	URL         string
+	StatusCode  int
+	ContentType string
+	Location    string // Location header value when StatusCode is 3xx
+	Body        []byte
+}
+
+// respiderVerdict is the evaluator's decision for one candidate. Reason is a
+// short tag used in the phase's skip summary.
+type respiderVerdict struct {
+	Keep      bool
+	Reason    string // spa | spa-shell | interactive | static | login | asset | not-html | bad-path | non-200
+	ShellHash string // per-(host,shell) dedup key; set only when Keep
+	Score     int    // ranking score among kept candidates
+}
+
+var (
+	modernAppMatcher = tag.NewModernAppMatcher()
+
+	// scriptSrcRe captures each <script src=…> value; its match count also
+	// serves the "how many external scripts" check (one regex, two uses).
+	scriptSrcRe   = regexp.MustCompile(`(?i)<script[^>]+\bsrc\s*=\s*["']?([^"'\s>]+)`)
+	scriptBlockRe = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`)
+	styleBlockRe  = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`)
+	htmlTagRe     = regexp.MustCompile(`(?s)<[^>]+>`)
+	volatileTokRe = regexp.MustCompile(`[0-9a-f]{6,}|[0-9]{2,}`) // hash/chunk/digit runs
+	interactiveRe = regexp.MustCompile(`(?i)<(button|select|textarea)\b`)
+	inputTagRe    = regexp.MustCompile(`(?i)<input\b`)
+	formTagRe     = regexp.MustCompile(`(?i)<form\b`)
+)
+
+// appMountMarkers are byte patterns for a client-side render mount point.
+var appMountMarkers = [][]byte{
+	[]byte(`id="root"`), []byte(`id='root'`), []byte(`id=root`),
+	[]byte(`id="app"`), []byte(`id='app'`), []byte(`id=app`),
+	[]byte(`id="__next"`), []byte(`id="application"`),
+	[]byte(`<app-root`), []byte(`ng-app`), []byte(`data-reactroot`),
+	[]byte(`window.__nuxt__`), []byte(`__sveltekit`),
+}
+
+// pathKeywords boost the ranking of routes that conventionally host an
+// interesting authenticated UI.
+var pathKeywords = []string{
+	"admin", "console", "dashboard", "portal", "account", "settings", "manage", "ui", "app",
+}
+
+// evaluateReSpiderCandidate decides whether a discovered route is worth a real
+// browser: a JS/SPA shell or an interactive HTML page that is NOT a login/SSO
+// wall. Pure function (no I/O) so it is unit-tested directly.
+func evaluateReSpiderCandidate(in respiderInput) respiderVerdict {
+	u, err := url.Parse(in.URL)
+	if err != nil || u.Host == "" {
+		return respiderVerdict{Reason: "bad-path"}
+	}
+
+	// Directory-style / extensionless path only (targets /ui/, /console/;
+	// excludes /app.js). Login paths still pass this and are caught below.
+	// Reuses the same predicate ModernAppMatcher applies, for one definition.
+	if !tag.IsValidModernAppPath(u.Path) {
+		return respiderVerdict{Reason: "bad-path"}
+	}
+
+	// SSO / login screen — cheap, no browser. The URL itself, a redirect to an
+	// IdP, or a password field in the body all disqualify.
+	if authsig.LooksLikeLoginURL(u) {
+		return respiderVerdict{Reason: "login"}
+	}
+	if in.StatusCode >= 300 && in.StatusCode < 400 {
+		if loc := strings.TrimSpace(in.Location); loc != "" {
+			if lu, lerr := u.Parse(loc); lerr == nil && authsig.LooksLikeLoginURL(lu) {
+				return respiderVerdict{Reason: "login"}
+			}
+		}
+		// A non-login redirect is not a renderable page worth a browser here;
+		// its real target gets discovered/recorded on its own.
+		return respiderVerdict{Reason: "non-200"}
+	}
+	if in.StatusCode != 200 {
+		return respiderVerdict{Reason: "non-200"}
+	}
+	if authsig.BodyLooksLikeLogin(in.Body) {
+		return respiderVerdict{Reason: "login"}
+	}
+
+	// Content-type must be HTML; static assets / non-HTML add nothing a browser
+	// would reveal.
+	if modkit.IsStaticAssetContentType(in.ContentType) {
+		return respiderVerdict{Reason: "asset"}
+	}
+	if !isHTMLContentType(in.ContentType) || len(in.Body) == 0 {
+		return respiderVerdict{Reason: "not-html"}
+	}
+
+	// Rich-content gate: SPA framework markers, an empty app shell, or an
+	// interactive server-rendered page (login already excluded above).
+	var reason string
+	switch {
+	case modernAppMatcher.Match(&tag.MatchInput{ResponseBody: in.Body, MIMEType: in.ContentType, RequestPath: u.Path}):
+		reason = "spa"
+	case isEmptyAppShell(in.Body):
+		reason = "spa-shell"
+	case isInteractiveHTML(in.Body):
+		reason = "interactive"
+	default:
+		return respiderVerdict{Reason: "static"}
+	}
+
+	return respiderVerdict{
+		Keep:      true,
+		Reason:    reason,
+		ShellHash: shellFingerprint(u, in.Body),
+		Score:     scoreCandidate(u, reason),
+	}
+}
+
+func isHTMLContentType(ct string) bool {
+	if ct == "" {
+		return true // unknown — let the body gates decide
+	}
+	c := strings.ToLower(ct)
+	return strings.Contains(c, "text/html") || strings.Contains(c, "application/xhtml")
+}
+
+func hasAppMount(lowerBody []byte) bool {
+	for _, m := range appMountMarkers {
+		if bytes.Contains(lowerBody, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// isEmptyAppShell recognizes a client-rendered page: an app mount point plus
+// several external scripts plus almost no static text.
+func isEmptyAppShell(body []byte) bool {
+	if !hasAppMount(bytes.ToLower(body)) {
+		return false
+	}
+	if len(scriptSrcRe.FindAllIndex(body, -1)) < 2 {
+		return false
+	}
+	return visibleTextLen(body) < 200
+}
+
+// visibleTextLen returns the length of human-visible text after stripping
+// script/style blocks and tags.
+func visibleTextLen(body []byte) int {
+	b := scriptBlockRe.ReplaceAll(body, []byte(" "))
+	b = styleBlockRe.ReplaceAll(b, []byte(" "))
+	b = htmlTagRe.ReplaceAll(b, []byte(" "))
+	return len(bytes.Join(bytes.Fields(b), []byte(" ")))
+}
+
+// isInteractiveHTML reports whether a server-rendered page has a real form or
+// several interactive controls (login forms are screened out before this).
+func isInteractiveHTML(body []byte) bool {
+	if formTagRe.Match(body) {
+		return true
+	}
+	controls := len(interactiveRe.FindAllIndex(body, -1)) + len(inputTagRe.FindAllIndex(body, -1))
+	return controls >= 3
+}
+
+// shellFingerprint builds a per-(host, app-shell) dedup key. SPA routes that
+// serve the same index shell share the same set of bundle <script src> paths
+// (with volatile hash/chunk tokens normalized), so they collapse to one key and
+// a single browser covers the whole client-side router.
+func shellFingerprint(u *url.URL, body []byte) string {
+	host := strings.ToLower(u.Hostname())
+	matches := scriptSrcRe.FindAllSubmatch(body, -1)
+	norm := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		v := strings.ToLower(string(m[1]))
+		v = string(volatileTokRe.ReplaceAll([]byte(v), []byte("*")))
+		norm = append(norm, v)
+	}
+	sort.Strings(norm)
+	skeleton := strings.Join(norm, "|")
+	if skeleton == "" {
+		// Shell-less page: fall back to a normalized body prefix so identical
+		// pages still dedup.
+		nb := volatileTokRe.ReplaceAll(bytes.ToLower(body), []byte("*"))
+		if len(nb) > 4096 {
+			nb = nb[:4096]
+		}
+		skeleton = string(nb)
+	}
+	sum := sha256.Sum256([]byte(host + "::" + skeleton))
+	return hex.EncodeToString(sum[:])
+}
+
+// routeUUIDRe matches a full UUID path segment.
+var routeUUIDRe = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// canonicalRoute reduces a URL to a route TEMPLATE — host + path with id-like
+// segments (numeric, UUID, long hex, long token-with-digit) collapsed to "*",
+// plus the sorted query KEYS (not values). It gives the re-spider frontier a
+// per-route-template dedup key so a family of data pages sharing one template
+// (/product/1, /product/2, /users/{uuid}) contributes a single browser seed
+// instead of N near-identical crawls — complementing shellFingerprint, which only
+// collapses pages that serve the same client-side bundle set.
+func canonicalRoute(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i, s := range segs {
+		if idLikeSegment(s) {
+			segs[i] = "*"
+		} else {
+			segs[i] = strings.ToLower(s)
+		}
+	}
+	route := host + "/" + strings.Join(segs, "/")
+
+	// Query keys distinguish SPA/API routes; the values do not (they are the
+	// volatile per-request part). Sort + dedup the keys for a stable template.
+	if q := u.Query(); len(q) > 0 {
+		keys := make([]string, 0, len(q))
+		for k := range q {
+			keys = append(keys, strings.ToLower(k))
+		}
+		sort.Strings(keys)
+		route += "?" + strings.Join(keys, "&")
+	}
+
+	// A hash-routed client route lives in the fragment; each is its own view.
+	if prefix, path, ok := clientroute.HashRoute(u.Fragment); ok {
+		fsegs := strings.Split(strings.Trim(path, "/"), "/")
+		for i, s := range fsegs {
+			if idLikeSegment(s) {
+				fsegs[i] = "*"
+			} else {
+				fsegs[i] = strings.ToLower(s)
+			}
+		}
+		route += "#" + prefix + "/" + strings.Join(fsegs, "/")
+	}
+	return route
+}
+
+// idLikeSegment reports whether a path segment looks like a volatile identifier
+// rather than a stable route label: all-digits, a UUID, a long hex string, or a
+// long token/slug containing a digit. Stable words (products, settings, v1) are
+// kept so genuinely different routes stay distinct.
+func idLikeSegment(s string) bool {
+	if s == "" {
+		return false
+	}
+	if isAllDigits(s) {
+		return true
+	}
+	if routeUUIDRe.MatchString(s) {
+		return true
+	}
+	if len(s) >= 16 && isAllHex(s) {
+		return true
+	}
+	if len(s) >= 24 && hasAnyDigit(s) {
+		return true
+	}
+	return false
+}
+
+func isAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAllHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func hasAnyDigit(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
+// scoreCandidate ranks kept candidates so the most promising win a tight budget.
+func scoreCandidate(u *url.URL, reason string) int {
+	score := 0
+	p := strings.ToLower(u.Path)
+	for _, kw := range pathKeywords {
+		if strings.Contains(p, kw) {
+			score += 10
+		}
+	}
+	switch reason {
+	case "spa":
+		score += 5
+	case "spa-shell":
+		score += 4
+	case "interactive":
+		score += 2
+	case routeSeedSource:
+		// A route the app's own router declares but no page links to: worth a
+		// browser, though unverified (nothing fetched it yet).
+		score += 3
+	}
+	segs := 0
+	for _, s := range strings.Split(strings.Trim(p, "/"), "/") {
+		if s != "" {
+			segs++
+		}
+	}
+	if segs > 5 {
+		segs = 5
+	}
+	return score + segs
+}

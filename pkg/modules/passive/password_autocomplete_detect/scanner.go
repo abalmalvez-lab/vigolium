@@ -1,24 +1,20 @@
 package password_autocomplete_detect
 
 import (
-	"regexp"
+	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/vigolium/vigolium/pkg/anomaly/htmlutils"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/utils"
+	"golang.org/x/net/html"
 )
 
-var passwordInputRe = regexp.MustCompile(`(?i)<input[^>]*type\s*=\s*["']?password["']?[^>]*>`)
-
-// autocompleteOffRe matches autocomplete="off" or autocomplete="new-password" in a tag.
-var autocompleteOffRe = regexp.MustCompile(`(?i)autocomplete\s*=\s*["']?(off|new-password)["']?`)
-
-// formAutocompleteRe extracts form tags with their attributes.
-var formAutocompleteRe = regexp.MustCompile(`(?i)<form[^>]*autocomplete\s*=\s*["']?off["']?[^>]*>`)
+const maxExamples = 8
 
 // Module implements the Password Autocomplete Detect passive scanner.
 type Module struct {
@@ -46,23 +42,32 @@ func New() *Module {
 	return m
 }
 
-// ScanPerRequest checks HTML responses for password fields without autocomplete disabled.
+func (m *Module) RequiredContentClasses() []string { return []string{"html"} }
+
+// ScanPerRequest records a markup-quality observation when a likely account
+// password input lacks the semantic current-password/new-password token.
+// autocomplete=off is not treated as the secure state: disabling autofill is
+// not an authentication control, and user agents may override it for
+// credentials.
 func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext) ([]*output.ResultEvent, error) {
 	urlx, err := ctx.URL()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get URL")
 	}
-
-	if utils.IsMediaAndJSURL(urlx.Path) {
+	if utils.IsMediaAndJSURL(urlx.Path) || ctx.Response() == nil {
+		return nil, nil
+	}
+	if !strings.Contains(strings.ToLower(ctx.Response().Header("Content-Type")), "text/html") {
 		return nil, nil
 	}
 
-	if ctx.Response() == nil {
+	// The shared, memoised parse: the other HTML passives reuse it.
+	doc, err := ctx.Response().HTMLDocument()
+	if err != nil || doc == nil {
 		return nil, nil
 	}
-
-	ct := strings.ToLower(ctx.Response().Header("Content-Type"))
-	if !strings.Contains(ct, "text/html") {
+	observations := passwordFieldsWithoutSemanticAutocomplete(doc)
+	if len(observations) == 0 {
 		return nil, nil
 	}
 
@@ -72,39 +77,92 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		return nil, nil
 	}
 
-	body := ctx.Response().BodyToString()
-	matches := passwordInputRe.FindAllString(body, -1)
-	if len(matches) == 0 {
-		return nil, nil
-	}
-
-	// Check if the form has autocomplete=off globally
-	formHasOff := formAutocompleteRe.MatchString(body)
-
-	var vulnerable []string
-	for _, tag := range matches {
-		if autocompleteOffRe.MatchString(tag) {
-			continue
-		}
-		if formHasOff {
-			continue
-		}
-		vulnerable = append(vulnerable, tag)
-	}
-
-	if len(vulnerable) == 0 {
-		return nil, nil
-	}
-
-	return []*output.ResultEvent{
-		{
-			Host:             urlx.Host,
-			URL:              urlx.String(),
-			Request:          string(ctx.Request().Raw()),
-			ExtractedResults: vulnerable,
-			Info: output.Info{
-				Description: "Password field(s) without autocomplete disabled",
-			},
+	return []*output.ResultEvent{{
+		ModuleID:         ModuleID,
+		RecordKind:       output.RecordKindObservation,
+		EvidenceGrade:    output.EvidenceGradeObservation,
+		Host:             urlx.Host,
+		URL:              urlx.String(),
+		Request:          string(ctx.Request().Raw()),
+		ExtractedResults: observations,
+		Info: output.Info{
+			Name:        "Password Field Lacks Semantic Autocomplete Hint",
+			Description: "A likely account-password input does not declare autocomplete=\"current-password\" or autocomplete=\"new-password\". This is an informational password-manager interoperability observation, not proof that credentials are insecurely stored. autocomplete=\"off\" is not a security requirement and is not treated as protection.",
+			Severity:    ModuleSeverity,
+			Confidence:  ModuleConfidence,
+			Tags:        ModuleTags,
 		},
-	}, nil
+		Metadata: map[string]any{
+			"recommended_tokens": []string{"current-password", "new-password"},
+			"security_impact":    "not established",
+			"field_count":        len(observations),
+		},
+	}}, nil
+}
+
+// passwordFieldsWithoutSemanticAutocomplete lists the account-password inputs
+// of the (shared, read-only) document lacking a semantic autocomplete token.
+func passwordFieldsWithoutSemanticAutocomplete(doc *html.Node) []string {
+	var observations []string
+	for _, node := range htmlutils.GetElementsByTagName(doc, "input") {
+		if obs, ok := passwordFieldObservation(node); ok {
+			observations = append(observations, obs)
+			if len(observations) == maxExamples {
+				break
+			}
+		}
+	}
+	return observations
+}
+
+// passwordFieldObservation describes one enabled, editable password input
+// without a semantic autocomplete token, or reports false.
+func passwordFieldObservation(node *html.Node) (string, bool) {
+	if !strings.EqualFold(htmlutils.GetAttributeTrimSpace(node, "type"), "password") ||
+		htmlutils.HasAttribute(node, "disabled") || htmlutils.HasAttribute(node, "readonly") {
+		return "", false
+	}
+
+	rawHint := htmlutils.GetAttribute(node, "autocomplete")
+	autocomplete := autocompleteTokenSet(rawHint)
+	if autocomplete["current-password"] || autocomplete["new-password"] || autocomplete["one-time-code"] || autocomplete["cc-csc"] {
+		return "", false
+	}
+	name, id := htmlutils.GetAttribute(node, "name"), htmlutils.GetAttribute(node, "id")
+	if likelyNonPasswordSecretField(name, id) {
+		return "", false
+	}
+
+	hint := strings.TrimSpace(rawHint)
+	if hint == "" {
+		hint = "(missing)"
+	}
+	return fmt.Sprintf("field=%s autocomplete=%s", firstNonEmpty(name, id, "(unnamed)"), hint), true
+}
+
+func autocompleteTokenSet(raw string) map[string]bool {
+	result := make(map[string]bool)
+	for _, token := range strings.Fields(strings.ToLower(raw)) {
+		result[token] = true
+	}
+	return result
+}
+
+func likelyNonPasswordSecretField(name, id string) bool {
+	identity := strings.ToLower(name + " " + id)
+	for _, marker := range []string{"otp", "one-time", "one_time", "pin", "cvv", "cvc", "security-code", "security_code"} {
+		if strings.Contains(identity, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }

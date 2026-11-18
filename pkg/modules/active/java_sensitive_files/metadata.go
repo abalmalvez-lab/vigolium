@@ -9,25 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Java/Spring-specific sensitive files not covered by generic file
-discovery modules: application.properties/yml, WEB-INF/web.xml, META-INF
-manifests, Maven/Gradle build files, and backup configuration files that
-are commonly exposed through misconfigured static file serving.
+	ModuleDesc = `**What it means:** A Java or Spring application file that should never be web-reachable is served to anonymous clients. The module probes known paths (WEB-INF/web.xml, META-INF/MANIFEST.MF, application.properties/yml, pom.xml, build.gradle) and reports only on a 200 carrying the file's expected content markers.
 
-## Notes
-- Runs once per host
-- Checks Java-specific config, deployment, and build artifact paths
-- Validates responses with content markers and anti-markers
-- Fingerprints 404 responses to detect custom error pages
-- Complements the generic sensitive_file_discovery module
+**How it's exploited:** Spring config files leak database credentials, API keys, and internal service URLs an attacker reads to pivot into back-end systems; web.xml, manifests, and build files disclose servlet mappings and dependency versions for targeting known CVEs.
 
-## References
-- https://tomcat.apache.org/tomcat-10.1-doc/security-howto.html
-- https://docs.spring.io/spring-boot/docs/current/reference/html/application-properties.html`
+**Fix:** Block these paths at the web server and keep WEB-INF/META-INF and config files out of any public document root.`
 
-	ModuleConfirmation = "Confirmed when Java-specific sensitive files return expected content markers"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleConfirmation = "Confirmed when Java-specific sensitive files return expected structural content markers and survive a same-extension catch-all check"
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"java", "sensitive-file", "probe", "light"}
 )

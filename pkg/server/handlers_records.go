@@ -3,20 +3,20 @@ package server
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/vigolium/vigolium/pkg/burpbridge"
 	"github.com/vigolium/vigolium/pkg/database"
+	"go.uber.org/zap"
 )
 
 // HandleListRecords handles GET /api/http-records
 func (h *Handlers) HandleListRecords(c fiber.Ctx) error {
 	if h.db == nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: ErrDatabaseRequired.Error(),
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
 
 	projectUUID := getProjectUUID(c)
@@ -76,6 +76,13 @@ func (h *Handlers) HandleListRecords(c fiber.Ctx) error {
 		}
 	}
 
+	// Attack-surface score
+	if minSurface := c.Query("min_surface"); minSurface != "" {
+		if v, err := strconv.Atoi(minSurface); err == nil {
+			filters.MinSurfaceScore = v
+		}
+	}
+
 	// Remark (single or comma-separated for AND filtering)
 	if remark := c.Query("remark"); remark != "" {
 		if strings.Contains(remark, ",") {
@@ -116,73 +123,114 @@ func (h *Handlers) HandleListRecords(c fiber.Ctx) error {
 		}
 	}
 
-	qb := database.NewQueryBuilder(h.db, filters)
-
+	bridgeEnabled := h.config.BurpBridgeURL != "" && burpbridge.Eligible(filters)
+	fetchFilters := filters
+	if bridgeEnabled {
+		fetchFilters.Offset = 0
+		fetchFilters.Limit = filters.Offset + filters.Limit
+	}
 	// Excluding raw_* keeps the list payload small. HTTPRecord.MarshalJSON
 	// derives request_body/response_body/request_headers/response_headers from
 	// raw_request/raw_response, so dropping those columns implicitly drops the
 	// derived fields too. Detail endpoints select raw_* and get the full view.
-	query := qb.BuildRecordsQuery().
-		ExcludeColumn("raw_request").
-		ExcludeColumn("raw_response")
+	qb := database.NewQueryBuilder(h.readerDB(), fetchFilters).OmitBodies()
 
 	var records []*database.HTTPRecord
 	ctx := c.Context()
-	if err := query.Scan(ctx, &records); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "query failed: " + err.Error(),
-			Code:  fiber.StatusInternalServerError,
-		})
+	if err := retryRead(ctx, func() error {
+		records = nil
+		return qb.BuildRecordsQuery().Scan(ctx, &records)
+	}); err != nil {
+		return respondQueryError(c, err)
 	}
 
-	total, _ := qb.Count(ctx)
+	// A discarded count error reported total=0 while rows were returned, which
+	// also made HasMore compute false — so a paging client stopped at the first
+	// page and a dashboard showed "0 records" above a populated table. Say the
+	// count is unavailable instead of asserting a wrong one.
+	total, countErr := qb.Count(ctx)
+	if countErr != nil {
+		zap.L().Warn("record count failed; total reported as unavailable", zap.Error(countErr))
+		total = 0 // keeps the merge arithmetic below sane; resolved at the response
+	}
+	if bridgeEnabled {
+		client, clientErr := burpbridge.New(h.config.BurpBridgeURL)
+		var live burpbridge.Result
+		if clientErr == nil {
+			live, clientErr = client.Query(ctx, burpbridge.QueryFromFilters(fetchFilters, false))
+		}
+		if clientErr != nil {
+			c.Set("X-Vigolium-Burp-Bridge", "unavailable")
+			zap.L().Warn("bridge traffic unavailable; returning database records only", zap.Error(clientErr))
+		} else {
+			c.Set("X-Vigolium-Burp-Bridge", "connected")
+			// Which vendor answered, for a client that wants to label the
+			// merged rows without inspecting each one. The header name stays
+			// Burp-spelled: it is a protocol marker existing consumers key off,
+			// not a provenance label.
+			c.Set("X-Vigolium-Bridge-Source", live.Source)
+		}
+		// Mirrors the CLI path: Eligible admitted every bridge vendor because the
+		// answering one was not yet known, so a ?source naming the other vendor
+		// discards the live set.
+		live = live.FilterBySource(filters.Source)
+		records, total = burpbridge.MergePage(
+			records,
+			live.Records,
+			total,
+			live.Total,
+			filters.Offset,
+			filters.Limit,
+			filters.SortBy,
+			filters.SortAsc,
+		)
+	}
 
-	return c.JSON(PaginatedResponse{
+	// With no trustworthy count, report total as -1 ("unknown") rather than the
+	// fabricated 0 a discarded error used to produce, and fall back to page
+	// fullness for HasMore so a paging client still advances instead of stopping
+	// dead on the first page.
+	hasMore := int64(filters.Offset+len(records)) < total
+	if countErr != nil {
+		total, hasMore = -1, filters.Limit > 0 && len(records) >= filters.Limit
+	}
+
+	return respondList(c, PaginatedResponse{
 		ProjectUUID: projectUUID,
 		Data:        records,
 		Total:       total,
 		Limit:       filters.Limit,
 		Offset:      filters.Offset,
-		HasMore:     int64(filters.Offset+filters.Limit) < total,
+		HasMore:     hasMore,
 	})
 }
 
 // HandleDeleteRecord handles DELETE /api/http-records/:uuid — deletes a single HTTP record by UUID.
 func (h *Handlers) HandleDeleteRecord(c fiber.Ctx) error {
 	if h.db == nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: ErrDatabaseRequired.Error(),
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
 
 	uuid := c.Params("uuid")
 	if uuid == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "missing uuid parameter",
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "missing uuid parameter")
 	}
 
-	// Verify the record exists
-	if _, err := h.repo.GetRecordByUUID(c.Context(), uuid); err != nil {
+	// Verify the record exists and belongs to the request's project. Only the
+	// project is needed, so don't load the record's body to delete it.
+	recProject, err := h.repo.RecordProjectUUID(c.Context(), uuid)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return c.Status(fiber.StatusNotFound).JSON(ErrorResponse{
-				Error: ErrRecordNotFound.Error(),
-				Code:  fiber.StatusNotFound,
-			})
+			return respondError(c, fiber.StatusNotFound, ErrRecordNotFound)
 		}
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to retrieve record: " + err.Error(),
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to retrieve record: %w", err))
+	}
+	if !inRequestProject(c, recProject) {
+		return respondError(c, fiber.StatusNotFound, ErrRecordNotFound)
 	}
 
 	if err := h.repo.DeleteRecord(c.Context(), uuid); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to delete record: " + err.Error(),
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to delete record: %w", err))
 	}
 
 	return c.JSON(fiber.Map{
@@ -194,32 +242,37 @@ func (h *Handlers) HandleDeleteRecord(c fiber.Ctx) error {
 // HandleGetRecord handles GET /api/http-records/:uuid — returns a single HTTP record with full blob fields.
 func (h *Handlers) HandleGetRecord(c fiber.Ctx) error {
 	if h.db == nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: ErrDatabaseRequired.Error(),
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
 
 	uuid := c.Params("uuid")
 	if uuid == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "missing uuid parameter",
-			Code:  fiber.StatusBadRequest,
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "missing uuid parameter")
+	}
+	if burpbridge.IsBridgeUUID(uuid) {
+		if h.config.BurpBridgeURL == "" {
+			return respondError(c, fiber.StatusNotFound, ErrRecordNotFound)
+		}
+		client, err := burpbridge.New(h.config.BurpBridgeURL)
+		if err != nil {
+			return respondError(c, fiber.StatusBadGateway, err)
+		}
+		record, err := client.Inspect(c.Context(), uuid, getProjectUUID(c))
+		if err != nil {
+			return respondError(c, fiber.StatusBadGateway, err)
+		}
+		return c.JSON(record)
 	}
 
 	record, err := h.repo.GetRecordByUUID(c.Context(), uuid)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return c.Status(fiber.StatusNotFound).JSON(ErrorResponse{
-				Error: ErrRecordNotFound.Error(),
-				Code:  fiber.StatusNotFound,
-			})
+			return respondError(c, fiber.StatusNotFound, ErrRecordNotFound)
 		}
-		return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to retrieve record: " + err.Error(),
-			Code:  fiber.StatusInternalServerError,
-		})
+		return respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to retrieve record: %w", err))
+	}
+	if !inRequestProject(c, record.ProjectUUID) {
+		return respondError(c, fiber.StatusNotFound, ErrRecordNotFound)
 	}
 
 	return c.JSON(record)

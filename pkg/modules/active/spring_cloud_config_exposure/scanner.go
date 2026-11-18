@@ -18,7 +18,7 @@ import (
 type probe struct {
 	path        string
 	name        string
-	markers     []string
+	markers     [][]string
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
@@ -28,7 +28,7 @@ var probes = []probe{
 	{
 		path:        "/application/default",
 		name:        "Config Server (application/default)",
-		markers:     []string{`"propertySources"`, `"name"`, `"source"`},
+		markers:     [][]string{{`"propertySources"`}, {`"source"`, `"profiles"`, `"name":"application"`}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Critical,
 		desc:        "Spring Cloud Config Server exposed, returning default application configuration with potential secrets and internal URLs",
@@ -36,7 +36,7 @@ var probes = []probe{
 	{
 		path:        "/application/prod",
 		name:        "Config Server (application/prod)",
-		markers:     []string{`"propertySources"`, `"name"`, `"source"`},
+		markers:     [][]string{{`"propertySources"`}, {`"source"`, `"profiles"`, `"name":"application"`}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Critical,
 		desc:        "Spring Cloud Config Server exposed for production profile, potentially leaking production credentials",
@@ -44,7 +44,7 @@ var probes = []probe{
 	{
 		path:        "/application/dev",
 		name:        "Config Server (application/dev)",
-		markers:     []string{`"propertySources"`, `"name"`, `"source"`},
+		markers:     [][]string{{`"propertySources"`}, {`"source"`, `"profiles"`, `"name":"application"`}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Critical,
 		desc:        "Spring Cloud Config Server exposed for development profile",
@@ -52,7 +52,7 @@ var probes = []probe{
 	{
 		path:        "/application/default/main",
 		name:        "Config Server (main label)",
-		markers:     []string{`"propertySources"`, `"name"`, `"source"`, `"label"`},
+		markers:     [][]string{{`"propertySources"`}, {`"source"`, `"profiles"`, `"label"`}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Critical,
 		desc:        "Spring Cloud Config Server exposed with main branch label",
@@ -60,7 +60,7 @@ var probes = []probe{
 	{
 		path:        "/application/default/master",
 		name:        "Config Server (master label)",
-		markers:     []string{`"propertySources"`, `"name"`, `"source"`, `"label"`},
+		markers:     [][]string{{`"propertySources"`}, {`"source"`, `"profiles"`, `"label"`}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Critical,
 		desc:        "Spring Cloud Config Server exposed with master branch label",
@@ -68,7 +68,7 @@ var probes = []probe{
 	{
 		path:        "/encrypt/status",
 		name:        "Config Server Encryption Status",
-		markers:     []string{`"status"`, "OK", "UP"},
+		markers:     [][]string{{`"status"`}, {"OK", "NO_KEY", "INVALID"}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.High,
 		desc:        "Spring Cloud Config Server encryption status endpoint exposed, confirming encryption capability is enabled",
@@ -128,17 +128,30 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
+	urlx, err := ctx.URL()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Walk the web root plus any context-path prefixes of the observed URL so an
+	// endpoint mounted under server.servlet.context-path (e.g. /api/<endpoint>)
+	// is reached, not just the root path. Claim each (host, base) pair up front
+	// so a fully-deduped request issues no traffic — including the soft-404
+	// fingerprint below.
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
 		return nil, nil
 	}
 
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
-	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p, fp); result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, p := range probes {
+			if result := m.probeEndpoint(ctx, httpClient, p, base+p.path, fp); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 
@@ -160,11 +173,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetPath produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -183,22 +194,21 @@ func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	p probe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, p.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetPath produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -247,20 +257,17 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
-	}
-	if !matched {
+	// Confirm the marker groups, then drop the finding if a sub-directory
+	// catch-all serves the same markers for a nonexistent sibling (a handler that
+	// 200s every child path). Root-level probes are covered by the random-path 404
+	// fingerprint above, so the sibling probe is a no-op for them.
+	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, body, p.markers)
+	if !ok {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
 		URL:              targetURL,

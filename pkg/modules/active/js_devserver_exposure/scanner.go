@@ -60,13 +60,13 @@ func (m *Module) ScanPerRequest(
 	host := service.Host()
 
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
-	// Fingerprint 404 response body hash
-	notFoundHash := get404Hash(ctx, httpClient)
+	// Fingerprint the 404 response (body hash + status) so probes can tell a
+	// distinctive dev-server response from the host's generic answer to any path.
+	notFoundHash, notFoundStatus := fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
 	target := ctx.Target()
@@ -83,11 +83,9 @@ func (m *Module) ScanPerRequest(
 		}
 		probeRaw, _ = httpmsg.SetMethod(probeRaw, "GET")
 
-		probeReq, err := httpmsg.ParseRawRequest(string(probeRaw))
-		if err != nil {
-			continue
-		}
-		probeReq = probeReq.WithService(ctx.Service())
+		// probeRaw is internally built (well-formed), so wrap directly instead
+		// of re-parsing on this hot path.
+		probeReq := httpmsg.NewRequestResponseRaw(probeRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(probeReq, http.Options{})
 		if err != nil {
@@ -101,12 +99,12 @@ func (m *Module) ScanPerRequest(
 
 		statusCode := resp.Response().StatusCode
 
-		// Check expected status
+		// Check expected status. Require the status to be DISTINCTIVE — if the
+		// random 404 probe returned the same status, the host answers every path
+		// that way (a blanket 204/200 catch-all) and the match proves nothing.
 		if probe.expectedStatus > 0 {
-			if statusCode == probe.expectedStatus {
+			if statusCode == probe.expectedStatus && statusCode != notFoundStatus {
 				results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString()))
-				resp.Close()
-				continue
 			}
 			resp.Close()
 			continue
@@ -121,8 +119,31 @@ func (m *Module) ScanPerRequest(
 		body := resp.Body().String()
 		ct := resp.Response().Header.Get("Content-Type")
 
+		// Catch-all / echo-server guard: none of these dev-server endpoints serve a
+		// full HTML document — the HMR endpoints stream text/event-stream, sockjs /
+		// info serves JSON, open-in-editor returns a plaintext error. A 200 text/html
+		// body on one of these paths is the host's catch-all / SPA shell served for
+		// literally any path (or, under a gzip + bogus `Content-Length: 0` transport
+		// quirk, a truncated TAIL fragment of it whose weak reflected marker survives
+		// the exact-hash 404 and observed-page guards). The Content-Type header
+		// survives that truncation, so reject an HTML document outright before the
+		// content-type / marker checks below.
+		if modkit.ClassifyContentType(ct) == modkit.ContentClassHTML {
+			resp.Close()
+			continue
+		}
+
 		// Skip if body hash matches 404
 		if notFoundHash != "" && utils.Sha1(body) == notFoundHash {
+			resp.Close()
+			continue
+		}
+
+		// Catch-all / SPA shell guard: a real dev-server endpoint streams SSE or
+		// serves a terse JSON status — it never returns the application page. A
+		// probe whose body is the observed page is the catch-all shell, even when
+		// the exact-hash 404 check above misses a shell that varies per path.
+		if modkit.ResemblesObservedPage(ctx, body) {
 			resp.Close()
 			continue
 		}
@@ -134,7 +155,13 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		// Check markers
+		// Check markers. Every probe declares a positive signal — a distinctive
+		// status (expectedStatus), an SSE/stream content-type (expectedCT), or a
+		// body marker. A probe that declares NONE deliberately does not fire: the
+		// former "any non-404, non-HTML 2xx body is a dev server" fallback flagged
+		// any app returning a small JSON/text 200 on one of these paths (an API
+		// gateway echoing the route, a catch-all `{"error":...}`) as a Medium/Firm
+		// dev-server exposure — the same weakness as an empty-marker fingerprint.
 		if len(probe.markers) > 0 {
 			for _, marker := range probe.markers {
 				if strings.Contains(body, marker) {
@@ -142,14 +169,6 @@ func (m *Module) ScanPerRequest(
 					break
 				}
 			}
-			resp.Close()
-			continue
-		}
-
-		// For probes without markers or expectedCT (open-in-editor, remix dev),
-		// a non-404 2xx with different body from 404 is enough
-		if len(probe.markers) == 0 && probe.expectedCT == "" && body != "" {
-			results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString()))
 		}
 
 		resp.Close()
@@ -158,28 +177,32 @@ func (m *Module) ScanPerRequest(
 	return results, nil
 }
 
-// get404Hash fetches a known-missing path to fingerprint the 404 page.
-func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) string {
+// fingerprint404 fetches a known-missing path to learn the host's answer to an
+// unknown path: the body hash (to drop probes that echo the 404 page) and the
+// status code (to drop status-only probes whose expected status the host returns
+// for every path). Returns ("", 0) on any error.
+func fingerprint404(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) (hash string, status int) {
 	notFoundPath := "/vigolium-nonexistent-path-404-check"
 	raw, err := httpmsg.SetPath(ctx.Request().Raw(), notFoundPath)
 	if err != nil {
-		return ""
+		return "", 0
 	}
 	raw, _ = httpmsg.SetMethod(raw, "GET")
 
-	req, err := httpmsg.ParseRawRequest(string(raw))
-	if err != nil {
-		return ""
-	}
-	req = req.WithService(ctx.Service())
+	// raw is internally built (well-formed), so wrap directly instead of
+	// re-parsing on this hot path.
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(req, http.Options{})
 	if err != nil {
-		return ""
+		return "", 0
 	}
 	defer resp.Close()
 
-	return utils.Sha1(resp.Body().String())
+	if resp.Response() != nil {
+		status = resp.Response().StatusCode
+	}
+	return utils.Sha1(resp.Body().String()), status
 }
 
 func buildResult(target, host string, probe devProbe, request, response string) *output.ResultEvent {

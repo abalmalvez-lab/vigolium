@@ -12,7 +12,9 @@ vigolium doctor
 ```
 
 `doctor` reports any missing optional dependencies (e.g. a browser for SPA
-spidering) and confirms your config is valid.
+spidering) and confirms your config is valid. You can skip installing them:
+the first `--spider` run downloads Chrome and the first known-issue scan clones
+nuclei templates on demand (`vigolium doctor --fix` does both now).
 
 ## 1. Scan a single URL
 
@@ -31,8 +33,8 @@ vigolium scan-url "https://example.com/search?q=test"
 
 ## 2. Run a full scan
 
-`vigolium scan` runs the full multi-phase pipeline (discovery → spidering →
-dynamic-assessment) using the **balanced** strategy by default:
+`vigolium scan` uses the **balanced** strategy by default: reconnaissance and
+discovery feed dynamic assessment, followed by the known-issue pass.
 
 ```bash
 vigolium scan -t https://example.com
@@ -55,8 +57,14 @@ scanning profile.
 # A file of targets, one URL per line
 vigolium scan -T targets.txt
 
+# A Burp Suite scope export (include rules become targets, auto-detected)
+vigolium scan -T scope.json
+
 # From an OpenAPI / Swagger spec
 vigolium scan -i api.yaml -I openapi -t https://api.example.com
+
+# From a WSDL / SOAP service (or a live .svc/.asmx URL)
+vigolium scan -i service.wsdl -I wsdl -t https://soap.example.com
 
 # Pipe URLs from stdin
 cat urls.txt | vigolium scan
@@ -65,8 +73,14 @@ cat urls.txt | vigolium scan
 echo "curl -X POST -d 'user=admin' https://example.com/login" | vigolium scan-request
 ```
 
-Supported input modes (`-I`): `urls`, `openapi`, `swagger`, `postman`,
-`curl`, `burpxml`, `nuclei`, `har`.
+Supported input modes (`-I`), canonical names first: `urls`, `nuclei`, `openapi`,
+`wsdl`, `postman`, `curl`, `burpraw`, `burpxml`, `burpscope`, `har`, and
+`deparos`. Run `vigolium --list-input-mode` for aliases and examples.
+
+Note the two flags are not interchangeable: `-T/--target-file` reads its file as
+one target URL per line, so every other format goes through `-i/--input`. The
+exceptions are the two formats that are themselves target lists — `urls` and
+`burpscope` — which `-T` accepts directly.
 
 ## 4. Pick specific modules (optional)
 
@@ -100,10 +114,12 @@ vigolium scan -t https://example.com --format jsonl,html -o scan
 | Flag | Effect |
 |------|--------|
 | `--format console` | Human-readable terminal output (default) |
-| `--format jsonl` / `-j` | One JSON object per line |
+| `--format jsonl` | One JSON object per line (findings stream) |
+| `-j` / `--json` | One machine-readable JSON envelope on stdout (not JSONL) |
 | `--format html` | Interactive ag-grid report (requires `-o`) |
+| `--format report,pdf` | Document and PDF reports |
+| `--format sqlite,fs` | Standalone DB or browsable filesystem export |
 | `-o, --output` | Output file path (base name; extension added per format) |
-| `--ci-output-format` | JSONL only, no banners or color — ideal for CI |
 | `--silent` | Suppress everything except findings |
 
 ## 6. Run a single phase
@@ -126,8 +142,8 @@ Phases: `ingestion`, `discovery`, `external-harvest`, `spidering`,
 `~/.vigolium/database-vgnm.sqlite`, so you can browse them afterward:
 
 ```bash
-vigolium traffic list      # ingested HTTP records
-vigolium finding list      # discovered vulnerabilities
+vigolium traffic           # ingested HTTP records
+vigolium finding           # discovered vulnerabilities
 ```
 
 For one-shot runs that leave nothing behind (CI, ad-hoc checks), add

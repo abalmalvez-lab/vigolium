@@ -139,7 +139,8 @@ func (g *getSessionTool) Execute(ctx context.Context, args map[string]any, _ too
 	uuid := argsString(args, "uuid")
 	if uuid == "" {
 		return tool.Result{
-			Content: "get_session: 'uuid' is required",
+			Content: "get_session: 'uuid' is required - the uuid of an agent run, as returned by list_sessions. " +
+				"To browse captured HTTP traffic use query_records; to read findings use list_findings.",
 			IsError: true,
 		}, nil
 	}
@@ -148,6 +149,15 @@ func (g *getSessionTool) Execute(ctx context.Context, args map[string]any, _ too
 	if err != nil {
 		return tool.Result{
 			Content: fmt.Sprintf("get_session: %v", err),
+			IsError: true,
+		}, nil
+	}
+	// Tenant isolation: GetAgenticScan looks up by UUID alone, so a cross-project
+	// UUID would otherwise leak another project's session record. Match the guard
+	// used by replay_request / list_sessions and refuse out-of-project reads.
+	if g.ctx.ProjectUUID != "" && run.ProjectUUID != g.ctx.ProjectUUID {
+		return tool.Result{
+			Content: fmt.Sprintf("get_session: session %q does not belong to the current project", uuid),
 			IsError: true,
 		}, nil
 	}
@@ -216,7 +226,7 @@ func (*listFindingsTool) Schema() map[string]any {
 		"properties": map[string]any{
 			"scan_uuid": map[string]any{
 				"type":        "string",
-				"description": "Restrict to a single scan UUID (from run_scan / list_sessions).",
+				"description": "Restrict to a single scan UUID (from run_native_scan / list_sessions).",
 			},
 			"severity": map[string]any{
 				"type":        "array",

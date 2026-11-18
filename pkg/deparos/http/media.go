@@ -68,3 +68,82 @@ func isMediaExtension(urlPath string) bool {
 	ext := strings.ToLower(path.Ext(urlPath))
 	return excludedExtensions[ext]
 }
+
+// MaxSecretScanBodySize is the largest response body (bytes) any consumer scans
+// for secrets. Above it the body is skipped: a multi-megabyte payload is far more
+// likely a bundle, media asset, or encoded blob than a credential carrier, and
+// scanning it dominates cost.
+const MaxSecretScanBodySize = 10 * 1024 * 1024
+
+// textMIMESubstrings are the media-type substrings (beyond the text/ prefix and
+// +json/+xml suffixes) that mark a body as text-based for secret scanning.
+var textMIMESubstrings = []string{
+	"/json",
+	"/javascript",
+	"/x-javascript",
+	"/xml",
+	"/x-yaml",
+	"/yaml",
+}
+
+// IsTextBasedMIME reports whether the MIME type indicates text-based content that
+// could carry a secret in plaintext. An empty type is treated as text (many
+// endpoints omit Content-Type on JSON/HTML). Runs once per response/record on the
+// secret-scan hot path, so it holds no per-call allocations.
+func IsTextBasedMIME(mimeType string) bool {
+	if mimeType == "" {
+		return true
+	}
+	mt := strings.ToLower(mimeType)
+	if strings.HasPrefix(mt, "text/") {
+		return true
+	}
+	for _, t := range textMIMESubstrings {
+		if strings.Contains(mt, t) {
+			return true
+		}
+	}
+	return strings.HasSuffix(mt, "+json") || strings.HasSuffix(mt, "+xml")
+}
+
+// textExtensions are source/data file extensions whose bodies are text no matter
+// what Content-Type the server declares. Static hosts routinely serve these as
+// application/octet-stream — most notably .map, which is plain JSON and (via
+// sourcesContent) the single richest credential carrier a front-end deployment
+// leaks, since original sources keep the identifier names minification destroys.
+// .css is deliberately absent: it is in excludedExtensions, so IsMediaContent
+// rejects it before this fallback is reached. Adding it here would not change
+// that, only mislead.
+var textExtensions = map[string]bool{
+	".map": true, ".json": true, ".js": true, ".mjs": true, ".cjs": true,
+	".ts": true, ".tsx": true, ".jsx": true,
+	".yaml": true, ".yml": true, ".xml": true, ".txt": true, ".env": true,
+}
+
+// hasTextExtension reports whether a URL path carries a known text extension.
+func hasTextExtension(urlPath string) bool {
+	return textExtensions[strings.ToLower(path.Ext(urlPath))]
+}
+
+// ShouldScanBodyForSecrets is the single eligibility policy deciding whether a
+// response body is worth scanning for secrets: it must be non-empty, within
+// MaxSecretScanBodySize, not media content (by MIME type or URL path), and
+// text-based by declared MIME or by file extension. Centralizing it here keeps
+// the three secret-scan callers — the passive module, the known-issue-scan batch,
+// and the discovery crawl — from drifting (they previously diverged on the size
+// cap and media filtering), so a large or mislabeled binary response can't slip
+// into the detector on one path but not another.
+//
+// The extension fallback is load-bearing: a source map served as
+// application/octet-stream (the default for .map on S3/CloudFront and most static
+// hosts) failed IsTextBasedMIME and was skipped by every caller, so megabytes of
+// original source went unscanned on exactly the responses most worth scanning.
+func ShouldScanBodyForSecrets(contentType, urlPath string, bodyLen int) bool {
+	if bodyLen == 0 || bodyLen > MaxSecretScanBodySize {
+		return false
+	}
+	if IsMediaContent(contentType, urlPath) {
+		return false
+	}
+	return IsTextBasedMIME(contentType) || hasTextExtension(urlPath)
+}

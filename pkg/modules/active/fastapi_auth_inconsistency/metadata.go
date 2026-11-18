@@ -9,23 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Fetches the FastAPI OpenAPI schema from /openapi.json and analyzes it for
-authentication inconsistencies. Identifies operations that lack security
-requirements, either because they explicitly opt out of global security
-or because no security is defined at any level.
+	ModuleDesc = `**What it means:** FastAPI's OpenAPI security contract and runtime behavior differ. Missing metadata is an observation because middleware or in-function checks may apply. A finding requires a declared-protected operation to return stable, substantive data to a credential-free client.
 
-## Notes
-- Runs once per host
-- Parses /openapi.json for OpenAPI spec
-- Flags operations under /api prefix without security requirements
-- Optionally verifies by calling endpoints without auth
-- FA-02: FastAPI auth inconsistency detection
+**How it's exploited:** An attacker enumerates the schema and calls an operation without the token, cookie, or API key its contract requires.
 
-## References
-- https://fastapi.tiangolo.com/tutorial/security/`
+**Fix:** Apply consistent authentication dependencies and remove unintended security: [] overrides.`
 
-	ModuleConfirmation = "Confirmed when OpenAPI spec reveals operations without security requirements, optionally verified by unauthenticated access"
+	ModuleConfirmation = "Confirmed only when an operation declared protected returns repeated, stable, substantive JSON to a fresh credential-free requester; missing security metadata and 422 responses are not bypass evidence"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"fastapi", "python", "auth-bypass", "audit", "moderate"}

@@ -9,23 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Audits Express.js session cookies for security issues beyond basic cookie attribute checks.
-Detects default session names (connect.sid), excessive session expiry windows, and
-session proliferation on anonymous or static requests.
+	ModuleDesc = `**What it means:** This passive check flags Express.js session hygiene issues in Set-Cookie headers: the default connect.sid name, an excessive Max-Age over 7 days, and sessions set on static or anonymous requests. Low-risk hardening weaknesses, not direct vulnerabilities.
 
-## Notes
-- Flags connect.sid default session name as a fingerprinting risk enabling framework identification
-- Flags excessive Max-Age (>7 days / 604800 seconds) or very long Expires dates
-- Detects session proliferation when session cookies are set on anonymous/static requests
+**How it's exploited:** The connect.sid name confirms the backend stack. A long lifetime keeps a stolen or fixated cookie valid longer, so one theft yields prolonged access, and anonymous sessions aid storage exhaustion or fixation.
 
-## References
-- https://expressjs.com/en/resources/middleware/session.html
-- https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
-- https://owasp.org/www-community/controls/SecureCookieAttribute`
+**Fix:** Rename the cookie away from connect.sid, cap Max-Age to 7 days or less, and avoid sessions on static or anonymous requests.`
 
 	ModuleConfirmation = "Confirmed when Express.js session cookies exhibit default naming, excessive expiry, or unnecessary proliferation"
 	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"express", "nodejs", "session", "misconfiguration", "light"}
+	ModuleTags         = []string{"express", "nodejs", "session", "misconfiguration", "hygiene", "light"}
 )

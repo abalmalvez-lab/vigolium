@@ -9,28 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript and TypeScript response bodies for Next.js caching and static
-generation patterns that may inadvertently leak authenticated or user-specific data.
-Static pages (getStaticProps, force-static) are generated at build time and served
-to all users, so including session-dependent data causes cross-user data leakage.
-Similarly, unstable_cache without user-scoped keys or server fetches without
-cache: "no-store" may serve stale authenticated responses to different users.
+	ModuleDesc = `**What it means:** A served source-like JS/TS file contains cache/static-generation syntax and authentication-related syntax. Client build artifacts are excluded, but the detector still establishes only file-level proximity, not connected dataflow.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects: getStaticProps with auth, force-static with auth, unstable_cache without user key
-- Also detects server component fetches with auth headers but without no-store/revalidate:0
-- CWE-524: Use of Cache That Contains Sensitive Information
-- Deduplicates by host+path
+**How it's exploited:** A real issue requires authenticated data to enter a shared cache key and another principal to receive it. This module performs neither call-graph tracing nor cross-user replay, so results remain candidates.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/caching
-- https://nextjs.org/docs/app/building-your-application/data-fetching
-- https://cwe.mitre.org/data/definitions/524.html`
+**Fix:** Mark session-dependent routes dynamic and uncacheable (force-dynamic, no-store, revalidate 0) and scope cache keys to the user.`
 
-	ModuleConfirmation = "Confirmed when static generation or caching patterns are used alongside authentication-scoped data fetching"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Candidate when source-like code contains cache and auth patterns after artifact filtering; confirmation requires connected flow and cross-user replay"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"info-disclosure", "cache-poisoning", "light"}
 )

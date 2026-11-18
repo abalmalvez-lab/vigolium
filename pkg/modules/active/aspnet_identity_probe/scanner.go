@@ -16,6 +16,13 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
+// decoyRounds is how many same-directory negative-control probes the catch-all
+// disproof issues per candidate. A host that answers every /<dir>/<anything> with
+// the same 200 page (a reflecting/echo server, an SPA fallback, a blanket rewrite)
+// trips at least one round and the candidate is dropped. Two rounds tolerate a
+// single WAF/CDN flake without over-probing.
+const decoyRounds = 2
+
 type notFoundFingerprint struct {
 	bodyHash string
 	bodyLen  int
@@ -67,10 +74,7 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -106,11 +110,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -140,11 +142,9 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -168,6 +168,17 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Content-type discipline (survives the body-truncation FP — the header stays
+	// intact when a gzip/Content-Length:0 quirk leaves only a partial body tail):
+	// the token / JWKS / Identity-API probes target JSON documents that are never
+	// served as an HTML *document*. A reflecting or catch-all host that answers an
+	// arbitrary path with its themed text/html shell would otherwise forge a match
+	// on a weak marker ("email", `"errors":{`) surviving in that tail. Rejecting an
+	// HTML document for a JSON probe is decisive and costs no true positives.
+	if p.jsonBody && modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
+		return nil
+	}
+
 	body := resp.Body().String()
 
 	if fp != nil {
@@ -183,6 +194,12 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Catch-all / SPA shell guard: a themed app that returns the same shell for
+	// any path is a false positive even when a weak marker appears in that shell.
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
 			return nil
@@ -193,15 +210,34 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
+	// Strip the reflected request from the body before marker matching: a host that
+	// echoes the requested path back into its response (the catch-all/echo server)
+	// would otherwise let a marker that is itself a path segment satisfy the check
+	// ("ForgotPassword" from /Identity/Account/ForgotPassword). The original body is
+	// kept for anti-markers and the stored evidence.
+	matchBody := modkit.StripReflectedProbePath(body, p.path)
+	if reqBody := ctx.Request().BodyToString(); reqBody != "" {
+		matchBody = modkit.StripReflected(matchBody, reqBody)
 	}
-	if !matched {
+
+	matchedMarkers, ok := p.accepts(matchBody)
+	if !ok {
+		return nil
+	}
+
+	// Multi-round catch-all disproof: probe several guaranteed-nonexistent siblings
+	// under this probe's parent directory. If a random sibling returns the same
+	// status and also satisfies the marker predicate, the host serves this content
+	// for any path — a reflecting/echo server or a wildcard rewrite — so the match
+	// proves nothing (a scaffolded ASP.NET shell carries "__RequestVerificationToken"
+	// on every page). A genuinely exposed endpoint has no such sibling (the decoy
+	// 404s), so this costs no true positives, and it is robust to the body-truncation
+	// quirk because the decoy is run through the same predicate rather than a body-
+	// similarity compare.
+	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+		_, sibOK := p.accepts(b)
+		return sibOK
+	}) {
 		return nil
 	}
 
@@ -240,11 +276,9 @@ func (m *Module) probeOIDCDiscovery(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -285,10 +319,14 @@ func (m *Module) probeOIDCDiscovery(
 		Info: output.Info{
 			Name:        "OIDC Discovery Metadata Enumeration",
 			Description: "OpenID Connect discovery document reveals detailed authentication infrastructure including token endpoints, supported scopes, grant types, and signing algorithms",
-			Severity:    severity.Medium,
-			Confidence:  severity.Certain,
-			Tags:        []string{"aspnet", "identity", "oidc", "information-disclosure"},
-			Reference:   []string{"https://openid.net/specs/openid-connect-discovery-1_0.html"},
+			// The discovery document at /.well-known/openid-configuration is public
+			// by design (OpenID Connect Discovery 1.0) and not ASP.NET-specific —
+			// it is exposed identically by any OIDC provider. It is informational
+			// and needs human review, so Low and not tagged "aspnet".
+			Severity:   severity.Low,
+			Confidence: severity.Certain,
+			Tags:       []string{"identity", "oidc", "information-disclosure"},
+			Reference:  []string{"https://openid.net/specs/openid-connect-discovery-1_0.html"},
 		},
 	}
 }

@@ -9,23 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Cross-framework detection of proxy header trust issues. Tests whether the application
-blindly trusts X-Forwarded-Proto, X-Forwarded-Host, and X-Forwarded-For headers,
-which can lead to host injection, protocol confusion, and IP-based access control bypass.
+	ModuleDesc = `**What it means:** Credential-preserving controls show that a client-supplied X-Forwarded-* value reproducibly changes URL generation, protocol behavior, or IP-gated access. Generic reflection and status-only changes remain candidates.
 
-## Notes
-- Runs once per host
-- Sends baseline request then compares with header-injected variants
-- X-Forwarded-Host reflected in Location or body indicates host injection (High)
-- X-Forwarded-Proto behavior changes indicate protocol confusion (Medium)
-- X-Forwarded-For bypassing restrictions indicates IP trust issues (High)
-- CF-21, FA-05, FL-06, DJ-08: cross-framework proxy header trust detection
+**How it's exploited:** Attackers may poison security-sensitive URLs, confuse HTTPS handling, or impersonate a trusted source IP. An IP bypass becomes a finding only when an unrelated-IP control stays denied and stable, distinct content is returned.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Have the edge proxy strip and re-set X-Forwarded-* and honor them only from known proxy IPs.`
 
-	ModuleConfirmation = "Confirmed when X-Forwarded-* header manipulation causes observable behavioral changes such as host reflection, redirect differences, or access control bypass"
+	ModuleConfirmation = "Candidates require replay and value-specific controls; a finding requires reproducible IP-denial bypass plus stable content distinct from denial responses"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"misconfiguration", "header-security", "moderate"}

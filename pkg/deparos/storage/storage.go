@@ -3,6 +3,8 @@ package storage
 import (
 	"net/url"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
 // NodeCallback is called for each node during streaming iteration.
@@ -36,9 +38,9 @@ type Storage interface {
 	// StreamNewNodesSince streams nodes in newSession not in oldSession.
 	StreamNewNodesSince(oldSessionName, newSessionName string, fn NodeCallback) error
 
-	// BatchUpdateKingfisherFindings updates kingfisher findings for nodes by URL.
+	// BatchUpdateSecretFindings updates secret findings for nodes by URL.
 	// Each map entry is a URL string → JSON-encoded findings string.
-	BatchUpdateKingfisherFindings(urlFindings map[string]string) error
+	BatchUpdateSecretFindings(urlFindings map[string]string) error
 
 	// Close releases resources and ends the current session
 	Close() error
@@ -61,7 +63,7 @@ type Storage interface {
 	// GetLatestRecordAt returns timestamp of most recently discovered record
 	GetLatestRecordAt() *time.Time
 
-	// Extractions returns the extraction repository for storing spider/jsscan/form extractions.
+	// Extractions returns the extraction repository for storing spider/jstangle/form extractions.
 	Extractions() *ExtractionRepository
 
 	// Observed returns the observed data repository for storing discovered filenames/extensions/paths.
@@ -74,8 +76,8 @@ type Storage interface {
 	GetSessionByName(name string) (*Session, error)
 }
 
-// KingfisherFinding represents a stored secret finding from kingfisher scanner.
-type KingfisherFinding struct {
+// SecretFinding represents a stored secret finding from native secret detector.
+type SecretFinding struct {
 	RuleID     string `json:"rule_id"`
 	RuleName   string `json:"rule_name"`
 	Snippet    string `json:"snippet"`
@@ -85,13 +87,13 @@ type KingfisherFinding struct {
 
 // Result represents a complete discovery result
 type Result struct {
-	URL                *url.URL
-	Request            *RequestData
-	Response           *ResponseData
-	Metadata           *DiscoveryMetadata
-	FingerprintAttrs   map[uint8]uint32    // Fingerprint attribute ID → hash value
-	Tags               []string            // Computed tags from tag analyzer
-	KingfisherFindings []KingfisherFinding // Secret findings from kingfisher scanner
+	URL              *url.URL
+	Request          *RequestData
+	Response         *ResponseData
+	Metadata         *DiscoveryMetadata
+	FingerprintAttrs map[uint8]uint32 // Fingerprint attribute ID → hash value
+	Tags             []string         // Computed tags from tag analyzer
+	SecretFindings   []SecretFinding  // Secret findings from native secret detector
 }
 
 // NewResult creates a new Result
@@ -149,6 +151,15 @@ func (b *ResultBuilder) WithResponse(status int, headers map[string]string, body
 	b.result.Response.Title = title
 	b.result.Response.Words = words
 	b.result.Response.Lines = lines
+	return b
+}
+
+// WithResponseDuration records the measured round-trip time for the response.
+// Separate from WithResponse because not every caller times its send, and a
+// caller that does not must leave the value at zero ("not measured") rather
+// than be forced to pass a placeholder.
+func (b *ResultBuilder) WithResponseDuration(d time.Duration) *ResultBuilder {
+	b.result.Response.DurationMs = httpmsg.MeasuredMillis(d)
 	return b
 }
 

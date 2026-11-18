@@ -331,7 +331,9 @@ func EnrichContextFromDB(ctx context.Context, data *agenttypes.TemplateData, rep
 			if hostname != "" {
 				filters.HostPattern = hostname
 			}
-			qb := database.NewQueryBuilder(db, filters)
+			// Only the metadata below is rendered into the prompt, so leave the
+			// request/response bodies in the database.
+			qb := database.NewQueryBuilder(db, filters).OmitBodies()
 			records, err := qb.Execute(ctx)
 			if err != nil {
 				zap.L().Debug("Failed to query HTTP records for context", zap.Error(err))
@@ -402,7 +404,9 @@ func EnrichContextFromDB(ctx context.Context, data *agenttypes.TemplateData, rep
 			if hostname != "" {
 				filters.HostPattern = hostname
 			}
-			qb := database.NewQueryBuilder(db, filters)
+			// Only the metadata below is rendered into the prompt, so leave the
+			// request/response bodies in the database.
+			qb := database.NewQueryBuilder(db, filters).OmitBodies()
 			records, err := qb.Execute(ctx)
 			if err != nil {
 				zap.L().Debug("Failed to query high risk endpoints for context", zap.Error(err))
@@ -469,7 +473,6 @@ func EnrichContextCommands(data *agenttypes.TemplateData, templateVars []string)
       --body <BODY>        Request body
       -H, --header <HDR>   Custom header (repeatable, e.g. -H 'Cookie: x=1')
       --no-passive         Skip passive modules
-      --no-insertion-points  Skip insertion point testing
       --json               Output results as JSON
 
   vigolium scan-request [flags]

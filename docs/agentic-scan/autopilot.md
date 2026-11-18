@@ -87,7 +87,7 @@ the vigolium `findings` table.
 │ user input                                                   │
 │   --target / --input (curl/raw/Burp/base64) / stdin pipe     │
 │   --source (local, git URL, diff, last-N commits)            │
-│   --focus, --instruction, --intensity                        │
+│   [prompt] / --prompt, --intensity                           │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼ resolveInputAndTarget,
@@ -127,7 +127,7 @@ the vigolium `findings` table.
 │     if no tool calls:  emit EventRunDone, return             │
 │                                                              │
 │     for each tool call:                                      │
-│       • read-only batch (read_file/ls/grep/glob/web_fetch):  │
+│       • read-only batch (read_file/ls/grep/glob):            │
 │         dispatched in parallel (max fan-out 8)               │
 │       • anything else (bash, write_file, edit_file, …):      │
 │         dispatched serially                                  │
@@ -170,7 +170,7 @@ prompt and skills, not from the tool surface itself.
 | `ls`             | `pkg/olium/tool/files.go`       | Parallelizable.                                                       |
 | `grep`           | `pkg/olium/tool/search.go`      | Parallelizable.                                                       |
 | `glob`           | `pkg/olium/tool/search.go`      | Parallelizable.                                                       |
-| `web_fetch`      | `pkg/olium/tool/web.go`         | Parallelizable.                                                       |
+| `web_fetch`      | `pkg/olium/tool/web.go`         | Side-effect (any method, browser mode, records); serial only.         |
 | `load_skill`     | `pkg/olium/skill/tool.go`       | Pulls a skill body by name (skills are indexed in the system prompt). |
 | `halt_scan`      | `pkg/olium/autopilot/halt.go`   | Autopilot-only. Sets `HaltSignal`, engine exits naturally next turn.  |
 | `report_finding` | `pkg/olium/autopilot/report_…`  | Autopilot-only. Writes a `Finding` row scoped to the AgenticScan UUID. |
@@ -194,10 +194,10 @@ Supported provider IDs and the credential they consume:
 | Provider           | Default model       | Credential                                                |
 | ------------------ | ------------------- | --------------------------------------------------------- |
 | `openai-codex-oauth`      | `gpt-5.5`           | OAuth cred file (`--oauth-cred` / `agent.olium.oauth_cred_path`) |
-| `anthropic-api-key`| `claude-opus-4-7`   | `--llm-api-key` / `$ANTHROPIC_API_KEY`                    |
-| `anthropic-oauth`     | `claude-opus-4-7`   | Bearer token from `claude setup-token` (`--oauth-token` / `$ANTHROPIC_API_KEY`) |
+| `anthropic-api-key`| `claude-opus-5`   | `--llm-api-key` / `$ANTHROPIC_API_KEY`                    |
+| `anthropic-oauth`     | `claude-opus-5`   | Bearer token from `claude setup-token` (`--oauth-token` / `$ANTHROPIC_API_KEY`) |
 | `openai-api-key`   | `gpt-5.5`           | `--llm-api-key` / `$OPENAI_API_KEY`                       |
-| `anthropic-cli`  | `claude-opus-4-7`   | The `claude` binary on `$PATH`                            |
+| `anthropic-cli`  | `claude-opus-5`   | The `claude` binary on `$PATH`                            |
 
 `EnablePromptCache: true` is set on the engine — providers that support it
 (Anthropic, Claude OAuth) cache the system prompt + tool list across turns,
@@ -228,9 +228,14 @@ The autopilot exits in one of four ways:
 1. **Natural halt** — model calls `halt_scan`. The current turn is allowed to
    finish; the engine then sees no further tool calls on the next turn and
    emits `EventRunDone`. `Result.Halted=true`, `HaltReason` populated.
-2. **Quiet halt** — model finishes a turn with no tool calls and no
-   `halt_scan`. Treated as a natural stop. `Result.Halted=false`,
-   `HaltReason="(natural stop — engine max turns or no more tool calls)"`.
+2. **Quiet halt / stall** - model finishes a turn with no tool calls and no
+   `halt_scan`. The engine nudges it twice (`[empty tool-call turn; nudging
+   model to act or halt (n/2)]`); if it still replies with text only, the run
+   ends with `Result.Halted=false` and `Result.Stalled=true`, and the summary
+   prints "model stopped calling tools". When `Result.ToolCalls==0` the
+   summary also warns that nothing was tested - usually a model without
+   tool-calling support or an endpoint that drops `tools` (Open WebUI: set
+   Function Calling to "Native").
 3. **Max turns** — turn count hits `MaxCommands`. Engine emits an `EventError`;
    autopilot returns a non-nil error.
 4. **Context cancelled** — timeout or SIGINT/SIGTERM. Engine teardown cancels
@@ -250,7 +255,7 @@ Every successful `report_finding` call writes a row via
 `repo.SaveFindingDirect`. Key fields the autopilot stamps:
 
 - `ProjectUUID`, `ScanUUID`, `AgenticScanUUID` — propagate the project/scan
-  scope so `vigolium finding` and `vigolium agent sessions` can join back.
+  scope so `vigolium finding` and `vigolium agent session` can join back.
 - `ModuleID = "olium-autopilot"`, `ModuleType = "ai-agent"`,
   `FindingSource = "autopilot"` — distinguishes agent-originated findings from
   scanner-module findings.
@@ -276,7 +281,7 @@ For each run, autopilot creates a UUID-named directory under the configured
   └── runtime.log   # tee of stdout (assistant text stream)
 ```
 
-The run UUID matches the `AgenticScan.uuid` row, so `vigolium agent sessions`
+The run UUID matches the `AgenticScan.uuid` row, so `vigolium agent session`
 and `vigolium log <uuid>` both work without extra plumbing. Stale dirs older
 than 48h are swept on startup; orphan PID files (from SIGKILL'd runs) are
 cleared via `agent.CleanupOrphanedProcesses`.
@@ -300,6 +305,44 @@ When `--source` is set, three things change:
 
 There is no separate code-audit pre-phase in the olium-backed autopilot — the
 single agent loop handles both code reading and dynamic probing.
+
+---
+
+## Knowledge base (`--knowledge-base`)
+
+`--knowledge-base <file|dir>` front-loads operator-supplied reference
+documentation — how the app authenticates, its roles / privilege tiers, its
+business logic — into the operator's opening brief. It works in both blackbox
+and whitebox runs and is where a KB matters most (blackbox, where the agent
+can't just read the code).
+
+The design is **read-on-demand**, mirroring `--source`: the full documents stay
+on disk, and only a compact **LLM-distilled summary** plus an **authoritative
+document index** are inlined. A directory of ten markdown files therefore adds a
+few hundred tokens to the prompt, not ten files' worth — the agent reads the
+specific file with `read_file`/`grep` when it needs detail, guided by an
+opinionated directive to consult the KB *before* authenticating or reasoning
+about roles.
+
+How it's assembled (in `runAutopilotOlium`, before the audit/pre-scan branch, so
+it reaches both execution paths):
+
+1. **Gather** — walk the file/dir, collect text docs (`.md`/`.markdown`/`.mdx`/
+   `.txt`/`.rst`/`.adoc`), skip binaries and `node_modules`/`.git`/`vendor`. Each
+   doc gets a deterministic one-line description (frontmatter `description:` →
+   first heading → first line).
+2. **Distill** — one bounded, tool-less LLM call (capped input corpus, 120s
+   timeout) turns the docs into a terse briefing (auth model, login flow, key
+   business logic, constraints). Best-effort: on any failure it degrades to the
+   deterministic index — the run never fails over the KB.
+3. **Inline + cache** — the assembled section is folded into the operator's
+   instruction and written to `<session-dir>/knowledge-base-brief.md` for
+   provenance and `--resume` reuse (a resumed run reuses the cached brief instead
+   of re-paying the LLM call).
+
+`--knowledge-base-raw` skips step 2 entirely and inlines the deterministic index
+only — for offline or byte-for-byte reproducible runs. A bad `--knowledge-base`
+path fails fast at flag-validation time.
 
 ---
 

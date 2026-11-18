@@ -64,8 +64,7 @@ func (m *Module) ScanPerHost(
 	}
 
 	host := service.Host()
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -132,11 +131,9 @@ func (m *Module) tryProbe(
 		return nil, err
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil, err
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -145,6 +142,16 @@ func (m *Module) tryProbe(
 	defer resp.Close()
 
 	if resp.Response() == nil || resp.Response().StatusCode != 200 {
+		return nil, nil
+	}
+
+	// Content-type discipline: a genuine S3/Azure bucket listing is an XML
+	// document (application/xml). A universal catch-all / static-website host that
+	// answers every path with a 200 text/html shell — or the gzip/Content-Length:0
+	// transport quirk that captures only a reflecting tail fragment of one — can
+	// carry a stray "<Key>"/"<Name>"/"<Container>" and forge a listing. Reject an
+	// HTML document: the XML listing markers only count in a non-HTML response.
+	if servedAsHTMLDoc(resp.Response().Header.Get("Content-Type")) {
 		return nil, nil
 	}
 
@@ -162,7 +169,7 @@ func (m *Module) tryProbe(
 		URL:      target,
 		Matched:  target,
 		Request:  string(modifiedRaw),
-		Response: truncate(body, 2000),
+		Response: modkit.Truncate(body, 2000),
 		ExtractedResults: []string{
 			fmt.Sprintf("Probe: %s", probe.name),
 			fmt.Sprintf("Items found: %d", itemCount),
@@ -176,11 +183,4 @@ func (m *Module) tryProbe(
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/"},
 		},
 	}, nil
-}
-
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }

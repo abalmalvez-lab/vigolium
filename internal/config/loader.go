@@ -1,13 +1,19 @@
 package config
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/public"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,17 +34,33 @@ type Settings struct {
 	Agent             AgentConfig             `yaml:"agent"`
 	OAST              OASTConfig              `yaml:"oast"`
 	Storage           StorageConfig           `yaml:"storage"`
+	// Offline keeps scans off every network path that is not the target:
+	// third-party lookups, OAST, template clones, browser downloads
+	// and update checks. --offline sets it for one run.
+	Offline bool `yaml:"offline,omitempty"`
+	// Output tunes the shareable artifacts a scan writes.
+	Output OutputConfig `yaml:"output,omitempty"`
 }
 
-// ProfileScanningStrategy is the subset of ScanningStrategyConfig that a
-// profile is permitted to override. It deliberately excludes the per-strategy
-// phase tables (Lite/Balanced/Deep), session, and scan_logs — those are
-// global-config concerns, and exposing them here would let a profile silently
-// zero-clobber strategy phase definitions during the YAML round-trip used by
-// ApplyProfile (every field without omitempty round-trips as its zero value).
-//
-// A profile selects WHICH strategy applies (DefaultStrategy) and tunes the
-// heuristics check; it does not redefine WHAT each strategy means.
+// OutputConfig tunes the shareable artifacts (HTML/PDF/SARIF/Markdown reports,
+// notifications).
+type OutputConfig struct {
+	// RedactEvidence scrubs credential headers, cookie values and sensitive
+	// query parameters from report evidence. Unset = true; false
+	// keeps the raw exchange (same as --no-redact). JSONL exports and the
+	// database are never redacted.
+	RedactEvidence *bool `yaml:"redact_evidence,omitempty"`
+}
+
+// ProfileScanningStrategy is the allowlist of ScanningStrategyConfig keys a
+// profile is permitted to override: it selects WHICH strategy applies
+// (DefaultStrategy) and tunes the heuristics check, and nothing else. The
+// per-strategy phase tables (Lite/Balanced/Deep), session, scan_logs, http, and
+// port_sweep are deliberately excluded — a profile picks a strategy, it does not
+// redefine WHAT each strategy means or touch global-config concerns. This is why
+// ApplyProfile merges scanning_strategy field-by-field (below) rather than through
+// the general key-preserving section overlay: the general path would faithfully
+// apply any strategy sub-key a profile set, widening this authorization boundary.
 type ProfileScanningStrategy struct {
 	DefaultStrategy string `yaml:"default_strategy,omitempty"`
 	HeuristicsCheck string `yaml:"heuristics_check,omitempty"`
@@ -57,6 +79,12 @@ type ProfileSettings struct {
 	MutationStrategy  *MutationStrategyConfig  `yaml:"mutation_strategy,omitempty"`
 	Scope             *ScopeConfig             `yaml:"scope,omitempty"`
 	Notify            *NotifyConfig            `yaml:"notify,omitempty"`
+
+	// raw holds the profile document's top-level section value-nodes, keyed by
+	// their YAML key, captured by LoadProfile and consumed by ApplyProfile (see
+	// there for why). Unexported, so it never round-trips through YAML; nil for a
+	// ProfileSettings built programmatically rather than loaded from a file.
+	raw map[string]*yaml.Node
 }
 
 // LoadProfile reads and parses a scanning profile YAML file.
@@ -65,24 +93,94 @@ func LoadProfile(path string) (*ProfileSettings, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read profile file %s: %w", path, err)
 	}
+	return parseProfile(data, path)
+}
 
+// LoadProfileWithBuiltin is LoadProfile with a fallback for the built-in
+// profiles: when path does not exist and name is a bare built-in profile name
+// (quick, standard, full — the files under public/presets/profiles), the
+// embedded copy is parsed instead. A container that mounts a config but never
+// ran `init` has no profiles directory, and `--intensity quick` must still
+// work there. A file on disk always wins, so operator edits stand.
+func LoadProfileWithBuiltin(path, name string) (*ProfileSettings, error) {
+	profile, err := LoadProfile(path)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return profile, err
+	}
+	if data, ok := BuiltinProfile(name); ok {
+		return parseProfile(data, "embedded presets/profiles/"+name+".yaml")
+	}
+	return nil, err
+}
+
+// BuiltinProfile returns the embedded YAML of a built-in profile by bare name.
+func BuiltinProfile(name string) ([]byte, bool) {
+	if name == "" || strings.ContainsAny(name, `/\~.`) {
+		return nil, false
+	}
+	data, err := public.StaticFS.ReadFile("presets/profiles/" + name + ".yaml")
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// parseProfile parses profile YAML; label names the source in errors.
+func parseProfile(data []byte, path string) (*ProfileSettings, error) {
 	content := ExpandEnvVars(string(data))
 
-	var profile ProfileSettings
-	if err := yaml.Unmarshal([]byte(content), &profile); err != nil {
+	// Parse once into a node, then derive both the typed struct and the per-section
+	// raw nodes from it. ApplyProfile overlays each present section from the raw
+	// nodes so it applies only the keys the file actually set (key-preserving).
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
 		return nil, fmt.Errorf("failed to parse profile file %s: %w", path, err)
 	}
+	var profile ProfileSettings
+	if err := doc.Decode(&profile); err != nil {
+		return nil, fmt.Errorf("failed to parse profile file %s: %w", path, err)
+	}
+	profile.raw = topLevelSectionNodes(&doc)
 
 	return &profile, nil
 }
 
+// topLevelSectionNodes returns the value node for each top-level mapping key in a
+// parsed YAML document, keyed by the key string; these are what make ApplyProfile
+// key-preserving. Returns nil for an empty or non-mapping document.
+func topLevelSectionNodes(doc *yaml.Node) map[string]*yaml.Node {
+	root := doc
+	if root.Kind == yaml.DocumentNode {
+		if len(root.Content) == 0 {
+			return nil
+		}
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	sections := make(map[string]*yaml.Node, len(root.Content)/2)
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		sections[root.Content[i].Value] = root.Content[i+1]
+	}
+	return sections
+}
+
 // ApplyProfile overlays non-nil profile sections onto settings.
 //
-// Most sections are overlaid via a YAML round-trip (marshal the profile section,
-// unmarshal onto the settings section). The ScanningStrategy section is handled
-// specially via ProfileScanningStrategy: its fields are merged explicitly so that
-// the per-strategy phase tables (Lite/Balanced/Deep) defined in the global config
-// are never clobbered by a profile that only meant to set default_strategy.
+// Each section is overlaid KEY-PRESERVINGLY: the section's raw YAML node (captured
+// by LoadProfile) is decoded onto the live settings section, so only the keys the
+// profile file actually set are written and an omitted sub-key (e.g.
+// discovery.jstangle) keeps its global/default value. This replaces an earlier
+// marshal→unmarshal round-trip that emitted every non-omitempty field as its zero
+// value — which is how --intensity deep once silently zeroed
+// discovery.jstangle.memory_budget_mb and aborted the whole Discovery phase.
+//
+// ScanningStrategy is handled specially via the ProfileScanningStrategy allowlist
+// (merged field-by-field above) and never flows through the section overlay. Only
+// sections present as raw nodes are overlaid, so a programmatically-built
+// ProfileSettings (no raw nodes, e.g. tests) applies only ScanningStrategy here;
+// every current caller of the section overlay goes through LoadProfile.
 func ApplyProfile(settings *Settings, profile *ProfileSettings) error {
 	if profile.ScanningStrategy != nil {
 		if v := profile.ScanningStrategy.DefaultStrategy; v != "" {
@@ -93,93 +191,135 @@ func ApplyProfile(settings *Settings, profile *ProfileSettings) error {
 		}
 	}
 
+	// Each entry pairs a section's YAML key (matching its ProfileSettings/Settings
+	// yaml tag) with the live destination. Presence is decided by the raw node
+	// alone: a key the file omitted is left untouched — defaults intact, never
+	// re-zeroed — and a key written as an explicit null decodes as a no-op. The
+	// matching ProfileSettings pointer fields are not consulted here; they exist
+	// so LoadProfile type-checks the document up front.
 	type overlay struct {
-		src  any
+		key  string
 		dest any
 	}
 
-	overlays := []overlay{}
-	if profile.ScanningPace != nil {
-		overlays = append(overlays, overlay{profile.ScanningPace, &settings.ScanningPace})
-	}
-	if profile.Discovery != nil {
-		overlays = append(overlays, overlay{profile.Discovery, &settings.Discovery})
-	}
-	if profile.Spidering != nil {
-		overlays = append(overlays, overlay{profile.Spidering, &settings.Spidering})
-	}
-	if profile.KnownIssueScan != nil {
-		overlays = append(overlays, overlay{profile.KnownIssueScan, &settings.KnownIssueScan})
-	}
-	if profile.DynamicAssessment != nil {
-		overlays = append(overlays, overlay{profile.DynamicAssessment, &settings.DynamicAssessment})
-	}
-	if profile.ExternalHarvester != nil {
-		overlays = append(overlays, overlay{profile.ExternalHarvester, &settings.ExternalHarvester})
-	}
-	if profile.MutationStrategy != nil {
-		overlays = append(overlays, overlay{profile.MutationStrategy, &settings.MutationStrategy})
-	}
-	if profile.Scope != nil {
-		overlays = append(overlays, overlay{profile.Scope, &settings.Scope})
-	}
-	if profile.Notify != nil {
-		overlays = append(overlays, overlay{profile.Notify, &settings.Notify})
-	}
-
-	for _, o := range overlays {
-		data, err := yaml.Marshal(o.src)
-		if err != nil {
-			return fmt.Errorf("failed to marshal profile section: %w", err)
+	for _, o := range []overlay{
+		{"scanning_pace", &settings.ScanningPace},
+		{"discovery", &settings.Discovery},
+		{"spidering", &settings.Spidering},
+		{"known_issue_scan", &settings.KnownIssueScan},
+		{"dynamic-assessment", &settings.DynamicAssessment},
+		{"external_harvester", &settings.ExternalHarvester},
+		{"mutation_strategy", &settings.MutationStrategy},
+		{"scope", &settings.Scope},
+		{"notify", &settings.Notify},
+	} {
+		node, ok := profile.raw[o.key]
+		if !ok {
+			continue
 		}
-		if err := yaml.Unmarshal(data, o.dest); err != nil {
-			return fmt.Errorf("failed to apply profile section: %w", err)
+		if err := node.Decode(o.dest); err != nil {
+			return fmt.Errorf("failed to apply profile section %q: %w", o.key, err)
 		}
 	}
 
 	return nil
 }
 
+// LoadError reports a configuration file that could not be used, and names the
+// file. Every LoadSettings failure is one of these.
+//
+// Explicit distinguishes the two cases a caller must handle differently. A file
+// the operator named with --config is load-bearing: failing to read it means
+// running under settings they did not choose, so the caller fails. A file found
+// by discovery is a convenience; an unreadable one warns and falls back to
+// defaults. The distinction used to be invisible — LoadSettings returned a bare
+// fmt.Errorf and ~35 call sites answered it with `settings = DefaultSettings()`,
+// so `--config ./prod.yaml` with a typo in it ran the scan against the DEFAULT
+// database and reported success.
+//
+// Op is "stat", "read" or "parse": which step failed, for a caller that wants to
+// word its own message. Err is the underlying error and unwraps, so
+// errors.Is(err, fs.ErrNotExist) still works.
+type LoadError struct {
+	Path     string
+	Explicit bool
+	Op       string
+	Err      error
+}
+
+func (e *LoadError) Error() string {
+	verb := "load"
+	switch e.Op {
+	case "stat":
+		verb = "access"
+	case "read":
+		verb = "read"
+	case "parse":
+		verb = "parse"
+	}
+	return fmt.Sprintf("config file %s: cannot %s it: %v", e.Path, verb, e.Err)
+}
+
+func (e *LoadError) Unwrap() error { return e.Err }
+
 // LoadSettings loads configuration from YAML file
 // Search paths (in order):
 //  1. --config flag path (if specified)
 //  2. $HOME/.vigolium/vigolium-configs.yaml
 //  3. ./vigolium-configs.yaml
+//
+// Every failure is a *LoadError. Use LoadSettingsWithWarnings (or, in the CLI,
+// clicommon.LoadSettings) when the non-fatal diagnostics matter too.
 func LoadSettings(configPath string) (*Settings, error) {
-	var path string
+	settings, _, err := LoadSettingsWithWarnings(configPath)
+	return settings, err
+}
 
-	// If config path is explicitly provided, use it
-	if configPath != "" {
+// LoadSettingsWithWarnings is LoadSettings plus the diagnostics that are worth
+// printing but must not fail the command: unknown keys, and a cwd config file
+// that discovery passed over.
+//
+// Both describe a file the operator wrote that is not doing what they think it
+// is, which is otherwise indistinguishable from the setting having no effect.
+// They are returned rather than printed so this package stays free of output
+// policy (--silent, machine modes) that only the CLI knows.
+func LoadSettingsWithWarnings(configPath string) (*Settings, []string, error) {
+	var (
+		path     string
+		explicit = configPath != ""
+		warnings []string
+	)
+
+	if explicit {
 		path = ExpandPath(configPath)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			return nil, fmt.Errorf("config file not found: %s", path)
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil, &LoadError{Path: path, Explicit: true, Op: "stat", Err: err}
 		}
 	} else {
-		// Try default locations
-		paths := []string{
-			ExpandPath("~/.vigolium/vigolium-configs.yaml"),
-			"./vigolium-configs.yaml",
+		var err error
+		if path, err = discoverConfigFile(); err != nil {
+			return nil, nil, &LoadError{Path: path, Explicit: false, Op: "stat", Err: err}
+		}
+		if path == "" {
+			return DefaultSettings(), nil, nil
 		}
 
-		found := false
-		for _, p := range paths {
-			if _, err := os.Stat(p); err == nil {
-				path = p
-				found = true
-				break
+		// Discovery is first-match-wins, so a project-local ./vigolium-configs.yaml
+		// is INVISIBLE whenever the home file exists. Someone who drops one in a
+		// repo expecting it to apply gets no error and no effect; say so.
+		if home := ExpandPath(homeConfigFile); path == home {
+			if _, err := os.Stat(cwdConfigFile); err == nil {
+				warnings = append(warnings, fmt.Sprintf(
+					"%s is ignored because %s exists; pass --config %s to use it",
+					cwdConfigFile, ContractPath(home), cwdConfigFile))
 			}
-		}
-
-		// If no config file found, return default settings
-		if !found {
-			return DefaultSettings(), nil
 		}
 	}
 
 	// Read config file
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return nil, nil, &LoadError{Path: path, Explicit: explicit, Op: "read", Err: err}
 	}
 
 	// Expand environment variables in YAML content
@@ -188,15 +328,90 @@ func LoadSettings(configPath string) (*Settings, error) {
 	// Parse YAML on top of defaults so unspecified sections keep sensible values
 	settings := *DefaultSettings()
 	if err := yaml.Unmarshal([]byte(content), &settings); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, nil, &LoadError{Path: path, Explicit: explicit, Op: "parse", Err: err}
 	}
 
-	// Install the configured global User-Agent so every scan phase that resolves
-	// httpmsg.DefaultUserAgent() at request time picks it up. Empty is a no-op,
-	// preserving the built-in Chrome default.
+	if msg := unknownKeyWarning(path, content); msg != "" {
+		warnings = append(warnings, msg)
+	}
+
+	// Install the configured global User-Agent selector so every scan phase that
+	// resolves httpmsg.DefaultUserAgent() at request time picks it up. The
+	// selector is "preset" (default, self-identifying string), "random"/"" (a
+	// rotating browser string), or a literal; VIGOLIUM_DEFAULT_UA still wins at
+	// resolution time.
 	httpmsg.SetDefaultUserAgent(settings.ScanningStrategy.HTTP.UserAgent)
 
-	return &settings, nil
+	return &settings, warnings, nil
+}
+
+// unknownKeyWarning decodes content a second time with KnownFields on and
+// reports the keys that match no struct field, or "" when there are none.
+//
+// A second decode rather than one strict decode, because strictness here must
+// never fail the load: a config written for a newer vigolium, or one carrying a
+// key a build dropped, should still apply everything it CAN. But a typo
+// (`default_stratgy`) is silently inert, and "I set it and nothing changed" is
+// the single most expensive kind of configuration bug to chase.
+//
+// The throwaway destination is a zero Settings rather than defaults: nothing is
+// read out of it, and building defaults twice per load is wasted work.
+//
+// The answer is memoized per exact (path, content), because the strict decode is
+// half the cost of a whole load and its only output is a diagnostic the CLI
+// already dedupes to one line per process. A scan loads settings five times, so
+// four of those decodes could not produce anything observable. Keyed on the
+// content itself, so a file that changes mid-process is re-checked rather than
+// answered from a stale verdict.
+func unknownKeyWarning(path, content string) string {
+	cacheKey := path + "\x00" + content
+	if cached, ok := unknownKeyCache.Load(cacheKey); ok {
+		return cached.(string)
+	}
+	msg := computeUnknownKeyWarning(path, content)
+	unknownKeyCache.Store(cacheKey, msg)
+	return msg
+}
+
+// unknownKeyCache memoizes unknownKeyWarning. Bounded by the number of distinct
+// config contents a process reads, which is one or two.
+var unknownKeyCache sync.Map
+
+func computeUnknownKeyWarning(path, content string) string {
+	unknown := unknownKeyErrors(content, &Settings{})
+	if len(unknown) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("config file %s has %d key(s) vigolium does not recognize (they have no effect): %s",
+		path, len(unknown), strings.Join(unknown, "; "))
+}
+
+// unknownKeyErrors decodes content into into with KnownFields on and returns
+// the decoder's "field X not found in type T" lines, one per unknown key. The
+// throwaway destination is a zero value rather than defaults: nothing is read
+// out of it. Shared by the load-time warning and `config validate`, so both
+// name the same keys.
+func unknownKeyErrors(content string, into any) []string {
+	dec := yaml.NewDecoder(strings.NewReader(content))
+	dec.KnownFields(true)
+	err := dec.Decode(into)
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	// A *yaml.TypeError lists every offending key at once. Anything else here is
+	// a parse failure the lenient decode already accepted, so it is not an
+	// unknown key and saying "unknown key" about it would be wrong.
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
+		return nil
+	}
+	var unknown []string
+	for _, e := range typeErr.Errors {
+		if strings.Contains(e, "not found in type") {
+			unknown = append(unknown, e)
+		}
+	}
+	return unknown
 }
 
 // DefaultSettings returns default configuration
@@ -307,12 +522,20 @@ func ReadActiveProject() (string, error) {
 
 // WriteActiveProject persists the active project UUID to disk so that future
 // shells/commands resolve to it without needing VIGOLIUM_PROJECT_UUID.
+//
+// Atomic (temp file + rename): every command that resolves a project without a
+// flag or env pin reads this file, so a concurrent reader must see the old UUID
+// or the new one, never an empty or half-written file that silently resolves
+// to the default project.
 func WriteActiveProject(projectUUID string) error {
 	path := ActiveProjectFilePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("failed to create vigolium config dir: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(projectUUID+"\n"), 0600); err != nil {
+	if err := atomicfile.WriteFile(path, 0o600, func(w *bufio.Writer) error {
+		_, err := w.WriteString(projectUUID + "\n")
+		return err
+	}); err != nil {
 		return fmt.Errorf("failed to write active project file: %w", err)
 	}
 	return nil
@@ -337,91 +560,50 @@ func LoadProjectConfig(projectUUID string) (*ProfileSettings, error) {
 }
 
 // LoadSettingsWithProject loads global settings, then overlays project-specific
-// config on top. This implements the merge strategy: global → project → CLI flags.
-// CLI flag overrides happen after this function returns.
+// config on top (ApplyProjectOverlay). This implements the merge strategy:
+// global → project → scanning profile → CLI flags; the profile and CLI layers
+// are applied by the caller after this returns.
 func LoadSettingsWithProject(configPath string, projectUUID string) (*Settings, error) {
 	settings, err := LoadSettings(configPath)
 	if err != nil {
 		return nil, err
 	}
-
-	if projectUUID == "" {
-		return settings, nil
+	if err := ApplyProjectOverlay(settings, projectUUID); err != nil {
+		return nil, err
 	}
-
-	profile, err := LoadProjectConfig(projectUUID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load project config for %s: %w", projectUUID, err)
-	}
-	if profile == nil {
-		return settings, nil
-	}
-
-	if err := ApplyProfile(settings, profile); err != nil {
-		return nil, fmt.Errorf("failed to apply project config: %w", err)
-	}
-
 	return settings, nil
 }
 
-// SaveProjectConfig writes a project config overlay to its config directory.
-func SaveProjectConfig(projectUUID string, profile *ProfileSettings) error {
-	dir := ProjectConfigDir(projectUUID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create project config directory: %w", err)
-	}
+// Without --config, LoadSettings reads the first of these that exists.
+const (
+	homeConfigFile = "~/.vigolium/vigolium-configs.yaml"
+	cwdConfigFile  = "./vigolium-configs.yaml"
+)
 
-	data, err := yaml.Marshal(profile)
-	if err != nil {
-		return fmt.Errorf("failed to marshal project config: %w", err)
-	}
-
-	path := ProjectConfigPath(projectUUID)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("failed to write project config: %w", err)
-	}
-
-	return nil
-}
-
-// ConfigFilePath returns the resolved path to the config file.
-// It searches the same locations as LoadSettings but only returns the path.
-// If no config file exists, returns the default path.
-func ConfigFilePath() string {
-	paths := []string{
-		ExpandPath("~/.vigolium/vigolium-configs.yaml"),
-		"./vigolium-configs.yaml",
-	}
-
-	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			return p
+// discoverConfigFile returns the config file LoadSettings reads without
+// --config, or "" when there is none. ONLY a missing file falls through to the
+// next candidate: a permission error, a dangling symlink or an I/O error on
+// ~/.vigolium means the operator's config exists and could not be looked at,
+// and silently continuing to the next candidate (or to defaults) would answer
+// that with a scan configured by nobody. The error names the path it hit.
+func discoverConfigFile() (string, error) {
+	for _, p := range []string{ExpandPath(homeConfigFile), cwdConfigFile} {
+		_, err := os.Stat(p)
+		if err == nil {
+			return p, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return p, err
 		}
 	}
-
-	return ExpandPath("~/.vigolium/vigolium-configs.yaml")
+	return "", nil
 }
 
-// SaveSettings writes settings to YAML file
-func SaveSettings(path string, settings *Settings) error {
-	path = ExpandPath(path)
-
-	// Ensure parent directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
+// ConfigFilePath returns the config file LoadSettings reads, or the default
+// path when none exists (or discovery failed).
+func ConfigFilePath() string {
+	if p, err := discoverConfigFile(); err == nil && p != "" {
+		return p
 	}
-
-	// Marshal to YAML
-	data, err := yaml.Marshal(settings)
-	if err != nil {
-		return fmt.Errorf("failed to marshal settings: %w", err)
-	}
-
-	// Write to file
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
-	}
-
-	return nil
+	return ExpandPath(homeConfigFile)
 }

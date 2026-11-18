@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Injects OAST (Out-of-Band Application Security Testing) callback URLs into HTTP headers
-and URL-like parameters to detect blind vulnerabilities such as blind SSRF, blind XXE,
-and blind command injection.
+	ModuleDesc = `**What it means:** A backend, reverse proxy, or routing layer was tricked into an outbound request to an attacker-chosen destination, confirmed by an out-of-band DNS or HTTP callback. This is blind server-side request forgery (SSRF) from a URL in a request header or parameter.
 
-## Notes
-- Requires an interactsh server (configured via oast settings)
-- Injects unique callback URLs into headers: Referer, X-Forwarded-For, X-Forwarded-Host, Origin, X-Original-URL
-- For insertion point scanning, targets parameters with URL-like values
-- Findings arrive asynchronously via the polling callback — this module returns nil results directly
-- DNS-only callbacks are reported as Info; HTTP callbacks are reported as High severity
-- OWASP Top 10 2021: A10 (SSRF)
+**How it's exploited:** An attacker injects an internal address (cloud metadata, admin panels, private hosts) into the same field to reach systems only the server can access, enabling credential theft, reconnaissance, or pivoting deeper.
 
-## References
-- https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
-- https://portswigger.net/burp/documentation/collaborator`
+**Fix:** Validate and allowlist outbound destinations, block internal and link-local ranges, and stop backends from fetching attacker-controlled URLs.`
 
 	ModuleConfirmation = "Confirmed when target server makes outbound DNS or HTTP request to OAST callback URL"
 	ModuleSeverity     = severity.High

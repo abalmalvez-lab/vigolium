@@ -5,7 +5,6 @@ import (
 
 	"github.com/pkg/errors"
 	urlutil "github.com/projectdiscovery/utils/url"
-	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -13,46 +12,6 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 )
-
-// wildcardShellFinding rejects findings whose response is indistinguishable
-// from the host's wildcard / SPA shell. Compares status + body length + head
-// against both a same-host random-path probe and the original baseline (so a
-// PUT returning the same SPA index.html as GET / is not reported).
-func looksLikeWildcardShell(
-	statusCode int,
-	body []byte,
-	wildcard *modkit.WildcardEntry,
-	baseline *modkit.BaselineEntry,
-) bool {
-	if wildcard != nil && wildcard.MatchesBody(statusCode, body) {
-		return true
-	}
-	if baseline == nil || baseline.Response == nil {
-		return false
-	}
-	if statusCode != baseline.StatusCode {
-		return false
-	}
-	if baseline.BodyLen == 0 || len(body) == 0 {
-		return false
-	}
-	diff := baseline.BodyLen - len(body)
-	if diff < 0 {
-		diff = -diff
-	}
-	if float64(diff)/float64(baseline.BodyLen) > 0.10 {
-		return false
-	}
-	baseHead := baseline.Response.Body()
-	if len(baseHead) > 256 {
-		baseHead = baseHead[:256]
-	}
-	probeHead := body
-	if len(probeHead) > 256 {
-		probeHead = probeHead[:256]
-	}
-	return string(baseHead) == string(probeHead)
-}
 
 // dangerousMethods are write methods that should not be blindly enabled.
 var dangerousMethods = []string{"PUT", "DELETE", "PATCH", "MKCOL", "MOVE", "COPY"}
@@ -106,155 +65,157 @@ func (m *Module) ScanPerRequest(
 	if !infra.IsValidForInjectionVulns(urlx, ctx) {
 		return nil, nil
 	}
+	// Generic method discovery must not mutate a real resource. PUT, PATCH,
+	// DELETE, MOVE, COPY, and POST-with-DELETE-override can all have irreversible
+	// effects, and a 2xx response still would not prove what state changed. Limit
+	// this module to an idempotent GET seed plus safe OPTIONS semantics.
+	if ctx.Request() == nil || !strings.EqualFold(ctx.Request().Method(), "GET") ||
+		ctx.Response() == nil || ctx.Response().StatusCode() < 200 || ctx.Response().StatusCode() >= 300 {
+		return nil, nil
+	}
 
 	if !m.markAndShouldContinue(urlx, scanCtx) {
 		return nil, nil
 	}
 
-	// Only test on endpoints that originally return 2xx (GET endpoints)
-	origStatus := 0
-	if ctx.Response() != nil {
-		origStatus = ctx.Response().StatusCode()
+	options, ok := m.fetchSafeMethodResponse(ctx, httpClient, "OPTIONS", "", "")
+	if !ok {
+		return nil, nil
 	}
-
-	// Fetch a wildcard probe and a same-method baseline so we can reject
-	// findings whose response is just the host's SPA / wildcard shell. If
-	// the probe itself errors out we fall back to running without it.
-	wildcard, _ := scanCtx.WildcardProbe(ctx, httpClient)
-	baseline, _ := scanCtx.GetOrFetchBaseline(ctx, httpClient)
-
 	var results []*output.ResultEvent
-
-	// Phase 1: Test dangerous methods on 2xx endpoints
-	if origStatus >= 200 && origStatus < 300 {
-		r, err := m.testDangerousMethods(urlx, ctx, httpClient, wildcard, baseline)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, r...)
+	if declared := declaredDangerousMethods(options.allow, options.corsAllow); len(declared) > 0 {
+		results = append(results, safeMethodObservation(
+			urlx,
+			"Server Declares Write-Oriented HTTP Methods",
+			"The OPTIONS response advertises write-oriented methods. This is capability metadata only; it does not show that an unauthenticated write succeeds or that any state changes.",
+			"OPTIONS",
+			options,
+			[]string{"declared_methods=" + strings.Join(declared, ",")},
+		))
 	}
 
-	// Phase 2: Test method override headers
-	r, err := m.testMethodOverrideHeaders(urlx, ctx, httpClient, wildcard, baseline)
-	if err != nil {
-		return nil, err
+	getResponse, getOK := m.fetchSafeMethodResponse(ctx, httpClient, "GET", "", "")
+	getReplay, replayOK := m.fetchSafeMethodResponse(ctx, httpClient, "GET", "", "")
+	if !getOK || !replayOK || !safeResponsesSimilar(getResponse, getReplay) {
+		return results, nil
 	}
-	results = append(results, r...)
-
-	return results, nil
-}
-
-// testDangerousMethods sends PUT/DELETE/PATCH to see if they are unexpectedly enabled.
-func (m *Module) testDangerousMethods(
-	urlx *urlutil.URL,
-	ctx *httpmsg.HttpRequestResponse,
-	httpClient *http.Requester,
-	wildcard *modkit.WildcardEntry,
-	baseline *modkit.BaselineEntry,
-) ([]*output.ResultEvent, error) {
-	var results []*output.ResultEvent
-
-	for _, method := range dangerousMethods {
-		// Skip if the original request already uses this method
-		if strings.EqualFold(ctx.Request().Method(), method) {
-			continue
-		}
-
-		modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), method)
-		if err != nil {
-			continue
-		}
-
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-		if err != nil {
-			continue
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
-
-		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
-		if err != nil {
-			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
-				return results, nil
-			}
-			continue
-		}
-
-		if resp.Response() != nil && isSuccessfulMethod(resp.Response().StatusCode, resp.FullResponseString()) &&
-			!looksLikeWildcardShell(resp.Response().StatusCode, resp.Body().Bytes(), wildcard, baseline) {
-			results = append(results, &output.ResultEvent{
-				URL:              urlx.String(),
-				Request:          string(modifiedRaw),
-				Response:         resp.FullResponseString(),
-				FuzzingParameter: "method",
-				ExtractedResults: []string{method + " method returned 2xx"},
-				Info: output.Info{
-					Description: "Dangerous HTTP method " + method + " is enabled on this endpoint",
-				},
-			})
-			resp.Close()
-			return results, nil
-		}
-		resp.Close()
-	}
-
-	return results, nil
-}
-
-// testMethodOverrideHeaders tests if method override headers change server behavior.
-func (m *Module) testMethodOverrideHeaders(
-	urlx *urlutil.URL,
-	ctx *httpmsg.HttpRequestResponse,
-	httpClient *http.Requester,
-	wildcard *modkit.WildcardEntry,
-	baseline *modkit.BaselineEntry,
-) ([]*output.ResultEvent, error) {
-	var results []*output.ResultEvent
-
 	for _, header := range methodOverrideHeaders {
-		for _, overrideMethod := range []string{"DELETE", "PUT"} {
-			modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "POST")
-			if err != nil {
-				continue
-			}
-			modifiedRaw, err = httpmsg.AddOrReplaceHeader(modifiedRaw, header, overrideMethod)
-			if err != nil {
-				continue
-			}
+		first, firstOK := m.fetchSafeMethodResponse(ctx, httpClient, "GET", header, "OPTIONS")
+		second, secondOK := m.fetchSafeMethodResponse(ctx, httpClient, "GET", header, "OPTIONS")
+		if !firstOK || !secondOK ||
+			!safeResponsesSimilar(first, second) ||
+			!safeResponsesSimilar(first, options) ||
+			safeResponsesSimilar(first, getResponse) {
+			continue
+		}
+		results = append(results, safeMethodObservation(
+			urlx,
+			"HTTP Method Override Mechanism Observed",
+			"A GET carrying "+header+": OPTIONS reproduced the direct OPTIONS response twice and differed from the normal GET. This proves override capability only; no privileged or state-changing method was invoked.",
+			header,
+			first,
+			[]string{"visible_method=GET", "override_header=" + header, "override_value=OPTIONS", "replay_count=2"},
+		))
+		break
+	}
+	return results, nil
+}
 
-			fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-			if err != nil {
-				continue
-			}
-			fuzzedReq = fuzzedReq.WithService(ctx.Service())
+type safeMethodResponse struct {
+	status      int
+	body        string
+	contentType string
+	allow       string
+	corsAllow   string
+	request     string
+	response    string
+}
 
-			resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
-			if err != nil {
-				if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
-					return results, nil
-				}
-				continue
-			}
-
-			if resp.Response() != nil && isSuccessfulMethod(resp.Response().StatusCode, resp.FullResponseString()) &&
-				!looksLikeWildcardShell(resp.Response().StatusCode, resp.Body().Bytes(), wildcard, baseline) {
-				results = append(results, &output.ResultEvent{
-					URL:              urlx.String(),
-					Request:          string(modifiedRaw),
-					Response:         resp.FullResponseString(),
-					FuzzingParameter: header,
-					ExtractedResults: []string{"POST with " + header + ": " + overrideMethod},
-					Info: output.Info{
-						Description: "Method override header " + header + " is respected (overrides to " + overrideMethod + ")",
-					},
-				})
-				resp.Close()
-				return results, nil
-			}
-			resp.Close()
+func (m *Module) fetchSafeMethodResponse(ctx *httpmsg.HttpRequestResponse, client *http.Requester, method, header, value string) (safeMethodResponse, bool) {
+	raw, err := httpmsg.SetMethod(ctx.Request().Raw(), method)
+	if err != nil {
+		return safeMethodResponse{}, false
+	}
+	if header != "" {
+		raw, err = httpmsg.AddOrReplaceHeader(raw, header, value)
+		if err != nil {
+			return safeMethodResponse{}, false
 		}
 	}
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
+	resp, _, err := client.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
+	if err != nil || resp == nil || resp.Response() == nil {
+		if resp != nil {
+			resp.Close()
+		}
+		return safeMethodResponse{}, false
+	}
+	defer resp.Close()
+	if infra.IsBlockedResponse(resp) || resp.Response().StatusCode >= 500 {
+		return safeMethodResponse{}, false
+	}
+	return safeMethodResponse{
+		status:      resp.Response().StatusCode,
+		body:        resp.BodyString(),
+		contentType: resp.Response().Header.Get("Content-Type"),
+		allow:       resp.Response().Header.Get("Allow"),
+		corsAllow:   resp.Response().Header.Get("Access-Control-Allow-Methods"),
+		request:     string(raw),
+		response:    resp.FullResponseString(),
+	}, true
+}
 
-	return results, nil
+func declaredDangerousMethods(values ...string) []string {
+	wanted := make(map[string]bool, len(dangerousMethods))
+	for _, method := range dangerousMethods {
+		wanted[method] = true
+	}
+	seen := make(map[string]bool)
+	var declared []string
+	for _, value := range values {
+		for _, token := range strings.FieldsFunc(strings.ToUpper(value), func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+			if wanted[token] && !seen[token] {
+				seen[token] = true
+				declared = append(declared, token)
+			}
+		}
+	}
+	return declared
+}
+
+func safeResponsesSimilar(left, right safeMethodResponse) bool {
+	if left.status != right.status || !strings.EqualFold(strings.TrimSpace(strings.Split(left.contentType, ";")[0]), strings.TrimSpace(strings.Split(right.contentType, ";")[0])) {
+		return false
+	}
+	if left.body == "" || right.body == "" {
+		return left.body == right.body
+	}
+	leftSig := modkit.NewResponseSignature(left.status, left.body, "OPTIONS")
+	rightSig := modkit.NewResponseSignature(right.status, right.body, "OPTIONS")
+	return modkit.RatioSimilar(leftSig, rightSig)
+}
+
+func safeMethodObservation(urlx *urlutil.URL, name, description, fuzzingParameter string, response safeMethodResponse, extracted []string) *output.ResultEvent {
+	return &output.ResultEvent{
+		ModuleID:         ModuleID,
+		RecordKind:       output.RecordKindObservation,
+		EvidenceGrade:    output.EvidenceGradeObservation,
+		Host:             urlx.Host,
+		URL:              urlx.String(),
+		Matched:          urlx.String(),
+		Request:          response.request,
+		Response:         response.response,
+		FuzzingParameter: fuzzingParameter,
+		ExtractedResults: extracted,
+		Info: output.Info{
+			Name:        name,
+			Description: description,
+			Severity:    ModuleSeverity,
+			Confidence:  ModuleConfidence,
+			Tags:        ModuleTags,
+		},
+		Metadata: map[string]any{"state_change_observed": false, "authorization_bypass_observed": false, "safe_probe_only": true},
+	}
 }
 
 // isSuccessfulMethod checks if a response indicates the method was accepted.
@@ -268,7 +229,13 @@ func isSuccessfulMethod(statusCode int, body string) bool {
 	if strings.Contains(bodyLower, "method not allowed") ||
 		strings.Contains(bodyLower, "not supported") ||
 		strings.Contains(bodyLower, "/login") ||
-		strings.Contains(bodyLower, "/signin") {
+		strings.Contains(bodyLower, "/signin") ||
+		// Framework soft-errors: a 200 that is actually a session/CSRF/validation
+		// rejection, not a performed action. Salesforce Aura answers ANY verb
+		// (including DELETE) with an aura:invalidSession / exceptionEvent event at
+		// HTTP 200 — the action never ran, so this is not a "successful" method.
+		strings.Contains(bodyLower, "aura:invalidsession") ||
+		strings.Contains(bodyLower, "\"exceptionevent\"") {
 		return false
 	}
 

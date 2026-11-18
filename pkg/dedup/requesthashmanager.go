@@ -19,6 +19,7 @@ type Option struct {
 	Body                   bool
 	AllParamKeys           bool
 	AllParamKV             bool
+	Identity               bool
 }
 
 // DefaultOption provides sensible defaults for request hashing.
@@ -29,6 +30,7 @@ var DefaultOption = Option{
 	InjectingParamName:     true,
 	InjectingParamPosition: true,
 	AllParamKeys:           true,
+	Identity:               true,
 
 	InjectingParamValue: false,
 	AllParamKV:          false,
@@ -91,7 +93,7 @@ func (m *RequestHashManager) ShouldCheck3(
 	urlx *urlutil.URL,
 	method, body, paramName, paramValue, paramPosition string,
 ) bool {
-	rHash := m.hash(urlx, method, body, paramName, paramValue, paramPosition)
+	rHash := m.hash(urlx, method, body, paramName, paramValue, paramPosition, "anonymous")
 	return !m.diskSet.IsSeen(rHash)
 }
 
@@ -120,8 +122,19 @@ func (m *RequestHashManager) ShouldCheckInsertionPoint(
 	request *httpmsg.HttpRequest,
 	paramName, paramValue, paramType string,
 ) bool {
-	rHash := m.hash(urlx, request.Method(), string(request.Body()), paramName, paramValue, paramType)
+	rHash := m.hash(urlx, request.Method(), m.bodyForHash(request), paramName, paramValue, paramType, request.IdentityFingerprint())
 	return !m.diskSet.IsSeen(rHash)
+}
+
+// bodyForHash returns the request body only when the body is actually part of
+// the hash. By default (DefaultOption.Body == false) the body is never hashed,
+// so materializing string(request.Body()) per insertion point is pure waste —
+// a request with K insertion points would otherwise pay K full-body copies.
+func (m *RequestHashManager) bodyForHash(request *httpmsg.HttpRequest) string {
+	if !m.option.Body || request == nil {
+		return ""
+	}
+	return string(request.Body())
 }
 
 // hasOrAdd returns true if the request exists in the data.
@@ -141,7 +154,7 @@ func (m *RequestHashManager) hasOrAdd(
 		paramValue = param.Value()
 		paramPosition = param.Type().String()
 	}
-	rHash := m.hash(urlx, method, string(request.Body()), paramName, paramValue, paramPosition)
+	rHash := m.hash(urlx, method, m.bodyForHash(request), paramName, paramValue, paramPosition, request.IdentityFingerprint())
 	return m.diskSet.IsSeen(rHash)
 }
 
@@ -154,7 +167,7 @@ func (m *RequestHashManager) hash(
 	urlx *urlutil.URL,
 	method string,
 	body string,
-	paramName, paramValue, paramPosition string,
+	paramName, paramValue, paramPosition, identity string,
 ) string {
 	h := fnv.New64a()
 	if m.option.Method {
@@ -193,6 +206,9 @@ func (m *RequestHashManager) hash(
 	}
 	if m.option.Body {
 		h.Write([]byte(body))
+	}
+	if m.option.Identity {
+		h.Write([]byte(identity))
 	}
 	return strconv.FormatUint(h.Sum64(), 16)
 }

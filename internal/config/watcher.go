@@ -24,12 +24,42 @@ type ConfigWatcher struct {
 	stopCh     chan struct{}
 	once       sync.Once
 
+	// applyMu guards the in-place swap of hot-reloadable settings sections in
+	// reload() against concurrent readers. reload() takes the write lock so the
+	// whole apply is atomic; readers of a reloadable section on a concurrent path
+	// (e.g. the ingest scope matcher) take RLock so they never observe a
+	// half-applied mix of sections or a torn slice/map header mid-assignment.
+	applyMu sync.RWMutex
+
 	onReloadMu sync.RWMutex
 	onReload   []func(changed []string)
 }
 
+// RLock/RUnlock let readers of hot-reloadable settings sections coordinate with
+// reload()'s in-place section swaps. Reading a section (which may hold slices or
+// maps) while reload() reassigns it is a data race; bracketing the read in
+// RLock/RUnlock serializes it against the apply. Safe to call on a nil watcher.
+func (cw *ConfigWatcher) RLock() {
+	if cw != nil {
+		cw.applyMu.RLock()
+	}
+}
+
+// RUnlock releases the reload read lock taken by RLock.
+func (cw *ConfigWatcher) RUnlock() {
+	if cw != nil {
+		cw.applyMu.RUnlock()
+	}
+}
+
 // reloadableSections lists config sections that can be hot-reloaded at runtime.
 // server and database require a restart.
+//
+// agent is reloadable: the server-wide agent engine reads settings.Agent.Olium
+// fresh on every run and builds a new provider from it, so swapping the agent
+// section in the shared Settings pointer makes the next agent request pick up
+// the new olium provider/model/credentials without a restart. (Route
+// registration — e.g. --no-agent — is still fixed at startup.)
 var reloadableSections = map[string]bool{
 	"scope":              true,
 	"notify":             true,
@@ -38,6 +68,7 @@ var reloadableSections = map[string]bool{
 	"scanning_strategy":  true,
 	"scanning_pace":      true,
 	"storage":            true,
+	"agent":              true,
 }
 
 // NewConfigWatcher creates a watcher for the given config file.
@@ -186,7 +217,10 @@ func (cw *ConfigWatcher) reload() {
 		return
 	}
 
-	// Apply reloadable sections
+	// Apply reloadable sections under the write lock so a concurrent reader
+	// holding RLock never observes a half-applied mix of old and new sections or
+	// a torn slice/map header mid-assignment.
+	cw.applyMu.Lock()
 	for _, section := range changed {
 		switch section {
 		case "scope":
@@ -203,8 +237,11 @@ func (cw *ConfigWatcher) reload() {
 			cw.settings.ScanningPace = newSettings.ScanningPace
 		case "storage":
 			cw.settings.Storage = newSettings.Storage
+		case "agent":
+			cw.settings.Agent = newSettings.Agent
 		}
 	}
+	cw.applyMu.Unlock()
 
 	zap.L().Info("Hot-reloaded config sections",
 		zap.Strings("sections", changed))

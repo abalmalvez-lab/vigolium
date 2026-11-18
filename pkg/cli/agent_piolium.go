@@ -24,7 +24,7 @@ import (
 func setupAuditStreamWriter(streamToConsole bool, sessionDir string) (io.Writer, func()) {
 	var w io.Writer
 	if streamToConsole {
-		w = os.Stdout
+		w = agentStreamSink()
 	}
 	if tee, closer := teeToRuntimeLog(w, sessionDir); closer != nil {
 		return tee, func() { _ = closer.Close() }

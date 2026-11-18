@@ -9,24 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects LDAP injection vulnerabilities by injecting malformed LDAP filter expressions into
-parameters that are likely used in LDAP queries (e.g., username, search, filter). Uses both
-error-based detection (checking for LDAP error messages in responses) and boolean-based
-detection (comparing responses with wildcard vs. baseline).
+	ModuleDesc = `**What it means:** A parameter feeding an LDAP query (username, uid, cn, or filter) is built into the filter without escaping, so attacker input can alter the query structure. Confirmed by injected syntax provoking an LDAP error.
 
-## Notes
-- Only tests parameters whose name suggests LDAP usage (username, uid, cn, filter, etc.)
-- Checks for LDAP error messages that were not present in the baseline response
-- Boolean-based detection uses a 3-way differential: the wildcard probe must
-  diverge from BOTH the baseline AND a no-match control probe by a substantial
-  body delta (absolute and relative), filtering out endpoints that simply
-  reflect any user input
-- Deduplication via RHM to avoid redundant requests
+**How it's exploited:** An attacker injects LDAP metacharacters (such as *, )(objectClass=*, or *)(uid=*) to break out of the filter, bypassing authentication or expanding it with wildcards to enumerate directory entries, leaking usernames and group membership.
 
-## References
-- https://owasp.org/www-community/attacks/LDAP_Injection
-- https://cheatsheetseries.owasp.org/cheatsheets/LDAP_Injection_Prevention_Cheat_Sheet.html`
+**Fix:** Escape all special characters in user input before placing it in an LDAP filter (per RFC 4515), and validate the input format.`
 
 	ModuleConfirmation = "Confirmed when injected LDAP filter syntax triggers error messages or produces differential responses indicating filter manipulation"
 	ModuleSeverity     = severity.Medium

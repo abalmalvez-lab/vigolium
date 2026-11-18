@@ -144,6 +144,85 @@ func TestFormatScreenIncludesExtractedAndFuzzing(t *testing.T) {
 	assert.Contains(t, out, "[id]", "fuzzing parameter rendered")
 }
 
+func TestFormatScreenTruncationRespectsTTY(t *testing.T) {
+	// A URL far longer than the 150-column TerminalWidth fallback.
+	longURL := "https://example.com/" + strings.Repeat("a", 300)
+	w := &StandardWriter{}
+	ev := &ResultEvent{ModuleID: "m", Info: Info{Severity: severity.Info}, Matched: longURL}
+
+	prev := terminal.IsTerminal()
+	defer terminal.SetIsTerminal(prev)
+
+	// Non-TTY (file/pipe, e.g. parallel-scan .console.log): full line, no ellipsis.
+	terminal.SetIsTerminal(false)
+	out := terminal.StripANSI(string(w.formatScreen(ev)))
+	assert.Contains(t, out, longURL, "redirected output must keep the full URL")
+	assert.NotContains(t, out, "…", "redirected output must not be truncated")
+
+	// Interactive TTY: width-based truncation kicks in and clips with an ellipsis.
+	terminal.SetIsTerminal(true)
+	out = terminal.StripANSI(string(w.formatScreen(ev)))
+	assert.NotContains(t, out, longURL, "terminal output should truncate a long URL")
+	assert.Contains(t, out, "…", "terminal output should mark truncation with an ellipsis")
+}
+
+func TestFormatScreenNonTTYCapsSuffixKeepsURL(t *testing.T) {
+	// A finding with an unbounded extracted-results suffix (e.g. unsafe-html-sink
+	// emitting one snippet per match in a large JS bundle) must keep the full URL
+	// in file/pipe output but cap the evidence suffix at maxFileSuffixWidth.
+	longURL := "https://example.com/" + strings.Repeat("a", 300)
+	snippets := make([]string, 20)
+	for i := range snippets {
+		snippets[i] = strings.Repeat("x", 150)
+	}
+	w := &StandardWriter{}
+	ev := &ResultEvent{
+		ModuleID:         "unsafe-html-sink",
+		Info:             Info{Severity: severity.Low},
+		Matched:          longURL,
+		ExtractedResults: snippets,
+	}
+
+	prev := terminal.IsTerminal()
+	defer terminal.SetIsTerminal(prev)
+	terminal.SetIsTerminal(false)
+
+	out := terminal.StripANSI(string(w.formatScreen(ev)))
+	assert.Contains(t, out, longURL, "non-TTY output must keep the full URL")
+	assert.Contains(t, out, "…", "oversized suffix must be truncated with an ellipsis")
+	assert.LessOrEqual(t, len(out), len("[unsafe-html-sink] ")+len(terminal.LowSymbol())+len(" [ low] ")+len(longURL)+maxFileSuffixWidth+8,
+		"suffix must be capped at maxFileSuffixWidth")
+
+	// A modest suffix stays intact.
+	ev.ExtractedResults = []string{"root", "admin"}
+	out = terminal.StripANSI(string(w.formatScreen(ev)))
+	assert.Contains(t, out, "[root,admin]")
+	assert.NotContains(t, out, "…")
+}
+
+func TestFormatScreenEscapesMultilineExtracted(t *testing.T) {
+	// Snippets with embedded newlines (regex context windows over pretty-printed
+	// JS) must render as a single line in every mode, with the newlines shown as
+	// literal \n escapes rather than as real line breaks that fracture the line.
+	w := &StandardWriter{}
+	ev := &ResultEvent{
+		ModuleID:         "unsafe-html-sink",
+		Info:             Info{Severity: severity.Low},
+		Matched:          "https://h/app.js",
+		ExtractedResults: []string{"dropdownContent) {\n      dropdownContent.innerHTML = \"\";\r\n      next"},
+	}
+
+	prev := terminal.IsTerminal()
+	defer terminal.SetIsTerminal(prev)
+	for _, tty := range []bool{false, true} {
+		terminal.SetIsTerminal(tty)
+		out := terminal.StripANSI(string(w.formatScreen(ev)))
+		assert.NotContains(t, out, "\n", "finding must render as one line, no real newlines (tty=%v)", tty)
+		assert.NotContains(t, out, "\r", "carriage returns must be escaped (tty=%v)", tty)
+		assert.Contains(t, out, `dropdownContent) {\n      dropdownContent.innerHTML = "";\n      next`, "newlines escaped to literal \\n, indentation preserved (tty=%v)", tty)
+	}
+}
+
 func TestFormatScreenPrependsHTTPMethod(t *testing.T) {
 	w := &StandardWriter{}
 	ev := &ResultEvent{
@@ -154,4 +233,41 @@ func TestFormatScreenPrependsHTTPMethod(t *testing.T) {
 	}
 	out := terminal.StripANSI(string(w.formatScreen(ev)))
 	assert.Contains(t, out, "POST https://h/login", "HTTP method prepended to matched URL")
+}
+
+func TestFormatScreenPatternLabelBracket(t *testing.T) {
+	// A finding that carries Metadata["pattern"] renders the label as a leading
+	// bracket immediately before the extracted value (secret-detect's use case:
+	// naming the credential family, e.g. `[JWT] [eyJ…]`).
+	w := &StandardWriter{}
+	ev := &ResultEvent{
+		ModuleID:         "secret-detect",
+		ModuleType:       "passive",
+		Info:             Info{Severity: severity.Medium},
+		Matched:          "https://h/app.js",
+		ExtractedResults: []string{"eyJhbGci.eyJzdWIi.sig"},
+		Metadata:         map[string]any{"pattern": "JWT"},
+	}
+
+	prev := terminal.IsTerminal()
+	defer terminal.SetIsTerminal(prev)
+	terminal.SetIsTerminal(false)
+
+	out := terminal.StripANSI(string(w.formatScreen(ev)))
+	assert.Contains(t, out, "[JWT] [eyJhbGci.eyJzdWIi.sig]", "pattern label bracket precedes the extracted value")
+}
+
+func TestFormatScreenNoPatternLabelUnchanged(t *testing.T) {
+	// A finding with no pattern metadata renders exactly as before — no stray
+	// leading bracket — so non-opted-in modules are untouched.
+	w := &StandardWriter{}
+	ev := &ResultEvent{
+		ModuleID:         "unsafe-html-sink",
+		Info:             Info{Severity: severity.Low},
+		Matched:          "https://h/app.js",
+		ExtractedResults: []string{"alert(1)"},
+	}
+	out := terminal.StripANSI(string(w.formatScreen(ev)))
+	assert.Contains(t, out, "[alert(1)]")
+	assert.NotContains(t, out, "] [alert(1)]", "no empty pattern bracket when metadata absent")
 }

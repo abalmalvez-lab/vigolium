@@ -16,20 +16,13 @@ import (
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/notify/webhook"
 	"github.com/vigolium/vigolium/pkg/storage"
-	"github.com/vigolium/vigolium/pkg/types"
 	"go.uber.org/zap"
 )
-
-// nativeScanUploadFormats is the set of per-format output files the API
-// upload helper looks for under <scanDir>/output.<ext>. Kept narrow because
-// API-launched scans only ever emit these formats today (see
-// resolveAPIOutputFormats in handlers_scan.go).
-var nativeScanUploadFormats = []string{"jsonl", "html"}
 
 // persistAgenticScan creates an agentic_scans DB record for a new agent run.
 // Returns ErrScanProjectMismatch when the caller pinned a UUID that already
 // exists under a different project; other errors are logged but not returned.
-func (h *Handlers) persistAgenticScan(agenticScanUUID, mode, agentName string) error {
+func (h *Handlers) persistAgenticScan(agenticScanUUID, mode, agentName, projectUUID string) error {
 	if h.repo == nil {
 		return nil
 	}
@@ -38,13 +31,14 @@ func (h *Handlers) persistAgenticScan(agenticScanUUID, mode, agentName string) e
 		protocol, model = h.settings.Agent.BackendMeta()
 	}
 	run := &database.AgenticScan{
-		UUID:      agenticScanUUID,
-		Mode:      mode,
-		AgentName: agentName,
-		Protocol:  protocol,
-		Model:     model,
-		Status:    "running",
-		StartedAt: time.Now(),
+		UUID:        agenticScanUUID,
+		ProjectUUID: projectUUID,
+		Mode:        mode,
+		AgentName:   agentName,
+		Protocol:    protocol,
+		Model:       model,
+		Status:      "running",
+		StartedAt:   time.Now(),
 	}
 	// Detached on purpose: an agent run outlives the HTTP request that starts it,
 	// so its DB lifecycle is not tied to any request context.
@@ -82,6 +76,24 @@ func (h *Handlers) persistAgenticScanCompleted(agenticScanUUID string, status *A
 	}
 }
 
+// shedAgenticScanResult drops the heavy Result/SwarmResult blobs from the
+// in-memory status entry once the run's summary has been persisted. Those
+// structures are large and uncapped (the full model RawOutput plus findings and
+// HTTP records with bodies) and would otherwise sit in the long-lived status
+// map for the whole prune window, with /status/list snapshotting them under the
+// agent lock. The lightweight counters stay so /status/:id polling is still
+// served from memory; the full result is recoverable from the DB-backed finding
+// /record endpoints, and streaming clients already received it via the SSE
+// "done" event (which uses the local result, not this stored copy).
+func (h *Handlers) shedAgenticScanResult(agenticScanUUID string) {
+	h.agentMu.Lock()
+	if status, ok := h.agenticScanStatus[agenticScanUUID]; ok && status != nil {
+		status.Result = nil
+		status.SwarmResult = nil
+	}
+	h.agentMu.Unlock()
+}
+
 // effectiveAgentName returns the agent identifier recorded on AgenticScan
 // rows for this run. With the subprocess backend system removed, every run
 // is olium-backed, so we ignore the request-supplied agent name and always
@@ -99,9 +111,9 @@ func (h *Handlers) effectiveAgentName(agentName string) string {
 // sync). Anything else is a 500.
 func respondScanPinError(c fiber.Ctx, err error) error {
 	if errors.Is(err, database.ErrScanProjectMismatch) {
-		return c.Status(fiber.StatusConflict).JSON(ErrorResponse{Error: err.Error()})
+		return respondError(c, fiber.StatusConflict, err)
 	}
-	return c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{Error: err.Error()})
+	return respondError(c, fiber.StatusInternalServerError, err)
 }
 
 // registerRunningAgenticScan creates the in-memory + DB tracking for a new
@@ -109,20 +121,30 @@ func respondScanPinError(c fiber.Ctx, err error) error {
 // attach a remote-created scan record across nodes; otherwise a fresh UUID is
 // minted. Returns ErrScanProjectMismatch when pinUUID belongs to a different
 // project, which the caller should surface as HTTP 409.
-func (h *Handlers) registerRunningAgenticScan(mode, agentName, pinUUID string) (string, error) {
+func (h *Handlers) registerRunningAgenticScan(mode, agentName, pinUUID, projectUUID string) (string, error) {
 	agenticScanUUID := pinUUID
 	if agenticScanUUID == "" {
 		agenticScanUUID = uuid.New().String()
 	}
+	// Normalize so the DB row (which CreateAgenticScan defaults) and the in-memory
+	// status agree on ownership, and so project-scoping checks compare like for like.
+	if projectUUID == "" {
+		projectUUID = database.DefaultProjectUUID
+	}
 	effectiveAgentName := h.effectiveAgentName(agentName)
 
-	if err := h.persistAgenticScan(agenticScanUUID, mode, effectiveAgentName); err != nil {
+	// Persist with the project set at creation so the row is born correctly owned:
+	// this removes the incorrect-ownership window the old post-registration UPDATE
+	// left, and lets a pinned cross-node UUID in a non-default project pass
+	// CreateAgenticScan's project match instead of colliding with the default.
+	if err := h.persistAgenticScan(agenticScanUUID, mode, effectiveAgentName, projectUUID); err != nil {
 		return "", err
 	}
 
 	h.agentMu.Lock()
 	h.agenticScanStatus[agenticScanUUID] = &AgenticScanStatusResponse{
 		AgenticScanUUID: agenticScanUUID,
+		ProjectUUID:     projectUUID,
 		Mode:            mode,
 		Status:          "running",
 		AgentName:       effectiveAgentName,
@@ -189,12 +211,14 @@ func (h *Handlers) uploadAgenticResults(projectUUID, agenticScanUUID, sessionDir
 	zap.L().Info("Uploaded agentic scan results", zap.String("agentic_scan_uuid", agenticScanUUID), zap.String("storage_url", storageURL))
 }
 
-// uploadNativeScanResults bundles the per-scan runtime.log and any per-format
-// output files (jsonl/html) the runner emitted into a tar.gz under
-// <projectUUID>/native-scans/<scanUUID>/results.tar.gz. Mirrors the CLI
-// helper at pkg/cli/storage_upload.go. Missing files are skipped silently by
-// BundleAndUploadFiles.
-func (h *Handlers) uploadNativeScanResults(projectUUID, scanID string) {
+// uploadNativeScanResults bundles the per-scan runtime.log and the scan's
+// requested output files (outputs) into a tar.gz under
+// <projectUUID>/native-scans/<scanUUID>/results.tar.gz. Mirrors the CLI helper
+// at pkg/cli/storage_upload.go. A requested file that is
+// missing is logged at error level by name rather than silently left out of the
+// bundle, so an operator reading the logs can tell "not requested" from "failed
+// to produce".
+func (h *Handlers) uploadNativeScanResults(projectUUID, scanID string, outputs scanOutputs) {
 	if h.settings == nil || !h.settings.Storage.IsEnabled() {
 		zap.L().Warn("upload_results requested but storage is not enabled")
 		return
@@ -207,9 +231,16 @@ func (h *Handlers) uploadNativeScanResults(projectUUID, scanID string) {
 	files := map[string]string{
 		config.RuntimeLogFilename: filepath.Join(scanDir, config.RuntimeLogFilename),
 	}
-	outputBase := filepath.Join(scanDir, "output")
-	for _, format := range nativeScanUploadFormats {
-		path := types.FormatOutputPath(outputBase, format)
+	var missing []string
+	for _, format := range outputs.formats {
+		path := outputs.path(format)
+		if _, err := os.Stat(path); err != nil {
+			missing = append(missing, filepath.Base(path))
+			zap.L().Error("Requested scan output is missing; not uploaded",
+				zap.String("scan_uuid", scanID), zap.String("format", format),
+				zap.String("path", path), zap.Error(err))
+			continue
+		}
 		files[filepath.Base(path)] = path
 	}
 
@@ -232,7 +263,8 @@ func (h *Handlers) uploadNativeScanResults(projectUUID, scanID string) {
 		}
 	}
 
-	zap.L().Info("Uploaded native scan results", zap.String("scan_uuid", scanID), zap.String("storage_url", storageURL))
+	zap.L().Info("Uploaded native scan results", zap.String("scan_uuid", scanID),
+		zap.String("storage_url", storageURL), zap.Strings("missing_outputs", missing))
 }
 
 // startAgenticScan is the entry point for query mode.
@@ -252,8 +284,15 @@ func (h *Handlers) startAgenticScan(c fiber.Ctx, mode string, stream bool, opts 
 	}
 
 	opts.AgentName = h.effectiveAgentName(opts.AgentName)
-	agenticScanUUID, err := h.registerRunningAgenticScan(mode, opts.AgentName, opts.ScanUUID)
+	opts.ProjectUUID = projectUUID
+	agenticScanUUID, err := h.registerRunningAgenticScan(mode, opts.AgentName, opts.ScanUUID, projectUUID)
 	if err != nil {
+		// Release the slot acquired above. Every other exit from this function
+		// hands ownership to a goroutine that releases it (the SSE stream writer
+		// or runBackgroundAgentWithOpts); this path hands it to nobody, so
+		// without an explicit release a caller can permanently shrink the light
+		// agent pool by repeating a request that fails registration.
+		h.releaseAgentSlot(h.agentLightSem)
 		if byokCleanup != nil {
 			byokCleanup()
 		}
@@ -285,8 +324,10 @@ func (h *Handlers) handleAgentSSE(c fiber.Ctx, agenticScanUUID string, opts agen
 			defer byokCleanup()
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(h.runContext(), timeout)
 		defer cancel()
+		h.registerRunCancel(agenticScanUUID, cancel)
+		defer h.unregisterRunCancel(agenticScanUUID)
 
 		// Pre-create the session dir under the API run UUID (matching the
 		// async path) so SSE-mode query runs also leave a runtime.log on
@@ -303,13 +344,19 @@ func (h *Handlers) handleAgentSSE(c fiber.Ctx, agenticScanUUID string, opts agen
 			})
 		}
 
+		// Log file FIRST in the MultiWriter so runtime.log is never gated on the
+		// SSE client; drainAgentPipeToSSE keeps reading pr after a disconnect so
+		// pw.Write never blocks and the agent keeps logging to disk.
 		pr, pw := io.Pipe()
 		var streamWriter io.Writer = pw
 		if logFile := h.openSessionRuntimeLog(sessionDir, agenticScanUUID); logFile != nil {
-			streamWriter = io.MultiWriter(pw, logFile)
+			streamWriter = io.MultiWriter(logFile, pw)
 			defer func() { _ = logFile.Close() }()
 		}
 		opts.StreamWriter = streamWriter
+
+		// All SSE events for this run go through one sink (see sseSink).
+		sink := newSSESink(w)
 
 		type runResult struct {
 			result *agent.Result
@@ -322,35 +369,25 @@ func (h *Handlers) handleAgentSSE(c fiber.Ctx, agenticScanUUID string, opts agen
 			done <- runResult{result: result, err: err}
 		}()
 
-		buf := make([]byte, 4096)
-		for {
-			n, readErr := pr.Read(buf)
-			if n > 0 {
-				if writeErr := writeSSE(w, sseEvent{Type: "chunk", Text: string(buf[:n])}); writeErr != nil {
-					_ = pr.Close()
-					<-done
-					return
-				}
-			}
-			if readErr != nil {
-				break
-			}
-		}
+		// On client disconnect, keep draining to EOF so the finalization below
+		// (DB status → completed/failed) always runs.
+		clientConnected := drainAgentPipeToSSE(sink, pr, cancel)
 
 		res := <-done
 		now := time.Now()
 		h.agentMu.Lock()
 		status := h.agenticScanStatus[agenticScanUUID]
 		if res.err != nil {
+			runStatus := terminalStatusForRunErr(res.err)
 			if status != nil {
-				status.Status = "failed"
+				status.Status = runStatus
 				status.Error = res.err.Error()
 				status.CompletedAt = &now
 			}
 			h.agentMu.Unlock()
 
 			h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
-				run.Status = "failed"
+				run.Status = runStatus
 				run.ErrorMessage = res.err.Error()
 				run.CompletedAt = now
 				run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
@@ -358,7 +395,9 @@ func (h *Handlers) handleAgentSSE(c fiber.Ctx, agenticScanUUID string, opts agen
 
 			webhook.FireAgenticScan(h.settings, h.repo, agenticScanUUID)
 
-			_ = writeSSE(w, sseEvent{Type: "error", Error: res.err.Error()})
+			if clientConnected {
+				_ = sink.send(sseEvent{Type: "error", Error: res.err.Error()})
+			}
 			zap.L().Error("Agent run failed (streaming)",
 				zap.String("agentic_scan_uuid", agenticScanUUID),
 				zap.Error(res.err))
@@ -387,7 +426,13 @@ func (h *Handlers) handleAgentSSE(c fiber.Ctx, agenticScanUUID string, opts agen
 
 		webhook.FireAgenticScan(h.settings, h.repo, agenticScanUUID)
 
-		_ = writeSSE(w, sseEvent{Type: "done", Result: res.result})
+		if clientConnected {
+			_ = sink.send(sseEvent{Type: "done", Result: res.result})
+		}
+
+		// Drop the heavy result blob from the long-lived status map now that it's
+		// persisted and streamed (the SSE used res.result, not status.Result).
+		h.shedAgenticScanResult(agenticScanUUID)
 		zap.L().Info("Agent run completed (streaming)",
 			zap.String("agentic_scan_uuid", agenticScanUUID),
 			zap.String("agent", res.result.AgentName),
@@ -403,8 +448,10 @@ func (h *Handlers) runBackgroundAgentWithOpts(agenticScanUUID string, opts agent
 		defer byokCleanup()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(h.runContext(), timeout)
 	defer cancel()
+	h.registerRunCancel(agenticScanUUID, cancel)
+	defer h.unregisterRunCancel(agenticScanUUID)
 
 	sessionDir, sessionErr := agent.EnsureSessionDir(h.settings.Agent.EffectiveSessionsDir(), agenticScanUUID)
 	if sessionErr != nil {
@@ -479,6 +526,10 @@ func (h *Handlers) runBackgroundAgentWithOpts(agenticScanUUID string, opts agent
 	}
 
 	h.persistAgenticScanCompleted(agenticScanUUID, &statusSnapshot)
+
+	// Async run: no SSE stream carried the result, but it's persisted and the
+	// findings/records are in the DB — drop the heavy blob from the status map.
+	h.shedAgenticScanResult(agenticScanUUID)
 
 	if uploadResults && sessionDir != "" {
 		h.uploadAgenticResults(projectUUID, agenticScanUUID, sessionDir)

@@ -21,11 +21,16 @@ func (p *Page) GetEventListeners(selector string) (map[string]interface{}, error
 		})()
 	`, selector)
 
+	ctxID, err := p.evalContextID()
+	if err != nil {
+		return nil, err
+	}
 	result, err := proto.RuntimeEvaluate{
 		Expression:            script,
+		ContextID:             ctxID,
 		IncludeCommandLineAPI: true,
 		ReturnByValue:         true,
-	}.Call(p.rodPage)
+	}.Call(p.boundedPage(0))
 
 	if err != nil {
 		return nil, err
@@ -90,11 +95,16 @@ func (p *Page) GetAllEventListeners(xpaths []string) ([]ElementListeners, error)
 		})()
 	`, xpathsJS)
 
+	ctxID, err := p.evalContextID()
+	if err != nil {
+		return nil, err
+	}
 	result, err := proto.RuntimeEvaluate{
 		Expression:            script,
+		ContextID:             ctxID,
 		IncludeCommandLineAPI: true,
 		ReturnByValue:         true,
-	}.Call(p.rodPage)
+	}.Call(p.boundedPage(0))
 
 	if err != nil {
 		return nil, err
@@ -139,7 +149,7 @@ type ElementListeners struct {
 
 // DOMSnapshot captures a DOM snapshot.
 func (p *Page) DOMSnapshot() (*DOMSnapshotResult, error) {
-	result, err := p.rodPage.CaptureDOMSnapshot()
+	result, err := p.boundedPage(0).CaptureDOMSnapshot()
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +170,7 @@ type DOMSnapshotResult struct {
 
 // EnableNetwork enables network domain for interception.
 func (p *Page) EnableNetwork() error {
-	return proto.NetworkEnable{}.Call(p.rodPage)
+	return proto.NetworkEnable{}.Call(p.boundedPage(0))
 }
 
 // SetRequestInterception enables request interception.
@@ -174,12 +184,12 @@ func (p *Page) SetRequestInterception(patterns []string) error {
 
 	return proto.FetchEnable{
 		Patterns: urlPatterns,
-	}.Call(p.rodPage)
+	}.Call(p.boundedPage(0))
 }
 
 // GetLayoutMetrics returns page layout metrics.
 func (p *Page) GetLayoutMetrics() (*LayoutMetrics, error) {
-	result, err := proto.PageGetLayoutMetrics{}.Call(p.rodPage)
+	result, err := proto.PageGetLayoutMetrics{}.Call(p.boundedPage(0))
 	if err != nil {
 		return nil, err
 	}

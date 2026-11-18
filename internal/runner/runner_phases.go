@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -8,49 +9,56 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/core"
-	"github.com/vigolium/vigolium/pkg/core/hosterrors"
-	hostlimit "github.com/vigolium/vigolium/pkg/core/ratelimit"
-	"github.com/vigolium/vigolium/pkg/core/services"
 	"github.com/vigolium/vigolium/pkg/database"
-	"github.com/vigolium/vigolium/pkg/http"
-	"github.com/vigolium/vigolium/pkg/httpmsg"
-	"github.com/vigolium/vigolium/pkg/jsext"
-	"github.com/vigolium/vigolium/pkg/knownissuescan"
-	"github.com/vigolium/vigolium/pkg/modules"
-	"github.com/vigolium/vigolium/pkg/modules/active/authz_compare"
-	"github.com/vigolium/vigolium/pkg/modules/passive/secret_detect"
-	"github.com/vigolium/vigolium/pkg/notify"
-	"github.com/vigolium/vigolium/pkg/notify/discord"
-	"github.com/vigolium/vigolium/pkg/notify/telegram"
-	"github.com/vigolium/vigolium/pkg/oast"
-	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/terminal"
-	"github.com/vigolium/vigolium/pkg/toolexec/kingfisher"
-	"github.com/vigolium/vigolium/pkg/types/severity"
 	"go.uber.org/zap"
 )
+
+// stderrCaptureActive guards the process-global os.Stderr redirection used for
+// raw-stderr scan-log capture. Only the scan that wins the claim redirects
+// os.Stderr; concurrent scans skip capture so they can't restore/close each
+// other's descriptors.
+var stderrCaptureActive atomic.Bool
+
+// cursorFlushBudget bounds the post-round cursor checkpoint. It runs on a
+// context detached from the phase's, so it needs a bound of its own; ten seconds
+// is generous for one UPDATE and short enough that a wedged database delays
+// teardown by a visible-but-tolerable amount rather than hanging it.
+const cursorFlushBudget = 10 * time.Second
+
+// teeDrainTimeout bounds the wait for the stderr-capture reader to finish after
+// the write end is closed. The healthy path takes microseconds and never
+// reaches it; the timeout exists only so a wedged reader cannot hang a scan's
+// teardown, at the cost of a few trailing log lines.
+const teeDrainTimeout = 2 * time.Second
 
 // RunNativeScan orchestrates the native scan plan:
 //
 //	HeuristicsCheck   — optional root-page probe to optimize downstream phase selection
 //	ExternalHarvest   — harvest URLs from external intelligence sources (opt-in)
+//	HarvestProbe      — drop dead/404 harvested URLs before a later phase scans them
 //	Spidering         — browser-based crawling (opt-in)
 //	Discovery         — ingest all input + deparos content discovery into DB (no modules)
 //	Seed              — ingest CLI targets when discovery is skipped but DB-backed phases still need records
-//	KnownIssueScan    — nuclei + kingfisher batch (opt-in via --known-issue-scan)
+//	ParamMining       — discover hidden parameters on recorded endpoints (deep / --param-mining)
+//	KnownIssueScan    — nuclei + secret scan (opt-in via --known-issue-scan)
 //	DynamicAssessment — modules + extensions scan DB records
-func (r *Runner) RunNativeScan() error {
+func (r *Runner) RunNativeScan() (err error) {
 	defer close(r.done)
 	ctx := r.ctx
+
+	// A Runner is reused across agent rescans, so the phase ledger starts empty
+	// here rather than at construction — otherwise the second run's scan row
+	// would carry the first run's curtailment.
+	r.scanOutcome.reset()
+	r.moduleErrors.Store(newModuleErrorLedger())
+	r.preflight = nil
 
 	// Total scan budget: when --scanning-max-duration is set, bound the WHOLE scan
 	// (all phases combined). Each phase wraps this ctx with its own per-phase
@@ -65,12 +73,63 @@ func (r *Runner) RunNativeScan() error {
 		ctx, totalCancel = context.WithTimeout(ctx, r.options.ScanMaxDuration)
 		defer totalCancel()
 	}
+	// Request budget (--max-requests / --max-requests-per-host): built before
+	// the infrastructure, whose egress gate enforces it, and bounding the same
+	// ctx the phases run under, which it cancels when the scan-wide limit runs
+	// out. See armRequestBudget.
+	ctx, stopRequestBudget := r.armRequestBudget(ctx)
+	defer stopRequestBudget()
+	// A session lost mid-scan under reauth.on_failure: abort cancels this ctx
+	// with an *AuthLostError; the phases wind down as for a budget, attributed
+	// to auth_lost, and the run returns the error. See armAuthAbort.
+	ctx, stopAuthAbort := r.armAuthAbort(ctx)
+	defer stopAuthAbort()
 
-	infra, err := r.buildInfrastructure()
+	plan := BuildNativeScanPlan(r.options)
+
+	// --resume-scan reuses the earlier scan's UUID (and so its row, cursor and
+	// coverage ledger); buildInfrastructure adopts options.ScanUUID.
+	if r.options.ResumeScanUUID != "" {
+		r.options.ScanUUID = r.options.ResumeScanUUID
+		// Validated before anything is built: a resume that cannot proceed
+		// (no such scan, another project, different targets/scope/modules)
+		// must not log in, register OAST or send a request first.
+		if err := r.checkResume(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Scope admission over the CLI targets, before anything is built: when
+	// scope refuses every target the run sends nothing, so it must not build
+	// the infrastructure that does (session logins, OAST registration). An
+	// empty plan is how buildInfrastructure is told; the run fails below, once
+	// the scan row exists to say why.
+	admission := r.targetAdmission()
+	if admission != nil && admission.NoneAdmitted() {
+		plan = NativeScanPlan{}
+	}
+
+	infra, err := r.buildInfrastructure(ctx, plan)
 	if err != nil {
 		return err
 	}
 	defer infra.Close()
+
+	// Warn the operator (once per host) when the edge WAF/CDN starts filtering
+	// scan traffic, across all phases that share this requester.
+	r.attachWAFBlockNotifier(infra.httpRequester)
+	// Proactively pace a host the first time an earlier phase reveals it is behind a
+	// CDN/WAF edge, so the active phase does not burst the edge into a rate-based
+	// block before the high-value probes run. Hangs off the shared host limiter (not a
+	// single requester), so the notice fires once per host regardless of which
+	// requester — heuristics, auth prep, discovery — first tripped the pre-arm.
+	r.attachWAFPacingNotifier(infra.hostLimiter)
+	// A single loopback or private host (a development server) is paced from
+	// its first request and ramps up on clean answers.
+	infra.hostLimiter.PreArmLocalTarget(r.options.Targets)
+	// Route every finding the writer emits onto the machine event stream. One
+	// seam rather than one per OnResult callback; see attachEventObserver.
+	r.attachEventObserver()
 
 	// Initialize scan logger (must happen before printScanConfig so the tee captures it)
 	r.scanLogger = database.NewScanLogger(r.repository, infra.scanUUID)
@@ -78,40 +137,117 @@ func (r *Runner) RunNativeScan() error {
 	defer r.scanLogger.Close()
 
 	// Create scan record in the database so every scan is tracked with its lifecycle.
-	// Skip when ScanOnReceive — the server already created the scan record.
-	if r.repository != nil && !r.options.ScanOnReceive {
+	// Skip when ScanOnReceive or ManagedScanRecord — the server already created the
+	// scan record and owns its pending/queued/running transitions.
+	if r.repository != nil && r.options.ResumeScanUUID != "" {
+		// --resume-scan: the row exists; mark it running again rather than
+		// creating a new one.
+		if err := r.resumeScanRow(ctx, infra.scanUUID); err != nil {
+			return err
+		}
+	} else if r.repository != nil && !r.options.ScanOnReceive && !r.options.ManagedScanRecord {
 		target := strings.Join(r.options.Targets, ", ")
 		scan := &database.Scan{
-			UUID:        infra.scanUUID,
-			ProjectUUID: r.options.ProjectUUID,
-			Name:        "cli-scan",
-			Status:      "running",
-			Target:      target,
-			Threads:     r.options.Concurrency,
-			ScanSource:  "cli",
-			ScanMode:    "full",
-			StartedAt:   time.Now(),
+			UUID:            infra.scanUUID,
+			ProjectUUID:     r.options.ProjectUUID,
+			Name:            "cli-scan",
+			Status:          "running",
+			Target:          target,
+			Threads:         r.options.Concurrency,
+			ScopeOriginMode: r.resolvedScopeOriginMode(),
+			ScanSource:      "cli",
+			ScanMode:        "full",
+			StartedAt:       time.Now(),
 		}
 		if err := r.repository.CreateScan(ctx, scan); err != nil {
 			zap.L().Warn("Failed to create scan record", zap.Error(err))
 		}
 	}
+	// Stamp the resolved scope mode on the row, whoever created it — there are ten
+	// scan-creation sites and only the runner knows the settings the matcher will
+	// actually be built from.
+	r.persistScopeOriginMode(ctx, infra.scanUUID)
+	r.persistExtensionFailures(ctx, infra)
+	// The resolved plan: scan.plan on the event stream (right after the CLI's
+	// scan.started, before any phase or the preflight sends a request) and
+	// scans.plan on the row. After the infrastructure, so the loaded
+	// extensions' selection is known; after the row exists, so it can be
+	// stored. A scope that refused every target still gets its plan, every
+	// phase disabled_by scope.
+	r.announcePlan(ctx, infra, admission)
+	// Liveness heartbeat, always on (status.json + the row's heartbeat
+	// columns). Finish is registered BEFORE the finalizer so it runs AFTER it
+	// (defers are LIFO): status.json only states a terminal status once the
+	// row does. The finalizer itself calls Stop first, which writes the final
+	// total_requests before the row is completed.
+	liveness := r.startLiveness(infra, plan)
+	defer func() {
+		liveness.Finish(r.terminalSessionStatus(err))
+		r.liveness.Store(nil)
+	}()
 	if r.repository != nil {
 		defer func() {
+			// Terminal status, most-truthful first: a returned error (including a
+			// recovered panic — the recovery defer below sets err, and runs before
+			// this one since it is registered later) marks the scan failed;
+			// otherwise a cancelled run context marks it cancelled; otherwise it
+			// completed cleanly.
 			var errMsg string
-			if r.ctx.Err() != nil {
+			switch {
+			case err != nil:
+				errMsg = err.Error()
+			case r.ctx.Err() != nil:
 				errMsg = "cancelled"
 			}
-			// Write on r.ctx (un-bounded parent), not the total-budget-bounded ctx:
-			// a scan curtailed by --scanning-max-duration must still record completion.
-			if completeErr := r.repository.CompleteScan(r.ctx, infra.scanUUID, errMsg); completeErr != nil {
+			// Finalize on a detached, bounded context: r.ctx is already cancelled on
+			// a stop/Ctrl-C, which would fail this write and leave the row stuck at
+			// "running". WithoutCancel keeps values (project/tenant) but not the
+			// cancellation, so the terminal status always lands. This makes the
+			// runner the single finalization owner — the server no longer overwrites.
+			finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(r.ctx), 30*time.Second)
+			defer finalCancel()
+			liveness.Stop(finalCtx)
+			r.persistModuleErrors(finalCtx, infra.scanUUID)
+			// WithOutcome, not CompleteScan: the runner is the only component that
+			// saw every phase, so it is the only one that can say whether the run
+			// actually covered its input. Everything else writes "unknown".
+			if completeErr := r.repository.CompleteScanWithOutcome(finalCtx, infra.scanUUID, errMsg, r.Completion()); completeErr != nil {
 				zap.L().Warn("Failed to complete scan record", zap.Error(completeErr))
 			}
+			r.finalized.Store(true)
 		}()
 	}
 
+	// The preflight verdict, recorded whether or not anything was refused so
+	// the row always carries the target tally. A scope that refused every
+	// target ends the run here: nothing was sent, and the finalizer above
+	// stores the row failed with stop_reason no_targets_in_scope. Otherwise the
+	// outcome is appended once the reachability check below has filled it in.
+	var preflightOutcome *database.PhaseOutcome
+	if admission != nil {
+		pre := admissionOutcome(*admission)
+		preflightOutcome = &pre
+		for _, v := range admission.Rejected {
+			r.scanLogger.Warn(string(PhasePreflight), fmt.Sprintf("target %s rejected by scope (%s)", v.Target, v.Rule))
+		}
+		if admission.NoneAdmitted() {
+			r.scanOutcome.append(pre)
+			r.scanOutcome.setStopReason(database.ReasonNoTargetsInScope)
+			rejected := &TargetsRejectedError{Admission: *admission}
+			r.scanLogger.Error(string(PhasePreflight), rejected.Error())
+			return rejected
+		}
+	}
+
 	// Set up TeeWriter to capture raw stderr output as trace-level scan logs.
-	if r.repository != nil {
+	//
+	// This redirects the PROCESS-GLOBAL os.Stderr to a pipe, so only one scan may
+	// own the capture at a time: two concurrent scans (server mode) would otherwise
+	// restore or close each other's descriptors and corrupt process-wide stderr.
+	// A single-owner claim keeps the common single-scan (CLI) case fully captured
+	// while a concurrent secondary scan simply skips raw capture rather than racing.
+	if r.repository != nil && stderrCaptureActive.CompareAndSwap(false, true) {
+		defer stderrCaptureActive.Store(false)
 		origStderr := os.Stderr
 		// Optionally mirror raw console output to ~/.vigolium/native-sessions/{uuid}/run.log.
 		var sessionLogFile *os.File
@@ -135,8 +271,11 @@ func (r *Runner) RunNativeScan() error {
 		pr, pw, err := os.Pipe()
 		if err == nil {
 			os.Stderr = pw
-			// Goroutine reads from the pipe and writes through the tee.
+			// Goroutine reads from the pipe and writes through the tee, and
+			// closes drained when the pipe reports EOF.
+			drained := make(chan struct{})
 			go func() {
+				defer close(drained)
 				buf := make([]byte, 4096)
 				for {
 					n, readErr := pr.Read(buf)
@@ -149,9 +288,20 @@ func (r *Runner) RunNativeScan() error {
 				}
 			}()
 			defer func() {
+				// Closing the write end is what ends the reader's loop, so wait
+				// for the goroutine to say it is done rather than guessing how
+				// long that takes. The old blind 50ms sleep was both a floor on
+				// every scan's teardown - visible on a probe that finishes in
+				// under a fifth of a second - and no guarantee at all on a busy
+				// machine, where the drain could still be unfinished when the
+				// descriptor was yanked. The timeout only bounds a reader that
+				// is stuck, which costs at most a few trailing log lines.
 				_ = pw.Close()
-				// Allow goroutine to drain.
-				time.Sleep(50 * time.Millisecond)
+				select {
+				case <-drained:
+				case <-time.After(teeDrainTimeout):
+					zap.L().Warn("stderr capture did not drain within the timeout; some trace logs may be missing")
+				}
 				_ = pr.Close()
 				os.Stderr = origStderr
 				r.teeWriter.Flush()
@@ -176,40 +326,28 @@ func (r *Runner) RunNativeScan() error {
 	// Log scan configuration snapshot as structured metadata.
 	r.logConfigSnapshot()
 
-	// Banner the scan lifecycle on stderr so operators see at a glance when
-	// scanning kicks off and wraps up. Suppressed by --silent; defers to the
-	// printScanConfig banner above for CLI runs (which already shows targets),
-	// so this marker is most useful for scan-on-receive where the server is
-	// otherwise quiet between 2-minute status ticks.
+	// Banner the end of the scan lifecycle on stderr so operators see at a glance
+	// when scanning wraps up, with wall-clock duration and finding count.
+	// Suppressed by --silent. The scan kickoff is already announced by the Scan ID
+	// line in the configuration banner above, so there is no separate "started"
+	// marker here.
 	scanStartedAt := time.Now()
 	if !r.options.Silent {
-		target := strings.Join(r.options.Targets, ", ")
-		if target == "" {
-			target = "(continuous, awaiting ingested records)"
-		}
-		fmt.Fprintf(os.Stderr, "  %s Scan started %s %s\n",
-			terminal.Green(terminal.SymbolStart),
-			terminal.BoldCyan(infra.scanUUID),
-			terminal.Gray("target: "+target))
 		defer func() {
-			duration := time.Since(scanStartedAt)
-			findingSummary := ""
-			if r.repository != nil {
-				// Use the run context (consistent with the CompleteScan defer
-				// above) so this terminal summary read participates in
-				// cancellation instead of running on a detached Background.
-				if scan, err := r.repository.GetScanByUUID(ctx, infra.scanUUID); err == nil && scan != nil {
-					findingSummary = fmt.Sprintf(", findings: %d", scan.TotalFindings)
-				}
-			}
-			fmt.Fprintf(os.Stderr, "  %s Scan finished %s %s\n",
-				terminal.SuccessSymbol(),
-				terminal.BoldCyan(infra.scanUUID),
-				terminal.Gray(fmt.Sprintf("duration: %s%s", fmtDuration(duration), findingSummary)))
+			// Detached, like the completion defer: on Ctrl-C the run context is
+			// already cancelled, and a read on it fails and drops the count.
+			finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(r.ctx), 10*time.Second)
+			defer finalCancel()
+			r.printFinishedBanner(finalCtx, os.Stderr, infra.scanUUID, time.Since(scanStartedAt))
+			r.printModuleErrorSummary(os.Stderr, infra.scanUUID)
+			r.printCoverageCaveats(os.Stderr)
+			r.printSafeSkipped(finalCtx, os.Stderr)
 		}()
 	}
 
-	// Panic recovery with notification
+	// Panic recovery with notification. Sets the named return so the panic
+	// surfaces as a scan error instead of being swallowed into a nil return that
+	// the finalizer (and the server) would record as a successful scan.
 	defer func() {
 		if rec := recover(); rec != nil {
 			stack := make([]byte, 4096)
@@ -226,10 +364,44 @@ func (r *Runner) RunNativeScan() error {
 			if infra.notifier != nil {
 				_ = infra.notifier.SendRaw(errorMessage)
 			}
+			err = errors.Errorf("panic recovered in runner execution: %+v", rec)
 		}
 	}()
 
-	plan := BuildNativeScanPlan(r.options)
+	// Final project-wide finding grouping, on every exit path (success, phase error,
+	// budget cutoff, panic) via defer, so findings on redirected / third-party hosts —
+	// and any scan that skipped known-issue-scan — still collapse per-asset rows before
+	// results are read. Registered here (after infra/scanLogger exist) so it runs first
+	// among the teardown defers: while stderr is still tee'd to the run log and before
+	// the finished-banner reads the finding count. Idempotent when prior passes already
+	// covered everything; see finalizeFindingGrouping.
+	defer r.finalizeFindingGrouping()
+
+	// External harvest sends nothing to the target, so its archive queries
+	// start now and overlap preflight, heuristics and the port sweep; the
+	// harvest phase joins them at its plan position.
+	if !r.options.FullNativeScanOnReceive && len(r.options.Targets) > 0 && r.settings != nil && plan.enables(PhaseExternalHarvest) {
+		p := startHarvestPrefetch(ctx, r.buildExternalHarvesterSource)
+		r.harvestPrefetchMu.Lock()
+		r.harvestPrefetch = p
+		r.harvestPrefetchMu.Unlock()
+		defer func() { r.takeHarvestPrefetch().stop() }()
+	}
+
+	// Reachability preflight: one GET per admitted CLI target. None answered
+	// ends the run here (stop_reason no_targets_reachable; the CLI exits 1 with
+	// that error.code); some answered marks the scan partial with
+	// targets_unreachable and keeps every target in the plan.
+	if preflightOutcome != nil {
+		var preErr error
+		if r.preflightApplies(plan) {
+			preErr = r.runPreflight(ctx, infra, admission.Admitted, preflightOutcome)
+		}
+		r.scanOutcome.append(*preflightOutcome)
+		if preErr != nil {
+			return preErr
+		}
+	}
 
 	// Full-scan-on-receive: loop waiting for new records, then run all phases
 	// on just the new batch. Each iteration swaps r.inputSource to a one-shot
@@ -240,16 +412,19 @@ func (r *Runner) RunNativeScan() error {
 				break
 			}
 			r.inputSource = database.NewOneShotDBInputSource(r.repository.DB(), r.repository, infra.scanUUID)
-			for _, step := range plan.Steps {
+			for i, step := range plan.Steps {
 				if !step.Enabled {
 					continue
 				}
 				if ctx.Err() != nil {
+					r.recordSkippedSteps(plan.Steps[i:], scanStopReason(ctx, r.ctx))
 					break
 				}
+				// Only a fatal error comes back (see executeNativePhase); it
+				// ends the run here as it does an ordinary scan.
 				if err := r.executeNativePhase(ctx, infra, step.Phase); err != nil {
-					zap.L().Error("Full-scan-on-receive: phase error", zap.Error(err))
-					break
+					r.recordSkippedSteps(plan.Steps[i+1:], database.ReasonError)
+					return err
 				}
 			}
 		}
@@ -257,7 +432,7 @@ func (r *Runner) RunNativeScan() error {
 		return nil
 	}
 
-	for _, step := range plan.Steps {
+	for i, step := range plan.Steps {
 		if !step.Enabled {
 			continue
 		}
@@ -266,11 +441,31 @@ func (r *Runner) RunNativeScan() error {
 		// curtailed scan ends cleanly instead of starting phases that would
 		// immediately abort on the already-expired ctx.
 		if ctx.Err() != nil {
-			zap.L().Warn("Scan budget (scanning-max-duration) reached; skipping remaining phases",
-				zap.String("phase", string(step.Phase)))
+			zap.L().Warn("Scan stopped (budget or cancellation); skipping remaining phases",
+				zap.String("phase", string(step.Phase)),
+				zap.String("reason", scanStopReason(ctx, r.ctx)))
+			// Record the phases that never ran. Without this the scan row shows
+			// outcomes only for the phases that happened to start, which reads
+			// exactly like a scan whose plan was that short to begin with.
+			r.recordSkippedSteps(plan.Steps[i:], scanStopReason(ctx, r.ctx))
 			break
 		}
+		// A phase that fails is recorded and the scan moves on; only a fatal
+		// infrastructure error (errFatal: the database, a record store or the
+		// output writer gone) comes back, and it ends the scan. The phases it
+		// leaves unstarted are recorded skipped so the row shows the gap.
 		if err := r.executeNativePhase(ctx, infra, step.Phase); err != nil {
+			r.recordSkippedSteps(plan.Steps[i+1:], database.ReasonError)
+			return err
+		}
+	}
+	if lost := authLostCause(ctx); lost != nil {
+		return lost
+	}
+	// No admission means no CLI targets (a database rescan): nothing to have
+	// quarantined.
+	if admission != nil {
+		if err := r.allTargetsQuarantined(infra.hostErrors(), admission.Admitted); err != nil {
 			return err
 		}
 	}
@@ -287,1282 +482,205 @@ func (r *Runner) RunNativeScan() error {
 	return nil
 }
 
-func (r *Runner) executeNativePhase(ctx context.Context, infra *phaseInfra, phase NativePhase) error {
-	switch phase {
-	case PhaseHeuristicsCheck:
-		r.setPhaseTag("heuristics")
-		r.scanLogger.Info("heuristics", "phase started")
+// printFinishedBanner writes the "Scan finished" line: the scan id, wall-clock
+// duration, the scan's finding count, and the partial-coverage suffix.
+//
+// The count comes from repository.ScanFindingTotal — the findings table, not the
+// scan row — which is the same helper the CLI's completion summary prints. The
+// row was the bug: this banner runs before the completion defer finalizes it
+// (defers are LIFO, and this one is registered later so it stays inside the
+// stderr capture), so total_findings still held its pre-finalize 0 and the
+// banner said "findings: 0" a line above the summary's "5 issues found". The
+// table is already final here: finding grouping has run, and nothing between
+// this defer and finalization writes findings.
+//
+// With no repository the line carries the duration only; on a failed count it
+// omits the count rather than print a zero it does not know to be true.
+func (r *Runner) printFinishedBanner(ctx context.Context, w io.Writer, scanUUID string, duration time.Duration) {
+	findingSummary := ""
+	if r.repository != nil {
+		if total, _, err := r.repository.ScanFindingTotal(ctx, scanUUID); err == nil {
+			findingSummary = fmt.Sprintf(", findings: %d", total)
+		} else {
+			zap.L().Debug("Scan finished banner: finding count unavailable", zap.Error(err))
+		}
+	}
+	_, _ = fmt.Fprintf(w, "  %s Scan finished %s %s%s\n",
+		terminal.SuccessSymbol(),
+		terminal.BoldCyan(scanUUID),
+		terminal.Gray(fmt.Sprintf("duration: %s%s", fmtDuration(duration), findingSummary)),
+		partialBannerSuffix(r.Completion()))
+}
+
+// phaseRunner is one native phase's entry in the dispatch table: what it is
+// called in the logs, how it runs, and what follows a successful run.
+//
+//   - tag is the output writer's / stderr tee's phase tag (setPhaseTag).
+//   - label is the scan-log component. The two differ for spidering ("spider" /
+//     "spidering"); both are kept as they were, since stored scan logs are
+//     filtered by them.
+//   - started / completed / failed override the default scan-log messages
+//     ("phase started", "phase completed", "phase failed: <err>"). selfStart
+//     means run logs its own start line (dynamic assessment, whose start
+//     carries the module counts, and which logs a skip instead when it has none).
+//   - run does the work. Returning errPhaseSkipped means the phase decided there
+//     was nothing to do and has marked its tracker skipped itself.
+//   - after runs only when run succeeded (discovery's deparos cleanup, the
+//     known-issue-scan finding dedup).
+type phaseRunner struct {
+	tag, label                 string
+	started, completed, failed string
+	selfStart                  bool
+	run                        func(r *Runner, ctx context.Context, infra *phaseInfra) error
+	after                      func(r *Runner, ctx context.Context)
+}
+
+// defaultPhaseRunners is the native phase dispatch table. Every NativePhase the
+// plan can enable has an entry (TestPhaseRunnersCoverPlan); the preflight is not
+// a dispatched phase — RunNativeScan runs it before the plan.
+var defaultPhaseRunners = map[NativePhase]phaseRunner{
+	PhaseHeuristicsCheck: {tag: "heuristics", label: "heuristics", run: func(r *Runner, ctx context.Context, infra *phaseInfra) error {
 		results, err := r.runHeuristicsCheckPhase(ctx, infra)
 		if err != nil {
-			zap.L().Error("HeuristicsCheck phase failed", zap.Error(err))
-			r.scanLogger.Error("heuristics", "phase failed: "+err.Error())
-		} else {
-			r.heuristicsResults = results
-			r.scanLogger.Info("heuristics", "phase completed")
-		}
-	case PhaseExternalHarvest:
-		r.setPhaseTag("harvest")
-		r.scanLogger.Info("harvest", "phase started")
-		if err := r.runExternalHarvestPhase(ctx, infra); err != nil {
-			zap.L().Error("ExternalHarvest phase failed", zap.Error(err))
-			r.scanLogger.Error("harvest", "phase failed: "+err.Error())
-		} else {
-			r.scanLogger.Info("harvest", "phase completed")
-		}
-	case PhaseSpidering:
-		r.setPhaseTag("spider")
-		r.scanLogger.Info("spidering", "phase started")
-		if err := r.runSpideringPhase(ctx, infra); err != nil {
-			zap.L().Error("Spidering phase failed", zap.Error(err))
-			r.scanLogger.Error("spidering", "phase failed: "+err.Error())
-		} else {
-			r.scanLogger.Info("spidering", "phase completed")
-		}
-	case PhaseDiscovery:
-		r.setPhaseTag("discovery")
-		r.scanLogger.Info("discovery", "phase started")
-		if err := r.runDiscoveryPhase(ctx, infra); err != nil {
-			r.scanLogger.Error("discovery", "phase failed: "+err.Error())
-			return fmt.Errorf("discovery phase failed: %w", err)
-		}
-		r.scanLogger.Info("discovery", "phase completed")
-		if r.repository != nil {
-			softDeleted, statusCodes, softErr := r.repository.DeduplicateSoftDeparosRecords(ctx, r.options.ProjectUUID)
-			if softErr != nil {
-				zap.L().Warn("Deparos soft deduplication failed", zap.Error(softErr))
-			} else if softDeleted > 0 {
-				detail := fmt.Sprintf("soft-deduplicated %s similar records",
-					terminal.Orange(fmt.Sprintf("%d", softDeleted)))
-				if len(statusCodes) > 0 {
-					detail += " — " + formatStatusCodeMap(statusCodes)
-				}
-				r.printPhaseFeedback("Discovery", detail)
-				r.scanLogger.Info("discovery", fmt.Sprintf("soft-deduplicated %d similar records", softDeleted))
-			}
-		}
-	case PhaseSeed:
-		r.setPhaseTag("seed")
-		r.scanLogger.Info("seed", "seeding CLI targets")
-		if err := r.seedCLITargets(ctx, infra); err != nil {
-			r.scanLogger.Error("seed", "CLI target seeding failed: "+err.Error())
-			return fmt.Errorf("CLI target seeding failed: %w", err)
-		}
-		r.scanLogger.Info("seed", "seeding completed")
-	case PhaseKnownIssueScan:
-		r.setPhaseTag("known-issue-scan")
-		r.scanLogger.Info("known-issue-scan", "phase started")
-		if err := r.runKnownIssueScanPhase(ctx, infra); err != nil {
-			zap.L().Error("KnownIssueScan phase failed", zap.Error(err))
-			r.scanLogger.Error("known-issue-scan", "phase failed: "+err.Error())
-		} else {
-			r.scanLogger.Info("known-issue-scan", "phase completed")
-			r.deduplicateFindings(ctx, "KnownIssueScan")
-		}
-	case PhaseDynamicAssessment:
-		r.setPhaseTag("dynamic-assessment")
-		activeModules, passiveModules := r.resolveAllModules(infra)
-		if len(activeModules) > 0 || len(passiveModules) > 0 {
-			r.scanLogger.InfoWithMeta("dynamic-assessment", "phase started", map[string]interface{}{
-				"active_modules":  len(activeModules),
-				"passive_modules": len(passiveModules),
-			})
-			if err := r.runDynamicAssessmentPhase(ctx, infra, activeModules, passiveModules); err != nil {
-				zap.L().Error("Dynamic-assessment phase failed", zap.Error(err))
-				r.scanLogger.Error("dynamic-assessment", "phase failed: "+err.Error())
-			} else {
-				r.scanLogger.Info("dynamic-assessment", "phase completed")
-			}
-		} else {
-			zap.L().Info("No modules to execute")
-			r.scanLogger.Info("dynamic-assessment", "skipped, no modules to execute")
-		}
-	}
-	return nil
-}
-
-// buildInfrastructure extracts common setup from the old RunNativeScan into a reusable struct.
-func (r *Runner) buildInfrastructure() (*phaseInfra, error) {
-	// Auto-generate scan UUID when not provided via --scan-uuid
-	scanUUID := r.options.ScanUUID
-	if scanUUID == "" {
-		scanUUID = uuid.New().String()
-		r.options.ScanUUID = scanUUID
-	}
-
-	infra := &phaseInfra{
-		scanUUID: scanUUID,
-	}
-
-	// If SharedInfra is available, reuse its components instead of building fresh
-	if r.sharedInfra != nil {
-		infra.httpRequester = r.sharedInfra.HTTPRequester
-		infra.scopeMatcher = r.sharedInfra.ScopeMatcher
-		infra.hostLimiter = r.sharedInfra.HostLimiter
-		infra.svc = r.sharedInfra.Services
-		infra.jsEngine = r.sharedInfra.JSEngine
-		infra.hookChain = r.sharedInfra.HookChain
-		// Still need to initialize sessions
-		if err := r.initSessions(infra); err != nil {
-			if len(r.options.AuthFiles) > 0 || len(r.options.AuthInline) > 0 {
-				return nil, fmt.Errorf("session initialization failed: %w", err)
-			}
-			zap.L().Warn("Failed to initialize sessions", zap.Error(err))
-		}
-		return infra, nil
-	}
-
-	// Create notifier with backends. Each backend is gated by the
-	// notify.provider selector — empty means "all", a specific value
-	// activates only that channel.
-	if r.settings != nil && r.settings.Notify.Enabled {
-		var backends []notify.Backend
-		notifyCfg := &r.settings.Notify
-
-		// Telegram backend (from settings or env)
-		if notifyCfg.IsProviderActive(config.NotifyProviderTelegram) {
-			tgOpts := r.buildTelegramOptions()
-			if tg, err := telegram.NewBackend(tgOpts...); err == nil {
-				backends = append(backends, tg)
-				zap.L().Info("[Notify] Telegram backend enabled")
-			}
-		}
-
-		// Discord backend (from settings or env)
-		if notifyCfg.IsProviderActive(config.NotifyProviderDiscord) {
-			webhookURL := notifyCfg.Discord.WebhookURL
-			if webhookURL == "" {
-				webhookURL = os.Getenv("DISCORD_WEBHOOK_URL")
-			}
-			if webhookURL != "" {
-				if dc, err := discord.NewBackend(webhookURL); err == nil {
-					backends = append(backends, dc)
-					zap.L().Info("[Notify] Discord backend enabled")
-				} else {
-					zap.L().Warn("[Notify] Failed to create Discord backend", zap.Error(err))
-				}
-			}
-		}
-
-		if len(backends) > 0 {
-			infra.notifier = notify.New(notify.Config{
-				Backends:          backends,
-				AllowedSeverities: notifyCfg.Severities,
-			})
-		}
-	}
-
-	// Create runtime services
-	svc := &services.Services{
-		Options:      r.options,
-		Notifier:     infra.notifier,
-		DedupManager: r.dedupManager,
-	}
-
-	if r.options.ShouldUseHostError() {
-		cache := hosterrors.New(
-			r.options.MaxHostError,
-			hosterrors.DefaultMaxHostsCount,
-			[]string{},
-		)
-		cache.SetVerbose(r.options.Verbose)
-		svc.HostErrors = cache
-	}
-
-	// Create HostLimiter for per-host concurrency control
-	maxPerHost := r.options.MaxPerHost
-	if r.settings != nil && !r.options.MaxPerHostExplicitlySet && r.settings.ScanningPace.MaxPerHost > 0 {
-		maxPerHost = r.settings.ScanningPace.MaxPerHost
-	}
-	if maxPerHost <= 0 {
-		maxPerHost = 10
-	}
-	hostLimiter := hostlimit.NewHostRateLimiter(hostlimit.HostRateLimiterConfig{
-		MaxPerHost:    maxPerHost,
-		MaxEntries:    1000,
-		EvictAfter:    30 * time.Second,
-		EvictInterval: 10 * time.Second,
-	})
-	svc.HostLimiter = hostLimiter
-	infra.hostLimiter = hostLimiter
-	infra.svc = svc
-
-	httpRequester, err := http.NewRequester(r.options, svc)
-	if err != nil {
-		infra.Close()
-		return nil, errors.Wrap(err, "could not create http requester")
-	}
-	infra.httpRequester = httpRequester
-
-	// Create scope matcher from settings, passing CLI targets for cli_origin_mode filtering
-	if r.settings != nil {
-		infra.scopeMatcher = config.NewScopeMatcher(r.settings.Scope, r.options.Targets...)
-	}
-
-	// Initialize JS extension engine
-	if r.settings != nil && r.settings.DynamicAssessment.Extensions.Enabled {
-		jsEngineOpts := &jsext.EngineOptions{
-			ScanUUID:   r.options.ScanUUID,
-			Repository: r.repository,
-			LLMClient:  extensionLLMClient(r.settings),
-		}
-		if r.settings != nil {
-			scopeCfg := r.settings.Scope
-			jsEngineOpts.ScopeConfig = &scopeCfg
-			jsEngineOpts.ScopeMatcher = config.NewScopeMatcher(r.settings.Scope, r.options.Targets...)
-		}
-		jsEngine, err := jsext.NewEngine(&r.settings.DynamicAssessment.Extensions, httpRequester, jsEngineOpts)
-		if err != nil {
-			zap.L().Warn("Failed to initialize JS extensions", zap.Error(err))
-		} else {
-			// Create hook chain if hooks are defined
-			preHooks := jsEngine.PreHooks()
-			postHooks := jsEngine.PostHooks()
-			if len(preHooks) > 0 || len(postHooks) > 0 {
-				infra.hookChain = jsext.NewHookChain(preHooks, postHooks)
-				zap.L().Info("JS hooks loaded",
-					zap.Int("pre_hooks", len(preHooks)),
-					zap.Int("post_hooks", len(postHooks)))
-			}
-			// Store the engine in infra for module resolution
-			infra.jsEngine = jsEngine
-		}
-	}
-
-	// Initialize multi-session support for IDOR/BOLA testing
-	if err := r.initSessions(infra); err != nil {
-		// If the user explicitly configured sessions, surface the error clearly
-		hasCLIAuth := len(r.options.AuthFiles) > 0 || len(r.options.AuthInline) > 0
-		if hasCLIAuth && !r.options.AuthBestEffort {
-			return nil, fmt.Errorf("session initialization failed: %w", err)
-		}
-		zap.L().Warn("Failed to initialize sessions, continuing without session support", zap.Error(err))
-	}
-
-	return infra, nil
-}
-
-// runDiscoveryPhase ingests all input into the database without running modules.
-// It combines the original input source with deparos content discovery (if enabled),
-// expanding deparos targets with hosts discovered by prior phases (ExternalHarvest, Spidering).
-// phaseDeadline derives a phase-scoped context bounded by maxDuration so a phase
-// cannot run past its configured scanning_pace max_duration. It is the single
-// chokepoint for the "wrap the WHOLE phase, not just one leg" invariant that
-// known-issue-scan once regressed on (the Nuclei leg was bounded but the
-// Kingfisher leg ran on the raw ctx). When maxDuration <= 0 the phase is
-// unbounded: the parent ctx is returned unchanged with a no-op cancel so callers
-// can always `defer cancel()`. When the parent already has an earlier deadline
-// (e.g. the overall scan budget), context.WithTimeout keeps that earlier
-// deadline, so a phase can never extend the scan.
-func phaseDeadline(ctx context.Context, maxDuration time.Duration) (context.Context, context.CancelFunc) {
-	if maxDuration <= 0 {
-		return ctx, func() {}
-	}
-	return context.WithTimeout(ctx, maxDuration)
-}
-
-// coversAllSeverities reports whether the configured severity list already
-// includes every nuclei severity level, so the "widen the filter" tip can be
-// suppressed. Order- and duplicate-insensitive; inputs are normalized.
-func coversAllSeverities(sevs []string) bool {
-	want := map[string]bool{"critical": true, "high": true, "medium": true, "low": true, "info": true}
-	have := make(map[string]bool, len(sevs))
-	for _, s := range sevs {
-		have[strings.ToLower(strings.TrimSpace(s))] = true
-	}
-	for s := range want {
-		if !have[s] {
-			return false
-		}
-	}
-	return true
-}
-
-// formatKnownIssueScanTemplateScope renders the nuclei template selection (tags,
-// excluded tags, and any custom templates dir) as a compact colored string for
-// the KnownIssueScan phase header. Returns "all built-in" when no filters narrow
-// the default template set.
-func formatKnownIssueScanTemplateScope(cfg *config.KnownIssueScanConfig) string {
-	var parts []string
-	if len(cfg.Tags) > 0 {
-		parts = append(parts, "tags="+terminal.HiTeal(strings.Join(cfg.Tags, ",")))
-	}
-	if len(cfg.ExcludeTags) > 0 {
-		parts = append(parts, "exclude="+terminal.HiPurple(strings.Join(cfg.ExcludeTags, ",")))
-	}
-	if cfg.TemplatesDir != "" {
-		parts = append(parts, "dir="+terminal.HiCyan(terminal.ShortenHome(config.ExpandPath(cfg.TemplatesDir))))
-	}
-	if len(parts) == 0 {
-		return terminal.Gray("all built-in")
-	}
-	return strings.Join(parts, " ")
-}
-
-// runKnownIssueScanPhase orchestrates nuclei + kingfisher batch scanning.
-func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) error {
-	phaseStart := time.Now()
-
-	r.printPhaseStart("KnownIssueScan", "assess security posture with Nuclei templates and third-party validation checks")
-	var kisMaxDuration time.Duration
-	if r.settings != nil {
-		knownIssueScanPace := r.settings.ScanningPace.ResolvePhase("known-issue-scan")
-		kisMaxDuration = knownIssueScanPace.MaxDuration
-		if knownIssueScanPace.MaxDuration > 0 || knownIssueScanPace.DurationFactor > 0 {
-			detail := "Speed:"
-			if knownIssueScanPace.MaxDuration > 0 {
-				detail += fmt.Sprintf(" max-duration=%s", terminal.HiTeal(knownIssueScanPace.MaxDuration.String()))
-			}
-			if knownIssueScanPace.DurationFactor > 0 {
-				detail += fmt.Sprintf(" (duration_factor=%s)", terminal.HiBlue(fmt.Sprintf("%.1f", knownIssueScanPace.DurationFactor)))
-			}
-			r.printPhaseDetail(detail)
-		}
-
-		// Surface the active severity filter and template scope as static detail
-		// lines so the operator can see exactly what nuclei will run, not just how
-		// many targets it runs against.
-		sevDetail := terminal.Gray("all")
-		if sevs := r.settings.KnownIssueScan.Severities; len(sevs) > 0 {
-			sevDetail = terminal.HiTeal(strings.Join(sevs, ", "))
-		}
-		r.printPhaseDetail(fmt.Sprintf("Severities: %s", sevDetail))
-		r.printPhaseDetail(fmt.Sprintf("Templates: %s", formatKnownIssueScanTemplateScope(&r.settings.KnownIssueScan)))
-	}
-
-	// bookkeepingCtx is the un-bounded parent context (still cancelled if the whole
-	// scan is cancelled). End-of-phase DB writes use it so progress counters still
-	// land when only a leg's deadline — not the scan — has fired. The Nuclei and
-	// Kingfisher legs below each derive their OWN max_duration budget from it (see
-	// the per-leg comments), so they are bounded independently but never exceed the
-	// overall scan budget.
-	bookkeepingCtx := ctx
-	enrichTargets := true
-	if r.settings != nil {
-		enrichTargets = r.settings.KnownIssueScan.EnrichTargets
-	}
-	if !enrichTargets && !r.options.Silent {
-		fmt.Fprintf(os.Stderr, "  %s %s %s\n",
-			terminal.TipPrefix(), terminal.Gray("enrich KnownIssueScan targets with discovered paths via"), terminal.HiCyan("vigolium config known_issue_scan.enrich_targets=true"))
-	}
-	// Surface the active severity filter and how to widen it. An empty list means
-	// "all severities", so only hint when the configured set does not already
-	// cover all five (the default balanced intensity ships with critical+high).
-	if r.settings != nil && !r.options.Silent {
-		sevs := r.settings.KnownIssueScan.Severities
-		if len(sevs) > 0 && !coversAllSeverities(sevs) {
-			fmt.Fprintf(os.Stderr, "  %s %s %s\n",
-				terminal.TipPrefix(),
-				terminal.Gray(fmt.Sprintf("known-issue-scan limited to %s severities; scan all via", strings.Join(sevs, ","))),
-				terminal.HiCyan(`vigolium config set known_issue_scan.severities "critical,high,medium,low,info"`))
-		}
-	}
-	r.printTargetDetail(r.formatTargetCounts(ctx, len(r.options.Targets)))
-	if r.repository != nil && r.options.Verbose {
-		paths, _ := r.repository.GetDistinctPaths(ctx, r.options.ProjectUUID)
-		if len(paths) > 0 {
-			var knownIssueScanTargets []string
-			if enrichTargets {
-				knownIssueScanTargets = buildKnownIssueScanTargetsFromPaths(paths)
-			} else {
-				knownIssueScanTargets = buildKnownIssueScanHostTargets(paths)
-			}
-			r.printVerboseTargets(knownIssueScanTargets)
-		}
-	}
-	zap.L().Info("KnownIssueScan: running security posture assessment")
-
-	// Track findings by severity
-	var mu sync.Mutex
-	counts := make(map[severity.Severity]int)
-
-	onResult := func(result *output.ResultEvent) {
-		mu.Lock()
-		counts[result.Info.Severity]++
-		mu.Unlock()
-
-		if err := r.output.Write(result); err != nil {
-			zap.L().Error("KnownIssueScan: failed to write result", zap.Error(err))
-		}
-	}
-
-	// Nuclei scan on distinct hosts. It gets its OWN max_duration budget so that a
-	// long Nuclei run no longer starves the Kingfisher secret scan below — the two
-	// legs are bounded independently rather than sharing one budget. A ctx error
-	// means this leg's max_duration (or the overall scan) elapsed — that is a
-	// curtailment, not a failure.
-	nucleiCtx, nucleiCancel := phaseDeadline(ctx, kisMaxDuration)
-	defer nucleiCancel()
-	if err := r.runKnownIssueScan(nucleiCtx, onResult); err != nil {
-		if nucleiCtx.Err() != nil {
-			zap.L().Warn("KnownIssueScan: Nuclei scan stopped at phase max_duration", zap.Error(nucleiCtx.Err()))
-		} else {
-			zap.L().Error("KnownIssueScan: Nuclei scan failed", zap.Error(err))
-		}
-	}
-
-	// Kingfisher batch scan on all response bodies. It gets a FRESH max_duration
-	// budget that starts now (derived from the parent ctx, so still bounded by the
-	// overall scan budget), so it always runs even when the Nuclei leg above was
-	// curtailed at its deadline. Kingfisher scans DB response bodies locally (no
-	// network) and normally finishes well within this budget. Worst-case phase
-	// wall-clock is ~2× max_duration, capped by the overall scan budget. A ctx error
-	// is a curtailment, distinct from a genuine scanner failure.
-	kingfisherCtx, kingfisherCancel := phaseDeadline(ctx, kisMaxDuration)
-	defer kingfisherCancel()
-	if err := r.runKingfisherBatch(kingfisherCtx, infra, onResult); err != nil {
-		if kingfisherCtx.Err() != nil {
-			zap.L().Warn("KnownIssueScan: Kingfisher secret scan curtailed before all response bodies were scanned — phase max_duration reached", zap.Error(kingfisherCtx.Err()))
-		} else {
-			zap.L().Error("KnownIssueScan: Kingfisher batch failed", zap.Error(err))
-		}
-	}
-
-	// Print summary
-	var total int
-	for _, c := range counts {
-		total += c
-	}
-	if total > 0 {
-		r.printPhaseDetail(formatKnownIssueScanSummary(counts, total))
-	}
-
-	// Increment processed_count for KnownIssueScan phase. Use the un-bounded
-	// parent ctx so the counter still updates when the phase deadline fired
-	// mid-scan (findings were already written; only the budget is exhausted).
-	if r.repository != nil && total > 0 {
-		if err := r.repository.IncrementProcessedCount(bookkeepingCtx, infra.scanUUID, int64(total)); err != nil {
-			zap.L().Warn("KnownIssueScan: failed to increment processed count", zap.Error(err))
-		}
-	}
-
-	elapsed := time.Since(phaseStart)
-	r.printPhaseComplete("KnownIssueScan", fmt.Sprintf("completed in %s", terminal.HiPurple(fmtDuration(elapsed))))
-	return nil
-}
-
-// runKingfisherBatch scans all response bodies in the database for secrets using Kingfisher.
-func (r *Runner) runKingfisherBatch(ctx context.Context, infra *phaseInfra, onResult func(*output.ResultEvent)) error {
-	if r.repository == nil {
-		return fmt.Errorf("kingfisher batch: database repository required")
-	}
-
-	scanner, err := kingfisher.NewScanner(nil)
-	if err != nil {
-		return fmt.Errorf("kingfisher batch: failed to create scanner: %w", err)
-	}
-	if err := scanner.EnsureBinary(ctx); err != nil {
-		return fmt.Errorf("kingfisher batch: binary unavailable: %w", err)
-	}
-
-	zap.L().Info("KnownIssueScan: Kingfisher batch — scanning response bodies for secrets")
-
-	var cursor string
-	var totalFindings int
-	for {
-		// Break promptly when the phase/scan budget elapses. A single batch holds up
-		// to kingfisherBatchSize records, so without an inner-loop check below the
-		// per-record loop would scan every body before the next-batch fetch could
-		// observe cancellation. Returning ctx.Err() lets the caller log the
-		// secret-scan curtailment notice rather than treating it as a failure.
-		if err := ctx.Err(); err != nil {
 			return err
 		}
-
-		records, err := r.repository.GetRecordsWithResponseBody(ctx, r.options.ProjectUUID, cursor, kingfisherBatchSize)
-		if err != nil {
-			return fmt.Errorf("kingfisher batch: failed to fetch records: %w", err)
-		}
-		if len(records) == 0 {
-			break
-		}
-
-		for _, record := range records {
-			cursor = record.UUID
-
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			// Filter by content type (reuse IsTextBasedMIME from secret_detect)
-			if !secret_detect.IsTextBasedMIME(record.ResponseContentType) {
-				continue
-			}
-
-			result, scanErr := scanner.Scan(ctx, record.ResponseBodyBytes())
-			if scanErr != nil || !result.HasFindings() {
-				continue
-			}
-
-			for i := range result.Findings {
-				f := &result.Findings[i]
-
-				sev := severity.High
-				conf := severity.Firm
-				if f.IsValidated() {
-					sev = severity.Critical
-					conf = severity.Certain
-				}
-
-				event := &output.ResultEvent{
-					ModuleID: "",
-					Info: output.Info{
-						Name:        f.RuleName(),
-						Description: "Leaked secret detected: " + f.RuleID(),
-						Severity:    sev,
-						Confidence:  conf,
-						Tags:        []string{"secret", "credential", "exposure", "known-issue-scan"},
-					},
-					Host:             record.Hostname,
-					URL:              record.URL,
-					Matched:          record.URL,
-					ExtractedResults: []string{secret_detect.RedactSnippet(f.Snippet())},
-					Metadata: map[string]any{
-						"rule_id":   f.RuleID(),
-						"rule_name": f.RuleName(),
-						"validated": f.IsValidated(),
-					},
-					ModuleType:    database.ModuleTypeSecretScan,
-					FindingSource: database.FindingSourceKnownIssueScan,
-					ModuleShort:   "Leaked secret detected in HTTP response body",
-				}
-
-				// Save to DB
-				if saveErr := r.repository.SaveFinding(ctx, event, []string{record.UUID}, infra.scanUUID, r.options.ProjectUUID); saveErr != nil {
-					zap.L().Debug("Failed to save kingfisher finding", zap.Error(saveErr))
-				}
-
-				// Write to output via callback
-				if onResult != nil {
-					onResult(event)
-				}
-				totalFindings++
-			}
-		}
-
-		if len(records) < kingfisherBatchSize {
-			break
-		}
-	}
-
-	zap.L().Info("KnownIssueScan: Kingfisher batch completed", zap.Int("findings", totalFindings))
-	return nil
-}
-
-// runDynamicAssessmentPhase runs all modules on DB records with a feedback loop for newly discovered URLs.
-func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfra, activeModules []modules.ActiveModule, passiveModules []modules.PassiveModule) error {
-	phaseStart := time.Now()
-
-	if r.repository == nil {
-		return fmt.Errorf("dynamic-assessment: database repository required")
-	}
-
-	r.printPhaseStart("DynamicAssessment", "execute dynamic security assessments through coordinated active and passive scanning modules")
-	modulesLine := fmt.Sprintf("Modules: %s active, %s passive",
-		terminal.Orange(fmt.Sprintf("%d", len(activeModules))),
-		terminal.Orange(fmt.Sprintf("%d", len(passiveModules))))
-	if infra.jsEngine != nil {
-		jsActive := len(infra.jsEngine.ActiveModules())
-		jsPassive := len(infra.jsEngine.PassiveModules())
-		if jsActive+jsPassive > 0 {
-			modulesLine += fmt.Sprintf(" (incl. %s extensions)",
-				terminal.HiTeal(fmt.Sprintf("%d", jsActive+jsPassive)))
-		}
-	}
-	r.printPhaseDetail(modulesLine)
-
-	daSpeedDetail := fmt.Sprintf("Speed: concurrency=%s, max-per-host=%s",
-		terminal.HiBlue(fmt.Sprintf("%d", r.options.Concurrency)),
-		terminal.HiBlue(fmt.Sprintf("%d", r.options.MaxPerHost)))
-	if r.settings != nil {
-		daPace := r.settings.ScanningPace.ResolvePhase("dynamic-assessment")
-		if daPace.MaxDuration > 0 {
-			daSpeedDetail += fmt.Sprintf(", max-duration=%s", terminal.HiTeal(daPace.MaxDuration.String()))
-		}
-		if daPace.DurationFactor > 0 {
-			daSpeedDetail += fmt.Sprintf(" (duration_factor=%s)", terminal.HiBlue(fmt.Sprintf("%.1f", daPace.DurationFactor)))
-		}
-	}
-	r.printPhaseDetail(daSpeedDetail)
-	r.printTargetDetail(r.formatTargetCounts(ctx, len(r.options.Targets)))
-
-	// Resolve feedback rounds early so we can show it in the phase header
-	feedbackRounds := maxFeedbackRounds
-	if r.settings != nil && r.settings.DynamicAssessment.MaxFeedbackRounds > 0 {
-		feedbackRounds = r.settings.DynamicAssessment.MaxFeedbackRounds
-	}
-	r.printPhaseDetail(fmt.Sprintf("Feedback rounds: %s", terminal.HiBlue(fmt.Sprintf("%d", feedbackRounds))))
-	if feedbackRounds <= 1 && !r.options.Silent {
-		fmt.Fprintf(os.Stderr, "  %s %s %s\n",
-			terminal.TipPrefix(), terminal.Gray("increase feedback rounds to re-scan newly discovered URLs via"), terminal.HiCyan("vigolium config dynamic-assessment.max_feedback_rounds=3"))
-	}
-
-	zap.L().Info("DynamicAssessment: running modules on database records",
-		zap.Int("active", len(activeModules)),
-		zap.Int("passive", len(passiveModules)))
-
-	// Log quarantined hosts from prior phases so users see cross-phase propagation
-	if infra.svc != nil && infra.svc.HostErrors != nil {
-		if qc := infra.svc.HostErrors.QuarantinedCount(); qc > 0 {
-			zap.L().Info("DynamicAssessment: carrying forward host errors from prior phases",
-				zap.Int("quarantined_hosts", qc))
-		}
-	}
-
-	// If KnownIssueScan was enabled, filter out secret-detect to avoid duplicate kingfisher findings
-	if r.options.KnownIssueScanEnabled {
-		passiveModules = filterOutPassiveModule(passiveModules, secret_detect.ModuleID)
-	}
-
-	// Wire compare session clients into the authz-compare module
-	if len(infra.compareSessions) > 0 {
-		clients := make([]*http.Requester, len(infra.compareSessions))
-		names := make([]string, len(infra.compareSessions))
-		hostnames := make([]string, len(infra.compareSessions))
-		for i, cs := range infra.compareSessions {
-			clients[i] = cs.Client
-			names[i] = cs.Name
-			hostnames[i] = cs.Hostname
-		}
-		for _, mod := range activeModules {
-			if ac, ok := mod.(*authz_compare.Module); ok {
-				ac.SetCompareClients(clients, names, hostnames)
-				break
-			}
-		}
-	}
-
-	// Update the top-level scan record with module info for cursor tracking.
-	// The scan record was already created at the start of RunNativeScan().
-	if _, err := r.repository.DB().NewUpdate().
-		Model((*database.Scan)(nil)).
-		Set("modules = ?", r.buildModulesString(activeModules, passiveModules)).
-		Set("updated_at = CURRENT_TIMESTAMP").
-		Where("uuid = ?", infra.scanUUID).
-		Exec(ctx); err != nil {
-		zap.L().Warn("Failed to update scan modules", zap.Error(err))
-	}
-
-	// Resolve dynamic-assessment concurrency: scanning_pace.dynamic-assessment overrides global when CLI not explicit
-	daConcurrency := r.options.Concurrency
-	if r.settings != nil && !r.options.ConcurrencyExplicitlySet {
-		daPace := r.settings.ScanningPace.ResolvePhase("dynamic-assessment")
-		if daPace.Concurrency > 0 {
-			daConcurrency = daPace.Concurrency
-		}
-	}
-
-	// Initialize OAST service if enabled
-	var oastService *oast.Service
-	if r.settings != nil && r.settings.OAST.Enabled {
-		onOASTResult := func(result *output.ResultEvent) {
-			if err := r.output.Write(result); err != nil {
-				zap.L().Error("Failed to write OAST result", zap.Error(err))
-			}
-		}
-		var err error
-		oastService, err = oast.New(&r.settings.OAST, onOASTResult, r.repository, infra.scanUUID, r.options.ProjectUUID, nil)
-		if err != nil {
-			zap.L().Warn("DynamicAssessment: OAST initialization failed, continuing without OAST", zap.Error(err))
-		}
-		if oastService != nil {
-			oastService.Start()
-			defer oastService.Close()
-			r.printPhaseDetail(fmt.Sprintf("OAST: enabled via %s (out-of-band callback detection active)", oastService.ServerURL()))
-		}
-	}
-
-	// Compute in-scope hostnames to filter DB records by CLI target hostnames
-	inScopeHostnames := r.getInScopeDBHostnamesList(ctx)
-
-	// Shared insertion point cache across feedback rounds to avoid cold-start overhead
-	ipCache, _ := lru.New[string, []httpmsg.InsertionPoint](4096)
-
-	// Resolve per-phase settings from scanning pace config (static across rounds)
-	var daMaxDuration time.Duration
-	daParallelPassive := true // default for dynamic-assessment phase
-	var daFeedbackDrain time.Duration
-	var daActiveModuleTimeout time.Duration
-	if r.settings != nil {
-		daPace := r.settings.ScanningPace.ResolvePhase("dynamic-assessment")
-		daMaxDuration = daPace.MaxDuration
-		daParallelPassive = daPace.ParallelPassive
-		daFeedbackDrain = daPace.FeedbackDrainTimeout
-		daActiveModuleTimeout = daPace.ActiveModuleTimeout
-	}
-
-	// Enforce dynamic-assessment phase deadline across all feedback rounds. Without this wrap
-	// each round's executor would start a fresh timeout, letting total phase time
-	// reach feedbackRounds × daMaxDuration.
-	var phaseCancel context.CancelFunc
-	ctx, phaseCancel = phaseDeadline(ctx, daMaxDuration)
-	defer phaseCancel()
-
-	// Reset cursor so dynamic-assessment reads all records from the beginning
-	// (seed phase advances the cursor past all records when saving them).
-	// Skip reset for scan-on-receive — the cursor tracks which records have been scanned.
-	if !r.options.ScanOnReceive {
-		if err := r.repository.ResetScanCursor(ctx, infra.scanUUID); err != nil {
-			zap.L().Warn("DynamicAssessment: failed to reset scan cursor", zap.Error(err))
-		}
-	}
-
-	var recordWriter *database.RecordWriter
-	if r.repository != nil {
-		recordWriter = database.NewRecordWriter(r.repository, database.RecordWriterConfig{})
-		defer recordWriter.Close()
-	}
-
-	// phaseModuleTimeouts is shared across every per-round executor so the
-	// timed-out total in the status line accumulates over the whole phase rather
-	// than resetting each feedback round (Records/Findings are per-round by design).
-	var phaseModuleTimeouts atomic.Int64
-
-	baseExecutorCfg := core.ExecutorConfig{
-		Workers:              daConcurrency,
-		Services:             infra.svc,
-		HTTPRequester:        infra.httpRequester,
-		Repository:           r.repository,
-		RecordWriter:         recordWriter,
-		ScanUUID:             infra.scanUUID,
-		ScopeMatcher:         infra.scopeMatcher,
-		ModuleTimeouts:       &phaseModuleTimeouts,
-		SkipBaseline:         true,
-		PauseCtrl:            r.pauseCtrl,
-		MaxFindingsPerModule: r.options.MaxFindingsPerModule,
-		TechFilterDisabled:   r.options.NoTechFilter || strings.EqualFold(r.options.Intensity, "deep"),
-		OnTechDetected: func(host, tag string) {
-			line := fmt.Sprintf("%s %s %s %s %s %s\n",
-				terminal.Muted(terminal.SymbolChevron+" tech-stack "+terminal.SymbolPipe),
-				terminal.BoldCyan("[detected]"),
-				terminal.HiBlue(host),
-				terminal.Muted("→"),
-				terminal.Yellow(tag),
-				terminal.Muted("(skips incompatible modules unless --no-tech-filter)"))
-			r.writeSessionLog(line)
-			if !r.options.Silent {
-				fmt.Fprint(os.Stderr, line)
-			}
-		},
-		// Phase-level ctx already carries the dynamic-assessment deadline; leaving this at 0
-		// prevents each feedback round from starting a fresh per-round timeout.
-		MaxDuration:          0,
-		ParallelPassive:      daParallelPassive,
-		FeedbackDrainTimeout: daFeedbackDrain,
-		ActiveModuleTimeout:  daActiveModuleTimeout,
-		IPCache:              ipCache,
-		OnTraffic:            r.makeOnTrafficVerbose("dynamic-assessment"),
-		OnResult: func(result *output.ResultEvent) {
-			if err := r.output.Write(result); err != nil {
-				zap.L().Error("Failed to write result", zap.Error(err))
-			}
-		},
-		OnStatus: func(processed, total, findings, distinctModules, activeCount, passiveCount, timedOut int64, elapsed time.Duration) {
-			if r.options.Silent {
-				return
-			}
-			prefix := terminal.Muted(terminal.SymbolChevron + " dynamic-assessment " + terminal.SymbolPipe)
-			var recordsStr string
-			if total > 0 {
-				recordsStr = fmt.Sprintf("%d/%d", processed, total)
-			} else {
-				recordsStr = fmt.Sprintf("%d", processed)
-			}
-			totalModules := activeCount + passiveCount
-			// timedOut is phase-cumulative (shared across feedback rounds); the
-			// helper appends it to the breakdown only when > 0.
-			modulesStr := terminal.FormatModuleProgress(distinctModules, totalModules, activeCount, passiveCount, timedOut)
-			fmt.Fprintf(os.Stderr, "%s %s Records: %s | Findings: %s | Modules: %s | Runtime: %s\n",
-				prefix,
-				terminal.BoldCyan("[status]"),
-				terminal.HiBlue(recordsStr),
-				terminal.Orange(fmt.Sprintf("%d", findings)),
-				terminal.Yellow(modulesStr),
-				terminal.Gray(fmtDuration(elapsed)))
-		},
-		StatusInterval: 1 * time.Minute,
-	}
-	if oastService != nil {
-		baseExecutorCfg.OASTProvider = oastService
-		baseExecutorCfg.OASTService = oastService
-	}
-	if infra.hookChain != nil {
-		baseExecutorCfg.Hooks = infra.hookChain
-	}
-
-	// Continuous scan-on-receive mode: use a polling DBInputSource that waits
-	// indefinitely for new records instead of snapshot-based feedback rounds.
-	if r.options.ScanOnReceive && !r.options.FullNativeScanOnReceive {
-		sorCfg := baseExecutorCfg
-		// scan-on-receive scans each ingested request exactly once with no
-		// fan-out. Feedback is disabled so passive-module URL discoveries
-		// (link extractors, redirect followers) don't persist new work items;
-		// RecordWriter is nil so the executor doesn't write scanner-produced
-		// rows that would get polled back into the scan. For targeted one-
-		// request scans drive /api/scan-request directly.
-		sorCfg.DisableFeedback = true
-		sorCfg.RecordWriter = nil
-		// In server mode the console stays terse (status line at a 2-minute cadence
-		// is the only stderr output by default). The same events are always written
-		// verbosely to runtime.log so operators can reconstruct activity after the
-		// fact — see runner.writeSessionLog.
-		// Fire the first status tick at 30s so users see progress quickly when
-		// a scan kicks off, then fall back to the 2-minute cadence.
-		sorCfg.StatusInterval = 2 * time.Minute
-		sorCfg.FirstStatusInterval = 30 * time.Second
-		origOnResult := sorCfg.OnResult
-		sorCfg.OnTraffic = func(method, url string, statusCode int, contentType string) {
-			line := formatTrafficLine("scan-on-receive", method, url, statusCode, contentType)
-			r.writeSessionLog(line)
-			if !r.options.Silent {
-				fmt.Fprint(os.Stderr, line)
-			}
-		}
-		sorCfg.OnResult = func(result *output.ResultEvent) {
-			if origOnResult != nil {
-				origOnResult(result)
-			}
-			if result == nil {
-				return
-			}
-			line := fmt.Sprintf("  %s %s [%s] %s — %s\n",
-				terminal.InfoSymbol(),
-				terminal.Cyan("finding"),
-				terminal.Orange(result.Info.Severity.String()),
-				terminal.BoldCyan(result.ModuleID),
-				terminal.Gray(result.URL))
-			r.writeSessionLog(line)
-			if !r.options.Silent {
-				fmt.Fprint(os.Stderr, line)
-			}
-		}
-		shortScanID := strings.TrimPrefix(infra.scanUUID, "scan-")
-		if len(shortScanID) > 8 {
-			shortScanID = shortScanID[:8]
-		}
-
-		// Threshold for treating a fetch as a "resume from idle" event. Below
-		// this, batches are considered back-to-back and we stay silent to avoid
-		// spamming the console while the scan is steadily processing.
-		const activityIdleThreshold = 5 * time.Second
-
-		// Restrict the DB poller to records that came from user ingestion.
-		// Without this, "finding" records persisted by the executor's
-		// emitResult (executor.go:1474-1488 — one row per finding with an
-		// attached request/response pair) would get polled back into the
-		// scan and fan out 1 ingested request → hundreds of re-scanned rows.
-		sorSourceFilter := database.IngestRecordSources
-
-		continuousSource := database.NewDBInputSource(r.repository.DB(), r.repository, infra.scanUUID, 2*time.Second).
-			WithHostnames(inScopeHostnames).
-			WithIncludeSources(sorSourceFilter).
-			WithIdleTimeout(r.options.ScanOnReceiveIdleTimeout).
-			WithOnActivity(func(records int, idleFor time.Duration, firstBatch bool) {
-				// Print a one-line confirmation that the scan is actively processing
-				// records. Two cases qualify: the very first batch ever (so the user
-				// knows the scan started without waiting for the 2-min status tick),
-				// or any batch that arrives after a quiet period.
-				if !firstBatch && idleFor < activityIdleThreshold {
-					return
-				}
-				prefix := terminal.Muted(terminal.SymbolChevron + " scan-on-receive " + terminal.SymbolPipe)
-				var line string
-				if firstBatch {
-					line = fmt.Sprintf("%s %s scan-%s picked up %s — scanning started\n",
-						prefix,
-						terminal.BoldGreen("[start]"),
-						shortScanID,
-						terminal.HiBlue(fmt.Sprintf("%d record(s)", records)))
-				} else {
-					line = fmt.Sprintf("%s %s scan-%s picked up %s after %s idle\n",
-						prefix,
-						terminal.BoldGreen("[resume]"),
-						shortScanID,
-						terminal.HiBlue(fmt.Sprintf("%d record(s)", records)),
-						terminal.Gray(fmtDuration(idleFor)))
-				}
-				r.writeSessionLog(line)
-				// Always surface start/resume to stderr — even in server mode
-				// where Silent is true — so the user sees confirmation that an
-				// ingested request was picked up for scanning. Without this the
-				// ingest HTTP log is the only signal, and the 2-min status tick
-				// is too late.
-				fmt.Fprint(os.Stderr, line)
-			})
-
-		// Forward-declared so OnStatus can query the executor's in-flight counter.
-		// Assigned right before Execute() below.
-		var sorExecutor *core.Executor
-
-		// Threshold for showing the "idle Ns" suffix in the status line. We only
-		// surface idle state once the source has been quiet for at least one poll
-		// interval — otherwise the suffix would flicker on/off between ticks.
-		const idleDisplayThreshold = 10 * time.Second
-
-		// Tracks the ingested-record count at the previous status tick so we can
-		// report the delta ("new ingested records" since last line). Accessed
-		// only from the ticker goroutine, so no locking needed.
-		var prevIngestedCount int64 = -1
-
-		sorCfg.OnStatus = func(processed, total, findings, distinctModules, activeCount, passiveCount, timedOut int64, elapsed time.Duration) {
-			// Use the phase context (captured from the enclosing function) so
-			// these periodic status DB reads stop once the scan is cancelled
-			// rather than outliving it on a detached context.Background().
-
-			// Count HTTP records ingested since the scan started, scoped to the
-			// in-scope hostnames if any were configured. Cheap enough at a
-			// 2-minute cadence. Uses scan.StartedAt as the cursor reference.
-			var ingestedCount int64 = -1
-			var scanRow *database.Scan
+		r.heuristicsResults = results
+		return nil
+	}},
+	PhasePortSweep:       {tag: "port-sweep", label: "port-sweep", run: (*Runner).runPortSweepPhase},
+	PhaseExternalHarvest: {tag: "harvest", label: "harvest", run: (*Runner).runExternalHarvestPhase},
+	PhaseHarvestProbe:    {tag: "harvest-probe", label: "harvest-probe", run: (*Runner).runHarvestProbePhase},
+	PhaseSpidering:       {tag: "spider", label: "spidering", run: (*Runner).runSpideringPhase},
+	PhaseProbe:           {tag: "probe", label: "probe", run: (*Runner).runProbePhase},
+	PhaseFingerprint:     {tag: "fingerprint", label: "fingerprint", run: (*Runner).runFingerprintPhase},
+	PhaseDiscovery: {tag: "discovery", label: "discovery", run: (*Runner).runDiscoveryPhase,
+		after: func(r *Runner, ctx context.Context) {
 			if r.repository != nil {
-				if s, err := r.repository.GetScanByUUID(ctx, infra.scanUUID); err == nil && s != nil {
-					scanRow = s
-					// Count only user-ingested records so the "new ingested
-					// records" counter matches what the DB poller will
-					// actually scan (see sorSourceFilter above).
-					if cnt, cErr := r.repository.CountRecordsAfterCursorBySource(ctx, s.StartedAt, "", sorSourceFilter, inScopeHostnames); cErr == nil {
-						ingestedCount = cnt
-					}
-				}
+				r.cleanupDeparosRecords(ctx)
 			}
+		}},
+	PhaseTargetedReSpider: {tag: "respider", label: "respider", run: (*Runner).runTargetedReSpiderPhase},
+	PhaseParamMining:      {tag: "param-mining", label: "param-mining", run: (*Runner).runParamMiningPhase},
+	PhaseSeed: {tag: "seed", label: "seed", run: (*Runner).seedCLITargets,
+		started: "seeding CLI targets", completed: "seeding completed", failed: "CLI target seeding failed: "},
+	PhaseKnownIssueScan: {tag: "known-issue-scan", label: "known-issue-scan", run: (*Runner).runKnownIssueScanPhase,
+		after: func(r *Runner, ctx context.Context) { r.deduplicateFindings(ctx, "KnownIssueScan") }},
+	PhaseDynamicAssessment: {tag: "dynamic-assessment", label: "dynamic-assessment", selfStart: true,
+		run: (*Runner).runDynamicAssessmentStep},
+}
 
-			// Processed Records: X / Y (new ingested records: Z)
-			//   X = records the executor has finished scanning
-			//   Y = total records this scan has ever seen (ingested so far)
-			//   Z = records that arrived since the previous status tick
-			totalModules := activeCount + passiveCount
-			var recordsStr string
-			if ingestedCount >= 0 {
-				delta := ingestedCount
-				if prevIngestedCount >= 0 {
-					delta = ingestedCount - prevIngestedCount
-					if delta < 0 {
-						delta = 0
-					}
-				}
-				recordsStr = fmt.Sprintf("%d / %d (new ingested records: %d)",
-					processed, ingestedCount, delta)
-				prevIngestedCount = ingestedCount
-			} else {
-				recordsStr = fmt.Sprintf("%d", processed)
-			}
+// runDynamicAssessmentStep is dynamic assessment's dispatch entry: it resolves
+// the modules first, so a run with none is reported skipped rather than started.
+func (r *Runner) runDynamicAssessmentStep(ctx context.Context, infra *phaseInfra) error {
+	activeModules, passiveModules := r.resolveAllModules(infra)
+	if len(activeModules) == 0 && len(passiveModules) == 0 {
+		zap.L().Info("No modules to execute")
+		r.scanLogger.Info("dynamic-assessment", "skipped, no modules to execute")
+		// Skipped, not completed: a scan that ran no modules at all must not
+		// be reportable as a clean assessment. It is still a COMPLETE scan —
+		// nothing was missed, there was nothing to do — which is why
+		// no_modules is the one skip reason Completion treats as benign.
+		r.currentPhase.Load().markSkipped(database.ReasonNoModules)
+		return errPhaseSkipped
+	}
+	r.scanLogger.InfoWithMeta("dynamic-assessment", "phase started", map[string]interface{}{
+		"active_modules":  len(activeModules),
+		"passive_modules": len(passiveModules),
+	})
+	return r.runDynamicAssessmentPhase(ctx, infra, activeModules, passiveModules)
+}
 
-			// Modules: <scanned> / <total> — how many enabled modules have been
-			// evaluated against any record so far, out of the full set. Counts
-			// both modules that ran AND modules whose CanProcess rejected the
-			// input shape (e.g., POST-only modules on a GET request) — so the
-			// counter can reach parity with the total once every module has been
-			// seen, instead of stalling on the "always-rejected" set forever.
-			scannedModules := distinctModules
-			if sorExecutor != nil {
-				scannedModules = sorExecutor.ConsideredModuleCount()
-			}
-			modulesStr := terminal.FormatModuleCount(scannedModules, totalModules, timedOut)
+// phaseRunnerFor returns the dispatch entry for phase: the Runner's own table
+// when a test installed one, else defaultPhaseRunners.
+func (r *Runner) phaseRunnerFor(phase NativePhase) (phaseRunner, bool) {
+	if r.phaseRunners != nil {
+		p, ok := r.phaseRunners[phase]
+		return p, ok
+	}
+	p, ok := defaultPhaseRunners[phase]
+	return p, ok
+}
 
-			// Optional suffix: when no workers are in-flight and the source has
-			// been quiet for a while, surface "idle <duration>" so the user knows
-			// the scan is alive but waiting for new ingested records.
-			var idleSuffix string
-			inFlight := int64(0)
-			if sorExecutor != nil {
-				inFlight = sorExecutor.InFlight()
-			}
-			if inFlight == 0 {
-				if idleFor := continuousSource.IdleFor(); idleFor >= idleDisplayThreshold {
-					idleSuffix = " | " + terminal.Muted(fmt.Sprintf("idle %s", fmtDuration(idleFor)))
-				}
-			}
+// executeNativePhase runs one phase through its dispatch entry and applies the
+// phase-error policy (see phase_errors.go). It returns an error only when the
+// scan must stop: a fatal infrastructure error, wrapped with the phase's name.
+// A phase that fails for any other reason is recorded (outcome failed, reason
+// phase_error, an `error` event) and nil is returned, so the next phase runs.
+func (r *Runner) executeNativePhase(ctx context.Context, infra *phaseInfra, phase NativePhase) (err error) {
+	// One tracker per phase, wrapped around the dispatch so the tracker sees the
+	// same outcome the caller does.
+	//
+	// r.currentPhase is set so the module result callbacks — which run on worker
+	// goroutines with no idea which phase they belong to — can count a finding
+	// against the phase that produced it.
+	tracker := r.beginPhase(ctx, string(phase), infra.httpRequester)
+	r.currentPhase.Store(tracker)
+	// Account the phase's logged-out traffic (responses_while_logged_out,
+	// auth_lost) when it finishes.
+	infra.sessions.trackPhase(tracker)
+	// Phases that run core.Executor report done/total off every executor they
+	// start, however deep in the phase it is built (dynamic assessment builds
+	// one per feedback round). A context value rather than a parameter so the
+	// executor sites need not know the event stream exists. Values only: the
+	// derived context cancels exactly as ctx does, so finish reads the same Err.
+	if unit, ok := executorProgressUnit[phase]; ok {
+		tracker.setProgress(unit, tracker.executorProgress)
+		ctx = core.WithExecutorObserver(ctx, tracker.observeExecutor)
+		// extensions_all_failed, read off the same executors.
+		tracker.onFinish(noteExtensionsAllFailed)
+	}
+	liveness := r.liveness.Load()
+	liveness.PhaseStarted(string(phase))
+	breaker := infra.hostErrors()
+	refusedBefore := breaker.Refusals()
+	defer func() {
+		// Probes the breaker refused never reach the executor's own skip
+		// count; without this a phase whose host went down mid-way read clean.
+		tracker.noteGateRefusals(breaker, refusedBefore)
+		r.noteRateCeiling(tracker)
+		r.currentPhase.Store((*phaseTracker)(nil))
+		r.scanOutcome.append(tracker.finish(ctx, err))
+		liveness.PhaseEnded(string(phase), tracker.extraSentSoFar())
+	}()
 
-			prefix := terminal.Muted(terminal.SymbolChevron + " scan-on-receive " + terminal.SymbolPipe)
-			fmt.Fprintf(os.Stderr, "%s %s %s Processed Records: %s | Findings: %s | Modules: %s | Runtime: %s%s\n",
-				prefix,
-				terminal.BoldCyan("[status]"),
-				terminal.Cyan("scan-"+shortScanID),
-				terminal.HiBlue(recordsStr),
-				terminal.Orange(fmt.Sprintf("%d", findings)),
-				terminal.Yellow(modulesStr),
-				terminal.Gray(fmtDuration(elapsed)),
-				idleSuffix)
-			if r.repository != nil && scanRow != nil {
-				_ = r.repository.RefreshScanStats(ctx, infra.scanUUID)
-			}
+	p, ok := r.phaseRunnerFor(phase)
+	if !ok {
+		zap.L().Warn("No runner for native phase; skipping it", zap.String("phase", string(phase)))
+		return nil
+	}
+	r.setPhaseTag(p.tag)
+	if !p.selfStart {
+		r.scanLogger.Info(p.label, cmp.Or(p.started, "phase started"))
+	}
+	runErr := p.run(r, ctx, infra)
+	switch {
+	case runErr == nil:
+		r.scanLogger.Info(p.label, cmp.Or(p.completed, "phase completed"))
+		if p.after != nil {
+			p.after(r, ctx)
 		}
-
-		sorExecutor = core.NewExecutor(sorCfg, continuousSource, activeModules, passiveModules)
-		executor := sorExecutor
-		if oastService != nil {
-			oastService.SetRequestUUIDResolver(executor.ResolveRequestUUID)
-		}
-		_, err := executor.Execute(ctx)
-		if metrics := executor.ModuleMetrics(); len(metrics) > 0 {
-			logModuleMetrics(metrics)
-		}
-		if err != nil && ctx.Err() == nil {
-			return err
-		}
+		return nil
+	case errors.Is(runErr, errPhaseSkipped):
 		return nil
 	}
 
-	// Feedback loop: re-scan newly discovered URLs
-	for round := 0; round < feedbackRounds; round++ {
-		processed, err := r.runDynamicAssessmentRound(ctx, infra, round, inScopeHostnames, activeModules, passiveModules, baseExecutorCfg, oastService)
-		if err != nil {
-			zap.L().Error("DynamicAssessment: executor error", zap.Error(err), zap.Int("round", round))
-			break
-		}
-
-		// Deduplicate findings after each dynamic-assessment round
-		r.deduplicateFindings(ctx, "DynamicAssessment")
-
-		if ctx.Err() != nil {
-			zap.L().Info("DynamicAssessment: phase deadline reached, stopping feedback loop",
-				zap.Int("round", round+1), zap.Error(ctx.Err()))
-			break
-		}
-
-		if round < feedbackRounds-1 {
-			newCount, countErr := r.countRemainingDynamicAssessmentRecords(ctx, infra.scanUUID, inScopeHostnames)
-			if countErr != nil || newCount == 0 {
-				if countErr != nil {
-					zap.L().Debug("DynamicAssessment: failed to count remaining records", zap.Error(countErr))
-				}
-				break
-			}
-			r.printPhaseFeedback("DynamicAssessment",
-				fmt.Sprintf("%s new records discovered, starting round %d", terminal.Orange(fmt.Sprintf("%d", newCount)), round+2))
-			zap.L().Info("DynamicAssessment: new records discovered, starting next round",
-				zap.Int64("new_records", newCount))
-		}
-
-		if processed == 0 {
-			break
-		}
-
-		if round == feedbackRounds-1 {
-			newCount, countErr := r.countRemainingDynamicAssessmentRecords(ctx, infra.scanUUID, inScopeHostnames)
-			if countErr == nil && newCount > 0 {
-				fmt.Fprintf(os.Stderr, "  %s %s %s\n",
-					terminal.TipPrefix(), terminal.Orange(fmt.Sprintf("%d", newCount)), terminal.Gray(fmt.Sprintf("new records discovered but skipped (max_feedback_rounds=%d)", feedbackRounds)))
-				fmt.Fprintf(os.Stderr, "  %s %s %s\n",
-					terminal.TipPrefix(), terminal.Gray("enable multi-round scanning via"), terminal.Cyan("vigolium config dynamic-assessment.max_feedback_rounds=3"))
-			}
-		}
-	}
-
-	elapsed := time.Since(phaseStart)
-	r.printPhaseComplete("DynamicAssessment", fmt.Sprintf("all rounds completed in %s", terminal.HiPurple(fmtDuration(elapsed))))
-
-	return nil
-}
-
-func (r *Runner) runDynamicAssessmentRound(
-	ctx context.Context,
-	infra *phaseInfra,
-	round int,
-	inScopeHostnames []string,
-	activeModules []modules.ActiveModule,
-	passiveModules []modules.PassiveModule,
-	baseCfg core.ExecutorConfig,
-	oastService *oast.Service,
-) (int64, error) {
-	roundStart := time.Now()
-	dbSource := database.NewRiskPrioritizedDBInputSource(r.repository.DB(), r.repository, infra.scanUUID).
-		WithHostnames(inScopeHostnames)
-
-	executor := core.NewExecutor(baseCfg, dbSource, activeModules, passiveModules)
-	if oastService != nil {
-		oastService.SetRequestUUIDResolver(executor.ResolveRequestUUID)
-	}
-	_, err := executor.Execute(ctx)
-
-	if metrics := executor.ModuleMetrics(); len(metrics) > 0 {
-		logModuleMetrics(metrics)
-	}
-	if c := infra.httpRequester.Clusterer(); c != nil {
-		c.LogStats()
-	}
-	if err != nil {
-		return 0, err
-	}
-
-	processed := executor.Processed()
-	roundElapsed := time.Since(roundStart)
-	r.printPhaseComplete("DynamicAssessment",
-		fmt.Sprintf("round %d — %s items in %s", round+1, terminal.Orange(fmt.Sprintf("%d", processed)), terminal.HiPurple(fmtDuration(roundElapsed))))
-	zap.L().Info("DynamicAssessment: round completed",
-		zap.Int("round", round+1),
-		zap.Int64("processed", processed))
-	return processed, nil
-}
-
-func (r *Runner) countRemainingDynamicAssessmentRecords(ctx context.Context, scanUUID string, hostnames []string) (int64, error) {
-	currentScan, err := r.repository.GetScanByUUID(ctx, scanUUID)
-	if err != nil {
-		return 0, err
-	}
-	return r.repository.CountRecordsAfterCursor(ctx, currentScan.CursorAt, currentScan.CursorUUID, hostnames...)
-}
-
-// waitForNewRecords polls until at least one record exists after the scan cursor,
-// or the context is cancelled. Used by full-native-scan-on-receive to block between iterations.
-func (r *Runner) waitForNewRecords(ctx context.Context, scanUUID string, pollInterval time.Duration) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		count, err := r.countRemainingDynamicAssessmentRecords(ctx, scanUUID, nil)
-		if err != nil {
-			zap.L().Debug("waitForNewRecords: query error", zap.Error(err))
-		}
-		if count > 0 {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
-		}
-	}
-}
-
-// runKnownIssueScan executes known issue scanning using the nuclei Go library.
-func (r *Runner) runKnownIssueScan(ctx context.Context, onResult func(*output.ResultEvent)) error {
-	if r.repository == nil {
-		return fmt.Errorf("known-issue-scan: database repository required")
-	}
-
-	// Query distinct paths from DB and build targets
-	paths, err := r.repository.GetDistinctPaths(ctx, r.options.ProjectUUID)
-	if err != nil {
-		return fmt.Errorf("known-issue-scan: failed to query paths: %w", err)
-	}
-	if len(paths) == 0 {
-		zap.L().Info("KnownIssueScan: no hosts in database, skipping")
+	r.scanLogger.Error(p.label, cmp.Or(p.failed, "phase failed: ")+runErr.Error())
+	switch {
+	case stoppedByScanContext(ctx, runErr):
+		// The scan's context ended under the phase. finish marks the phase
+		// partial with that context's stop reason, and the phase loop records
+		// the phases that never started; this is not the phase's failure.
+		zap.L().Warn("Phase stopped with the scan", zap.String("phase", string(phase)), zap.Error(runErr))
+		return nil
+	case isFatalPhaseError(runErr):
+		// RETURNED, so it ends the scan and rides out on scan.finished; the
+		// tracker records it once, in finish, without a non-fatal `error` event.
+		zap.L().Error("Phase failed; stopping the scan", zap.String("phase", string(phase)), zap.Error(runErr))
+		return fatal(fmt.Errorf("%s phase failed: %w", phase, runErr))
+	default:
+		zap.L().Error("Phase failed; the scan continues without it", zap.String("phase", string(phase)), zap.Error(runErr))
+		tracker.noteError(runErr)
+		tracker.markPartial(database.ReasonPhaseError)
 		return nil
 	}
-
-	enrichTargets := true
-	if r.settings != nil {
-		enrichTargets = r.settings.KnownIssueScan.EnrichTargets
-	}
-
-	var targets []string
-	if enrichTargets {
-		targets = buildKnownIssueScanTargetsFromPaths(paths)
-	} else {
-		targets = buildKnownIssueScanHostTargets(paths)
-	}
-
-	zap.L().Info("KnownIssueScan: targets from database", zap.Int("count", len(targets)))
-
-	// Build KnownIssueScan config from settings
-	cfg := knownissuescan.Config{
-		Targets:     targets,
-		Concurrency: r.options.Concurrency,
-		ScanUUID:    r.options.ScanUUID,
-		ProjectUUID: r.options.ProjectUUID,
-		ProxyURL:    r.options.ProxyURL,
-		Headers:     r.options.Headers,
-		OnResult:    onResult,
-		Repository:  r.repository,
-	}
-
-	// Apply YAML settings
-	if r.settings != nil {
-		knownIssueScanCfg := &r.settings.KnownIssueScan
-		cfg.Tags = knownIssueScanCfg.Tags
-		cfg.ExcludeTags = knownIssueScanCfg.ExcludeTags
-		cfg.Severities = knownIssueScanCfg.Severities
-		if knownIssueScanCfg.TemplatesDir != "" {
-			cfg.TemplatesDir = config.ExpandPath(knownIssueScanCfg.TemplatesDir)
-		}
-
-		// scanning_pace.known-issue-scan controls speed
-		knownIssueScanPace := r.settings.ScanningPace.ResolvePhase("known-issue-scan")
-		if !r.options.ConcurrencyExplicitlySet && knownIssueScanPace.Concurrency > 0 {
-			cfg.Concurrency = knownIssueScanPace.Concurrency
-		}
-		if knownIssueScanPace.RateLimit > 0 {
-			cfg.RateLimit = knownIssueScanPace.RateLimit
-		}
-		if knownIssueScanPace.MaxDuration > 0 {
-			cfg.Timeout = knownIssueScanPace.MaxDuration
-		}
-	}
-
-	return knownissuescan.Run(ctx, cfg)
-}
-
-// runExternalHarvestPhase runs external intelligence harvesting as a standalone phase.
-// Harvested URLs are ingested into the httpRecords table via an Executor with zero modules.
-func (r *Runner) runExternalHarvestPhase(ctx context.Context, infra *phaseInfra) error {
-	if len(r.options.Targets) == 0 {
-		return nil
-	}
-
-	phaseStart := time.Now()
-
-	src := r.buildExternalHarvesterSource()
-	if src == nil {
-		zap.L().Warn("ExternalHarvest: no source could be built, skipping")
-		return nil
-	}
-
-	r.printPhaseStart("ExternalHarvest", "harvest URLs from external intelligence sources")
-
-	ehSpeedDetail := fmt.Sprintf("Speed: concurrency=%s, max-per-host=%s",
-		terminal.HiBlue(fmt.Sprintf("%d", r.options.Concurrency)),
-		terminal.HiBlue(fmt.Sprintf("%d", r.options.MaxPerHost)))
-	if r.settings != nil {
-		ehPace := r.settings.ScanningPace.ResolvePhase("external_harvester")
-		if ehPace.MaxDuration > 0 {
-			ehSpeedDetail += fmt.Sprintf(", max-duration=%s", terminal.HiTeal(ehPace.MaxDuration.String()))
-		}
-		if ehPace.DurationFactor > 0 {
-			ehSpeedDetail += fmt.Sprintf(" (duration_factor=%s)", terminal.HiBlue(fmt.Sprintf("%.1f", ehPace.DurationFactor)))
-		}
-	}
-	r.printPhaseDetail(ehSpeedDetail)
-	r.printTargetDetail(r.formatTargetCounts(ctx, len(r.options.Targets)))
-	r.printVerboseTargets(r.options.Targets)
-
-	zap.L().Info("ExternalHarvest: ingesting harvested URLs into database")
-
-	executorCfg := core.ExecutorConfig{
-		Workers:       r.options.Concurrency,
-		Services:      infra.svc,
-		HTTPRequester: infra.httpRequester,
-		Repository:    r.repository,
-		ScanUUID:      infra.scanUUID,
-		ScopeMatcher:  infra.scopeMatcher,
-		PauseCtrl:     r.pauseCtrl,
-		OnTraffic:     r.makeOnTraffic("harvest"),
-		OnResult: func(result *output.ResultEvent) {
-			if err := r.output.Write(result); err != nil {
-				zap.L().Error("Failed to write result", zap.Error(err))
-			}
-		},
-	}
-
-	executor := core.NewExecutor(executorCfg, src, nil, nil)
-	_, err := executor.Execute(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Increment processed_count for external harvest phase
-	if r.repository != nil && executor.Processed() > 0 {
-		if err := r.repository.IncrementProcessedCount(ctx, infra.scanUUID, executor.Processed()); err != nil {
-			zap.L().Warn("ExternalHarvest: failed to increment processed count", zap.Error(err))
-		}
-	}
-
-	elapsed := time.Since(phaseStart)
-	r.printPhaseComplete("ExternalHarvest", fmt.Sprintf("completed — %s items ingested in %s",
-		terminal.Orange(fmt.Sprintf("%d", executor.Processed())), terminal.HiPurple(fmtDuration(elapsed))))
-	zap.L().Info("ExternalHarvest: completed", zap.Int64("processed", executor.Processed()))
-	return nil
 }

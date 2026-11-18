@@ -9,23 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Log4Shell (CVE-2021-44228) and related Log4j JNDI injection vulnerabilities by
-injecting JNDI lookup payloads into HTTP headers and request parameters. Uses OAST
-(Out-of-band Application Security Testing) callbacks to confirm exploitation.
+	ModuleDesc = `**What it means:** The app uses an Apache Log4j version vulnerable to Log4Shell (CVE-2021-44228), where user input reaching a log statement triggers JNDI lookups that fetch and run remote code. Confirmed by injecting JNDI payloads into logged headers and seeing an out-of-band DNS/LDAP callback to the OAST server.
 
-## Notes
-- Requires an interactsh server (configured via oast settings)
-- Injects JNDI payloads into common HTTP headers (X-Forwarded-For, User-Agent, etc.)
-- Tests multiple JNDI obfuscation patterns to bypass WAF rules
-- Injects JNDI payloads into request parameters via insertion points
-- Findings arrive asynchronously via the OAST polling callback
-- Deduplication via DiskSet (per-request) and RHM (per-insertion-point)
+**How it's exploited:** An attacker sends a JNDI lookup pointing the server at a malicious LDAP/RMI endpoint; Log4j resolves it and loads a remote class, achieving unauthenticated RCE and full server compromise.
 
-## References
-- https://nvd.nist.gov/vuln/detail/CVE-2021-44228
-- https://logging.apache.org/log4j/2.x/security.html
-- https://www.lunasec.io/docs/blog/log4j-zero-day/`
+**Fix:** Upgrade Log4j to 2.17.1 or later (or remove the JndiLookup class) and patch all dependencies bundling vulnerable Log4j.`
 
 	ModuleConfirmation = "Confirmed when target server performs outbound DNS or LDAP lookup to OAST callback URL injected via JNDI expression"
 	ModuleSeverity     = severity.Critical

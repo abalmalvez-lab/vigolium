@@ -9,20 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively scans HTTP response bodies for leaked secrets, credentials, API keys,
-and connection strings using the Kingfisher secret detection engine.
+	ModuleDesc = `**What it means:** A secret (API key, token, password, private key, or DB connection string) was found in an HTTP response, served to anyone who can reach it. It is not tested against its service, so whether it is live is unverified; matches only on a redirect, header, reflected value, or pre-auth JWT are downgraded.
 
-## Notes
-- Scans response bodies only (no additional HTTP requests sent)
-- Skips binary/media content types
-- Uses lazy-initialized singleton Kingfisher scanner
-- Generates one finding per detected secret
+**How it's exploited:** An attacker who reads the response harvests the credential and reuses it against the matching service for account takeover or data theft.
 
-## References
-- https://github.com/mongodb/kingfisher`
+**Fix:** Remove and immediately rotate the secret, and keep secrets server-side or in a secrets manager, never in client-facing content.`
 
-	ModuleConfirmation = "Confirmed when Kingfisher detects a known secret pattern in the HTTP response body"
+	ModuleConfirmation = "Confirmed when the native secret detector matches a known secret pattern in the HTTP response body"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"info-disclosure", "file-exposure", "light"}

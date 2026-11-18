@@ -48,7 +48,7 @@ func (*inspectRecordTool) Schema() map[string]any {
 		"properties": map[string]any{
 			"uuid": map[string]any{
 				"type":        "string",
-				"description": "Record UUID (from query_records).",
+				"description": "Record UUID (from query_records). A unique prefix works too - the first 8 characters are enough, so you don't have to copy all 36.",
 			},
 			"include_nested": map[string]any{
 				"type":        "boolean",
@@ -78,6 +78,7 @@ type inspectRecordOut struct {
 	ResponseLen     int64                 `json:"response_length"`
 	IsAuthenticated bool                  `json:"is_authenticated,omitempty"`
 	Source          string                `json:"source,omitempty"`
+	SurfaceScore    int                   `json:"surface_score,omitempty"`
 	Technology      []string              `json:"technology,omitempty"`
 	Headers         map[string]string     `json:"request_headers,omitempty"`
 	RawRequest      string                `json:"raw_request,omitempty"`
@@ -100,10 +101,15 @@ func (i *inspectRecordTool) Execute(ctx context.Context, args map[string]any, _ 
 		}, nil
 	}
 
-	rec, err := i.ctx.Repo.GetRecordByUUID(ctx, uuid)
+	rec, err := i.ctx.Repo.GetRecordByUUIDOrPrefix(ctx, uuid)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		// An ambiguous prefix names its candidates; surface that verbatim.
+		return tool.Result{Content: "inspect_record: " + err.Error(), IsError: true}, nil
+	}
 	if errors.Is(err, sql.ErrNoRows) || rec == nil {
 		return tool.Result{
-			Content: fmt.Sprintf("inspect_record: no record with uuid %q. Use query_records to discover valid UUIDs first — don't guess.", uuid),
+			Content: fmt.Sprintf("inspect_record: no record with uuid %q. Use query_records to discover valid UUIDs first — don't guess. "+
+				"The first 8 characters are enough; you don't have to copy all 36.", uuid),
 			IsError: true,
 		}, nil
 	}
@@ -166,6 +172,7 @@ func (i *inspectRecordTool) Execute(ctx context.Context, args map[string]any, _ 
 		ResponseLen:     rec.ResponseContentLength,
 		IsAuthenticated: rec.IsAuthenticated,
 		Source:          rec.Source,
+		SurfaceScore:    rec.SurfaceScore,
 		Technology:      rec.Technology,
 		Headers:         headers,
 		RawRequest:      rawReq,

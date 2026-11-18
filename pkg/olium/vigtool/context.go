@@ -9,12 +9,16 @@
 package vigtool
 
 import (
+	"context"
+	"time"
+
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/olium/tool"
+	"go.uber.org/zap"
 )
 
 // ScanContext pins the project/repo/config under which scan-launch tools
-// (run_scan, run_extension) operate. One instance per olium run.
+// (run_native_scan, run_extension) operate. One instance per olium run.
 type ScanContext struct {
 	// Repo is required. Without it, scans run but findings aren't
 	// persisted and the result struct comes back near-empty.
@@ -27,8 +31,10 @@ type ScanContext struct {
 	// Empty = default search.
 	ConfigPath string
 
-	// AgenticScanUUID is recorded for run-attribution (informational only
-	// today — the runner doesn't yet thread it onto the Scan row).
+	// AgenticScanUUID is the parent agentic scan. run_native_scan stamps it
+	// onto each child scan row and that scan's findings after the scan
+	// completes (Repository.AttributeScanToAgenticScan), so tool-launched
+	// scans surface under `finding --agentic-scan <parent>`.
 	AgenticScanUUID string
 
 	// Target is the run's primary target (URL or host). Used by
@@ -42,6 +48,32 @@ type ScanContext struct {
 	// Options.Scope). Host-like entries widen the send_raw_http allowlist
 	// beyond the primary Target host.
 	Scope []string
+}
+
+// attributeChildScan links a native scan this run launched (and its findings)
+// to the parent agentic scan, so tool-launched scans surface under
+// `finding --agentic-scan <parent>`. Every scan-launch tool (run_native_scan,
+// run_module, run_extension) calls it after its blocking LaunchScan returns —
+// every finding exists by then. Best-effort: the scan already succeeded, so an
+// attribution hiccup is logged rather than surfaced as a tool failure. No-op
+// when the run isn't part of an agentic scan or has no repo.
+func (c *ScanContext) attributeChildScan(ctx context.Context, scanUUID string) {
+	if c == nil || c.Repo == nil || c.AgenticScanUUID == "" || scanUUID == "" {
+		return
+	}
+	// Detach from ctx. This runs immediately after a blocking scan, so the
+	// tool's deadline may have just fired — which is exactly when the scan
+	// was longest and the attribution matters most. On the caller's ctx the
+	// write would fail and the findings would exist in the DB but never
+	// appear under `finding --agentic-scan <parent>`.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := c.Repo.AttributeScanToAgenticScan(ctx, scanUUID, c.AgenticScanUUID); err != nil {
+		zap.L().Warn("agentic-scan attribution failed",
+			zap.String("scan_uuid", scanUUID),
+			zap.String("agentic_scan_uuid", c.AgenticScanUUID),
+			zap.Error(err))
+	}
 }
 
 // SessionsContext pins the read-only repo handle that session/finding query

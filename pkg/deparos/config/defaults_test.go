@@ -75,6 +75,17 @@ func TestDefaultConfig(t *testing.T) {
 		// Timeout: 10 seconds
 		assert.Equal(t, 10*time.Second, cfg.Engine.Timeout, "timeout should be 10 seconds")
 	})
+
+	t.Run("jstangle safety defaults", func(t *testing.T) {
+		assert.True(t, cfg.JSTangle.Enabled)
+		assert.Equal(t, "exact", cfg.JSTangle.ReplayMode)
+		assert.True(t, cfg.JSTangle.SourceMaps)
+		assert.True(t, cfg.JSTangle.AssetGraph)
+		assert.False(t, cfg.JSTangle.ProtocolHandshake)
+		assert.Equal(t, 500_000, cfg.JSTangle.MaxASTNodes)
+		assert.LessOrEqual(t, cfg.JSTangle.NormalInputMB, cfg.JSTangle.MaxASTInputMB)
+		assert.LessOrEqual(t, cfg.JSTangle.MaxASTInputMB, cfg.JSTangle.HardInputMB)
+	})
 }
 
 func TestDefaultCustomExtensions(t *testing.T) {
@@ -91,12 +102,14 @@ func TestDefaultCustomExtensions(t *testing.T) {
 
 func TestAllowedObservedExtensions(t *testing.T) {
 	// Verify the whitelist contains expected extensions
-	assert.Len(t, AllowedObservedExtensions, 92, "should have 92 allowed extensions")
+	assert.Len(t, AllowedObservedExtensions, 98, "should have 98 allowed extensions")
 
-	// Verify key extensions are in the whitelist
+	// Verify key extensions are in the whitelist, including the server-side
+	// route extensions used by the extension-confirm pipeline.
 	expectedExtensions := []string{
 		"php", "asp", "aspx", "jsp", "html", "htm", "js", "txt", "xml",
 		"bak", "backup", "old", "tmp", "log", "conf", "ini", "cfg",
+		"action", "do", "jspx", "ashx", "asmx", "cgi",
 	}
 	for _, ext := range expectedExtensions {
 		_, exists := AllowedObservedExtensions[ext]
@@ -118,28 +131,17 @@ func TestAllowedObservedExtensions(t *testing.T) {
 }
 
 func TestDefaultBackupExtensions(t *testing.T) {
-	// Verify the exported default list has 36 items
-	assert.Len(t, DefaultBackupExtensions, 36, "should have 36 backup extensions")
-
-	// Verify critical backup extensions are present
-	criticalBackups := []string{"bak", "old", "tmp", "backup"}
-	for _, ext := range criticalBackups {
-		assert.Contains(t, DefaultBackupExtensions, ext,
-			"should contain critical backup extension: %s", ext)
+	// Templates over the discovered file, ~40 of them.
+	assert.GreaterOrEqual(t, len(DefaultBackupExtensions), 35)
+	assert.LessOrEqual(t, len(DefaultBackupExtensions), 50)
+	for _, tmpl := range []string{"{f}~", "{f}.bak", ".{f}.swp", "{n}.bak", "{n}_old.{e}", "{f}.1", "{f}.zip"} {
+		assert.Contains(t, DefaultBackupExtensions, tmpl, "should contain backup template %s", tmpl)
 	}
-
-	// Verify archive formats are present
-	archiveFormats := []string{"zip", "tar", "gz"}
-	for _, ext := range archiveFormats {
-		assert.Contains(t, DefaultBackupExtensions, ext,
-			"should contain archive format: %s", ext)
-	}
-
-	// Verify config file extensions are present
-	configExts := []string{"conf", "ini"}
-	for _, ext := range configExts {
-		assert.Contains(t, DefaultBackupExtensions, ext,
-			"should contain config extension: %s", ext)
+	seen := map[string]bool{}
+	for _, tmpl := range DefaultBackupExtensions {
+		assert.Contains(t, tmpl, "{", "default %q must be a template, not a bare suffix", tmpl)
+		assert.False(t, seen[tmpl], "duplicate template %q", tmpl)
+		seen[tmpl] = true
 	}
 }
 

@@ -18,7 +18,7 @@ import (
 type probe struct {
 	path        string
 	name        string
-	markers     []string
+	markers     [][]string
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
@@ -28,7 +28,7 @@ var probes = []probe{
 	{
 		path:        "/api",
 		name:        "Spring Data REST API Root",
-		markers:     []string{`"_links"`, `"self"`, `"profile"`, `"href"`},
+		markers:     [][]string{{`"_links"`}, {`"profile"`}, {`"href"`}},
 		antiMarkers: []string{"404", "Not Found", "swagger", "openapi", "graphql"},
 		sev:         severity.Medium,
 		desc:        "Spring Data REST API root detected with HAL links, indicating auto-exposed repository endpoints that may lack authorization controls",
@@ -36,7 +36,7 @@ var probes = []probe{
 	{
 		path:        "/api/profile",
 		name:        "Spring Data REST ALPS Profile",
-		markers:     []string{`"alps"`, `"descriptor"`, `"representation"`},
+		markers:     [][]string{{`"alps"`}, {`"descriptor"`, `"representation"`}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Medium,
 		desc:        "Spring Data REST ALPS profile endpoint exposed, revealing full data model descriptors and entity relationships",
@@ -44,7 +44,7 @@ var probes = []probe{
 	{
 		path:        "/profile",
 		name:        "Spring Data REST Profile (root)",
-		markers:     []string{`"alps"`, `"descriptor"`, `"representation"`},
+		markers:     [][]string{{`"alps"`}, {`"descriptor"`, `"representation"`}},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE", "facebook", "twitter", "user"},
 		sev:         severity.Medium,
 		desc:        "Spring Data REST ALPS profile at root level, revealing data model metadata",
@@ -104,17 +104,30 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
+	urlx, err := ctx.URL()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Walk the web root plus any context-path prefixes of the observed URL so an
+	// endpoint mounted under server.servlet.context-path (e.g. /api/<endpoint>)
+	// is reached, not just the root path. Claim each (host, base) pair up front
+	// so a fully-deduped request issues no traffic — including the soft-404
+	// fingerprint below.
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
 		return nil, nil
 	}
 
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
-	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p, fp); result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, p := range probes {
+			if result := m.probeEndpoint(ctx, httpClient, p, base+p.path, fp); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 
@@ -136,11 +149,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetPath produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -159,22 +170,21 @@ func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	p probe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, p.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetPath produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -223,20 +233,17 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
-	}
-	if !matched {
+	// Confirm the marker groups, then drop the finding if a sub-directory
+	// catch-all serves the same markers for a nonexistent sibling (a handler that
+	// 200s every child path). Root-level probes are covered by the random-path 404
+	// fingerprint above, so the sibling probe is a no-op for them.
+	matchedMarkers, ok := modkit.MatchAndConfirmSibling(ctx, httpClient, probePath, body, p.markers)
+	if !ok {
 		return nil
 	}
 
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
 		URL:              targetURL,

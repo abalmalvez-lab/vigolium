@@ -9,24 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Express.js and NestJS applications by analyzing HTTP response
-headers, cookies, and error body patterns. Detects X-Powered-By header set to Express,
-NestJS default error shapes in JSON responses, connect.sid session cookie, and Express
-default weak ETag format.
+	ModuleDesc = `**What it means:** This passive check fingerprints the server as Express.js or NestJS (Node.js) from response artifacts: an X-Powered-By: Express header, the default NestJS JSON error shape (statusCode, message, error), or a connect.sid session cookie. Informational technology disclosure, not a vulnerability itself.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects Express via X-Powered-By header
-- Identifies NestJS by its default JSON error shape (statusCode, message, error)
-- Recognizes connect.sid session cookie as Express session middleware
-- Checks ETag header for Express default weak ETag format (W/"...")
-- Deduplicates by host to avoid redundant processing
+**How it's exploited:** An attacker uses the confirmed framework to look up stack CVEs and misconfigurations and tailor payloads (prototype pollution, middleware bypasses, session flaws) instead of probing blindly. The connect.sid cookie signals where session state lives.
 
-## References
-- https://expressjs.com/en/api.html
-- https://docs.nestjs.com/exception-filters
-- https://github.com/expressjs/session`
+**Fix:** Remove or override X-Powered-By (app.disable('x-powered-by') or helmet), rename the session cookie, and return generic error responses.`
 
 	ModuleConfirmation = "Confirmed when Express or NestJS-specific headers, cookies, or error body patterns are detected in the response"
 	ModuleSeverity     = severity.Info

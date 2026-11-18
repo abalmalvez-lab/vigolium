@@ -9,27 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Browser-confirmed XSS module. After a cheap pattern-matching pre-filter (response
-reflection or DOM source-to-sink heuristics) flags a candidate, the module loads
-the payload-armed URL in a real headless browser and observes JavaScript dialogs
-(alert/confirm/prompt). A confirmed match means JavaScript actually executed —
-no string-reflection guesswork.
+	ModuleDesc = `**What it means:** A browser-confirmed cross-site scripting (XSS) flaw: a URL query parameter or path segment reflects into the page or flows into a DOM sink, running attacker JavaScript in the victim's browser. The scanner injected an svg/onload=alert(canary) payload and watched a JavaScript dialog fire in a real headless browser.
 
-## Notes
-- Pre-filter runs first: never opens the browser unless reflection or a DOM
-  source-to-sink pattern is present. Every pre-filter check is a single HTTP
-  request the same as a regular reflected-XSS probe.
-- Limited to URL-side insertion points (query params, path) where browser
-  navigation can naturally carry the payload.
-- Each confirmation spins up an isolated browser session via spitolas.ProbeURL,
-  bounded by per-host and per-scan budgets.
-- Uses a unique canary in the alert message so cross-talk from unrelated alerts
-  is not mistaken for confirmation.
+**How it's exploited:** An attacker lures a victim to a crafted link carrying the payload. On load, the script runs in the site origin, enabling session/token theft, account takeover, or defacement.
 
-## References
-- https://owasp.org/www-community/attacks/DOM_Based_XSS
-- https://portswigger.net/web-security/cross-site-scripting/dom-based`
+**Fix:** Contextually encode URL-derived data on output, avoid dangerous DOM sinks (innerHTML, document.write, eval), and enforce a strict Content-Security-Policy.`
 
 	ModuleConfirmation = "Confirmed when a payload navigated through a real browser triggers a JavaScript dialog (alert/confirm/prompt) whose message contains the unique scan canary"
 	ModuleSeverity     = severity.High

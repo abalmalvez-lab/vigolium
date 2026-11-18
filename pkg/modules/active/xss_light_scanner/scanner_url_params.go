@@ -1,6 +1,7 @@
 package xss_light_scanner
 
 import (
+	"context"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -11,6 +12,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
+	"github.com/vigolium/vigolium/pkg/spitolas"
 	"go.uber.org/zap"
 )
 
@@ -21,6 +23,10 @@ type URLParamsModule struct {
 	rhm               dedup.Lazy[dedup.RequestHashManager]
 	transformAnalyzer *TransformAnalyzer
 	jsAnalyzer        *JavaScriptContextAnalyzer
+
+	// Probe runs the headless-browser confirmation step. Overridable so tests
+	// never spawn a real browser. Default: spitolas.ProbeURL.
+	Probe ProbeFunc
 }
 
 // NewURLParamsScanner creates a new URL parameters XSS scanner.
@@ -40,6 +46,7 @@ func NewURLParamsScanner() *URLParamsModule {
 		rhm:               dedup.LazyDefaultRHM("xss_light_url_params"),
 		transformAnalyzer: NewTransformAnalyzer(),
 		jsAnalyzer:        NewJavaScriptContextAnalyzer(),
+		Probe:             spitolas.ProbeURL,
 	}
 	m.ModuleTags = ModuleTags
 	return m
@@ -137,12 +144,9 @@ func (m *URLParamsModule) scanConvertedRequest(
 		return nil, nil
 	}
 
-	// Get base response for the converted request
-	parsedReq, err := httpmsg.ParseRawRequest(string(getRequest))
-	if err != nil {
-		return nil, err
-	}
-	parsedReq = parsedReq.WithService(ctx.Service())
+	// Get base response for the converted request. getRequest is well-formed
+	// raw, so wrap directly instead of re-parsing on this hot path.
+	parsedReq := httpmsg.NewRequestResponseRaw(getRequest, ctx.Service())
 
 	resp, _, err := httpClient.Execute(parsedReq, http.Options{})
 	if err != nil {
@@ -157,6 +161,9 @@ func (m *URLParamsModule) scanConvertedRequest(
 
 	// Scan each URL parameter
 	for _, ip := range urlPoints {
+		if scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
+			continue // another xss module already reported this param here
+		}
 		result, err := m.scanInsertionPointWithPrefixes(parsedReq, ip, baseBody, httpClient)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -166,10 +173,10 @@ func (m *URLParamsModule) scanConvertedRequest(
 		}
 
 		if result != nil && result.HasVulnerability() {
-			*foundXSS = true
-			evt := m.buildResultEvent(parsedReq, ip, result)
-			evt.Info.Description = "[POST→GET] " + evt.Info.Description
-			results = append(results, evt)
+			if evt := confirmXSS(m.Probe, parsedReq, ip, result, httpClient, "[POST→GET] ", nil); evt != nil {
+				*foundXSS = true
+				results = append(results, evt)
+			}
 		}
 	}
 
@@ -190,13 +197,19 @@ func (m *URLParamsModule) scanURLParameters(
 		return nil, err
 	}
 
-	// Create insertion points
-	points, err := httpmsg.CreateAllInsertionPoints(ctx.Request().Raw(), true)
+	// Create insertion points. Go through the executor's per-request LRU
+	// (keyed on request ID) instead of CreateAllInsertionPoints, which would
+	// re-run AnalyzeRequest and re-copy the whole request buffer — the module's
+	// primary entry already enumerated the identical (raw, includeNested=true)
+	// set, so this hits a warm cache.
+	// The full set: this module also tests URL parameter NAMES, an opt-in
+	// point type.
+	points, err := scanCtx.GetAllInsertionPoints(ctx.Request().Raw(), ctx.Request().ID(), true)
 	if err != nil {
 		return nil, err
 	}
 
-	// Filter to only URL parameters
+	// Filter to only URL parameters (values and names)
 	urlPoints := filterURLParamPoints(points)
 	if len(urlPoints) == 0 {
 		return nil, nil
@@ -220,6 +233,18 @@ func (m *URLParamsModule) scanURLParameters(
 
 	// Scan each URL parameter
 	for _, ip := range urlPoints {
+		if scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
+			continue // another xss module already reported this param here
+		}
+		// An empty base value cannot be checked against the stored page; the
+		// shared reflection probe settles "not reflected anywhere"
+		// with one request the other reflection modules reuse. Fails open.
+		if ip.BaseValue() == "" {
+			if prof, err := scanCtx.ReflectionProfile(context.Background(), ctx, ip, httpClient); err == nil &&
+				prof != nil && !prof.Blocked && !prof.Reflected() {
+				continue
+			}
+		}
 		result, err := m.scanInsertionPointWithPrefixes(ctx, ip, baseBody, httpClient)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
@@ -229,8 +254,10 @@ func (m *URLParamsModule) scanURLParameters(
 		}
 
 		if result != nil && result.HasVulnerability() {
-			*foundXSS = true
-			results = append(results, m.buildResultEvent(ctx, ip, result))
+			if evt := confirmXSS(m.Probe, ctx, ip, result, httpClient, "", nil); evt != nil {
+				*foundXSS = true
+				results = append(results, evt)
+			}
 		}
 	}
 
@@ -454,35 +481,5 @@ func (m *URLParamsModule) detectContext(
 
 	default:
 		return HTMLGeneric
-	}
-}
-
-// buildResultEvent creates a ResultEvent from scan result
-func (m *URLParamsModule) buildResultEvent(
-	ctx *httpmsg.HttpRequestResponse,
-	ip httpmsg.InsertionPoint,
-	result *XSSScanResult,
-) *output.ResultEvent {
-	urlx, _ := ctx.URL()
-
-	var evidenceParts []string
-	for _, ea := range result.ExploitableAnalyses {
-		evidenceParts = append(evidenceParts, ea.Context.String())
-	}
-	description := strings.Join(evidenceParts, " | ")
-
-	if result.UsedPrefix != "" && result.UsedPrefix != "none" {
-		description += " [bypass: " + result.UsedPrefix + "]"
-	}
-
-	return &output.ResultEvent{
-		URL:              urlx.String(),
-		Request:          string(ip.BuildRequest([]byte(result.PrimaryPayload.FullPayload))),
-		Response:         string(result.PrimaryResponse),
-		FuzzingParameter: ip.Name(),
-		ExtractedResults: []string{ip.BaseValue()},
-		Info: output.Info{
-			Description: description,
-		},
 	}
 }

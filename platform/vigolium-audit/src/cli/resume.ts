@@ -3,7 +3,13 @@ import { resolve, join } from "path";
 import chalk from "chalk";
 import { StateStore } from "../engine/state.js";
 import { failCli, parsePositiveUsd } from "./util.js";
-import type { AgentPlatform, AuditRecord, AuditMode, RunOptions } from "../engine/types.js";
+import type {
+  AgentPlatform,
+  AgentTransport,
+  AuditRecord,
+  AuditMode,
+  RunOptions,
+} from "../engine/types.js";
 
 /**
  * Subset of run flags that `vigolium-audit resume` accepts and forwards to
@@ -16,6 +22,7 @@ import type { AgentPlatform, AuditRecord, AuditMode, RunOptions } from "../engin
 export interface ResumeOptions {
   target?: string;
   agent?: string;
+  transport?: AgentTransport;
   strict?: boolean;
   maxCost?: number | string;
   output?: string;
@@ -24,8 +31,11 @@ export interface ResumeOptions {
   apiKey?: string;
   stripRaw?: boolean;
   keepRaw?: boolean;
+  keepSecrets?: boolean;
   focusFile?: string;
   expectedBehaviorsFile?: string;
+  knowledgeBase?: string;
+  knowledgeBaseRaw?: string;
   serial?: boolean;
   json?: boolean;
   debug?: boolean;
@@ -92,23 +102,31 @@ export async function resumeCommand(
     );
   }
 
-  const runOpts = buildRunOptions({ mode: picked.mode, targetDir, opts });
+  const runOpts = buildRunOptions({
+    mode: picked.mode,
+    auditId: picked.audit_id,
+    targetDir,
+    opts,
+  });
   const { runCommand } = await import("./run.js");
   await runCommand(runOpts);
 }
 
 function buildRunOptions(args: {
   mode: AuditMode;
+  auditId: string;
   targetDir: string;
   opts: ResumeOptions;
 }): RunOptions {
-  const { mode, targetDir, opts } = args;
+  const { mode, auditId, targetDir, opts } = args;
   const runOpts: RunOptions = {
     mode,
     target: targetDir,
     resume: true,
+    resumeAuditId: auditId,
   };
   if (opts.agent !== undefined) runOpts.agent = opts.agent as AgentPlatform;
+  if (opts.transport !== undefined) runOpts.transport = opts.transport;
   if (opts.strict !== undefined) runOpts.strict = opts.strict;
   if (opts.maxCost !== undefined) {
     const n = parsePositiveUsd(opts.maxCost);
@@ -123,8 +141,11 @@ function buildRunOptions(args: {
   if (opts.apiKey !== undefined) runOpts.apiKey = opts.apiKey;
   if (opts.stripRaw !== undefined) runOpts.stripRaw = opts.stripRaw;
   if (opts.keepRaw !== undefined) runOpts.keepRaw = opts.keepRaw;
+  if (opts.keepSecrets !== undefined) runOpts.keepSecrets = opts.keepSecrets;
   if (opts.focusFile !== undefined) runOpts.focusFile = opts.focusFile;
   if (opts.expectedBehaviorsFile !== undefined) runOpts.expectedBehaviorsFile = opts.expectedBehaviorsFile;
+  if (opts.knowledgeBase !== undefined) runOpts.knowledgeBase = opts.knowledgeBase;
+  if (opts.knowledgeBaseRaw !== undefined) runOpts.knowledgeBaseRaw = opts.knowledgeBaseRaw;
   if (opts.serial !== undefined) runOpts.serial = opts.serial;
   if (opts.json !== undefined) runOpts.json = opts.json;
   if (opts.debug !== undefined) runOpts.debug = opts.debug;

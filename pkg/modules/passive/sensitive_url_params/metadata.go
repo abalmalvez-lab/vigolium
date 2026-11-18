@@ -9,20 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects sensitive information passed via URL query parameters, which may
-be logged in server logs, browser history, and referrer headers.
+	ModuleDesc = `**What it means:** A sensitive value rides in a URL query parameter whose name matches a credential pattern (password, token, api_key, secret, access_token, session_id). URL values are not private: they land in server and proxy logs and browser history, and leak via the Referer header.
 
-## Notes
-- Detects passwords, tokens, API keys, and credentials in URL parameters
-- Pattern-based detection on both parameter names and values
-- Sensitive data in URLs is logged and may leak via Referer headers
+**How it's exploited:** Anyone with access to server, CDN, or analytics logs, or a linked site receiving the Referer, harvests the token or key and replays it to authenticate or hijack a session.
 
-## References
-- https://owasp.org/www-community/vulnerabilities/Information_exposure_through_query_strings_in_url
-- https://cwe.mitre.org/data/definitions/598.html`
+**Fix:** Move sensitive values out of the URL into the request body or an Authorization header, and rotate any exposed credential.`
 
-	ModuleConfirmation = "Indicated when URL query parameters contain names or values matching sensitive data patterns (password, token, key, secret)"
+	ModuleConfirmation = "Candidate when a boundary-matched credential parameter carries a substantive value; pagination tokens, public identifiers, and example or masked values remain observations"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"info-disclosure", "light"}

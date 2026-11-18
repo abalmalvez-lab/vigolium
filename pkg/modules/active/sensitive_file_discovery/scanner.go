@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
@@ -14,6 +15,12 @@ import (
 	"github.com/vigolium/vigolium/pkg/types/severity"
 	"github.com/vigolium/vigolium/pkg/utils"
 )
+
+// envAssignmentPattern matches a genuine dotenv KEY=VALUE assignment line
+// (uppercase env-style key at line start, optionally `export`-prefixed). It
+// gates the Critical .env findings: a bare "=" marker matched any non-HTML body
+// (JSON, CSS, config) that happened to contain an equals sign.
+var envAssignmentPattern = regexp.MustCompile(`(?m)^[ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]+[ \t]*=`)
 
 // notFoundFingerprint stores characteristics of a custom 404 page.
 type notFoundFingerprint struct {
@@ -73,28 +80,46 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
-	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	urlx, err := ctx.URL()
+	if err != nil {
 		return nil, nil
 	}
+
+	// Walk the web root plus every observed path prefix — INCLUDING static/asset
+	// and CDN-style directories (/assets, /static, ...), where a misconfigured
+	// server or object-storage front may serve an exposed .env/.git/backup that a
+	// root-only probe never reaches. Claim each (host, base) pair up front so a
+	// fully-deduped request issues no traffic, including the soft-404 fingerprint.
+	diskSet := m.ds.Get(scanCtx.DedupMgr())
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePathsIncludingStatic(urlx.Path))
+	if len(bases) == 0 {
+		return nil, nil
+	}
+	// Generic content-type probing is root-only and runs once per host — only when
+	// the root base "" was unclaimed in this batch (it is always first when present).
+	probeRoot := bases[0] == ""
 
 	// Fingerprint 404 page
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
 
-	for _, sf := range sensitiveFiles {
-		result := m.probeFile(ctx, httpClient, sf, fp)
-		if result != nil {
-			results = append(results, result)
+	// Marker-based sensitive files: probed under every candidate base path so a
+	// /<context>/.git/config or /assets/.env is found, not only the web root.
+	for _, base := range bases {
+		for _, sf := range sensitiveFiles {
+			result := m.probeFile(ctx, httpClient, scanCtx, sf, base+sf.path, fp)
+			if result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 
-	// Generic file probing (content-type + body differencing).
-	// Skip if 404 fingerprinting failed or if the 404 page itself returns
+	// Generic file probing (content-type + body differencing) stays root-anchored
+	// and runs once per host — only when the root base was first claimed in this
+	// batch. Skip if 404 fingerprinting failed or if the 404 page itself returns
 	// text/plain or octet-stream (we can't distinguish real files).
-	if fp != nil {
+	if probeRoot && fp != nil {
 		fpCT := fp.contentType
 		if !strings.Contains(fpCT, "text/plain") && !strings.Contains(fpCT, "application/octet-stream") {
 			for _, cat := range genericFileCategories {
@@ -127,11 +152,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetPath produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -157,27 +180,63 @@ func (m *Module) fingerprint404(
 	}
 }
 
+// confirms reports whether body is a genuine match for sf: no anti-marker is
+// present, at least one exact content marker matches, and — for a .env file — a
+// real KEY=VALUE assignment line exists (the credential markers DB_/SECRET/… only
+// corroborate; prose mentioning "SECRET" must not forge a Critical finding). It
+// is the single source of truth used by all three confirmation rounds and the
+// decoy-baseline check, so they stay consistent. matched carries the evidence
+// substrings; ok is false (and matched nil) when the body is not a real match.
+func (sf sensitiveFile) confirms(body string) (matched []string, ok bool) {
+	for _, anti := range sf.antiMarkers {
+		if strings.Contains(body, anti) {
+			return nil, false
+		}
+	}
+	// Strip the reflected probe path before marker matching so a marker that is
+	// also the path slug (e.g. "draft" for /api/draft, "preview" for /api/preview)
+	// cannot match on a page that merely echoes the requested URL into an href,
+	// breadcrumb, or JSON "path" field. Content-signature markers (KEY names, JSON
+	// keys) are unaffected — they don't appear inside the probe path.
+	matchBody := modkit.StripReflectedProbePath(body, sf.path)
+	for _, marker := range sf.markers {
+		if strings.Contains(matchBody, marker) {
+			matched = append(matched, marker)
+		}
+	}
+	if strings.HasPrefix(sf.path, "/.env") {
+		if !envAssignmentPattern.MatchString(body) {
+			return nil, false
+		}
+		if len(matched) == 0 {
+			matched = append(matched, "env assignment (KEY=VALUE)")
+		}
+		return matched, true
+	}
+	return matched, len(matched) > 0
+}
+
 // probeFile sends a GET request for a sensitive file and validates the response.
 func (m *Module) probeFile(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	sf sensitiveFile,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, sf.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetPath produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -220,32 +279,47 @@ func (m *Module) probeFile(
 		}
 	}
 
-	// Check anti-markers
-	for _, anti := range sf.antiMarkers {
-		if strings.Contains(body, anti) {
+	// Round 1 — content confirmation: status 200, no anti-marker, an exact content
+	// marker present (.env gated on a real KEY=VALUE assignment line).
+	if status != 200 {
+		return nil
+	}
+	matchedMarkers, ok := sf.confirms(body)
+	if !ok {
+		return nil
+	}
+
+	// Round 2 — reproduce: re-fetch the same path with the response cache bypassed.
+	// The body must stay a confirmed match AND remain textually stable, so a
+	// random / load-balanced / one-shot 200 cannot forge a finding. The candidate
+	// body is compared against both the reproduce and decoy bodies below, so its
+	// signature is built once here and reused.
+	bodySig := modkit.BodySignature(body)
+	repStatus, repBody, repOK := modkit.FetchPath(ctx, httpClient, probePath)
+	if !repOK || repStatus != 200 || !modkit.BodiesSimilarSig(bodySig, repBody) {
+		return nil
+	}
+	if _, ok := sf.confirms(repBody); !ok {
+		return nil
+	}
+
+	// Round 3 — decoy baseline: a same-extension random sibling under the same
+	// directory must NOT return a body equivalent to the candidate, and must not
+	// itself satisfy the markers. This subtracts sub-directory catch-alls (a SPA
+	// fallback, a logging proxy, an object-store wildcard) that serve identical
+	// content for every <dir>/*.<ext> — the "/orders/run.log equals
+	// /orders/<random>.log" false positive.
+	if decoyStatus, decoyBody, served := modkit.DecoyFileBaseline(scanCtx, ctx, httpClient, probePath); served && decoyStatus == status {
+		if modkit.BodiesSimilarSig(bodySig, decoyBody) {
+			return nil
+		}
+		if _, ok := sf.confirms(decoyBody); ok {
 			return nil
 		}
 	}
 
-	// Require status 200 and at least one marker match
-	if status != 200 {
-		return nil
-	}
-
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range sf.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
-	}
-	if !matched {
-		return nil
-	}
-
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + sf.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
 		URL:              targetURL,
@@ -256,7 +330,7 @@ func (m *Module) probeFile(
 		Info: output.Info{
 			Name:        fmt.Sprintf("Sensitive File: %s", sf.name),
 			Description: sf.desc,
-			Severity:    sf.sev,
+			Severity:    modkit.CapSeverity(sf.sev, severity.Medium),
 			Confidence:  ModuleConfidence,
 			Tags:        []string{"sensitive-file", "information-disclosure", "misconfiguration"},
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information"},
@@ -283,11 +357,9 @@ func (m *Module) probeGenericFile(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetPath produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -360,7 +432,7 @@ func (m *Module) probeGenericFile(
 		Info: output.Info{
 			Name:        fmt.Sprintf("Exposed %s: %s", categoryName, filename),
 			Description: categoryDesc,
-			Severity:    severity.Low,
+			Severity:    severity.Suspect,
 			Confidence:  severity.Tentative,
 			Tags:        []string{"sensitive-file", "information-disclosure", "misconfiguration"},
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information"},

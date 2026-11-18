@@ -33,20 +33,18 @@ import (
 func (h *Handlers) HandleAgentSwarm(c fiber.Ctx) error {
 	var req AgentSwarmRequest
 	if err := c.Bind().JSON(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "invalid request body: " + err.Error(),
-		})
+		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 	}
 
 	// Natural language prompt: resolve when explicit fields are empty
 	hasExplicitInput := req.Input != "" || len(req.Inputs) > 0 || req.HTTPRequestBase64 != "" || req.SourcePath != "" || req.Diff != "" || req.LastCommits > 0
 	if req.Prompt != "" && !hasExplicitInput {
-		if refused := h.refuseIfGuardrailBlocks(c, req.Prompt); refused != nil {
-			return refused
+		if refused, err := h.refuseIfGuardrailBlocks(c, req.Prompt); refused {
+			return err
 		}
-		resolved, resolveErr := h.resolvePromptIntent(c, req.Prompt)
-		if resolveErr != nil {
-			return resolveErr // already sent HTTP response
+		resolved, answered, resolveErr := h.resolvePromptIntent(c, req.Prompt)
+		if answered {
+			return resolveErr // error response already written
 		}
 		if req.DryRun {
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{"intent": resolved})
@@ -113,114 +111,112 @@ func (h *Handlers) HandleAgentSwarm(c fiber.Ctx) error {
 
 	// If base64 HTTP request is provided, ingest it and use the record UUID as input.
 	if req.HTTPRequestBase64 != "" {
-		recordUUID, err := h.ingestSwarmBase64(c, &req)
-		if err != nil {
-			return err // already sent HTTP response
+		recordUUID, answered, err := h.ingestSwarmBase64(c, &req)
+		if answered {
+			return err // error response already written
 		}
 		req.Inputs = append(req.Inputs, recordUUID)
 	}
 
 	inputs := req.EffectiveInputs()
 	if len(inputs) == 0 && req.SourcePath == "" && req.Diff == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "at least one input is required (input, inputs, http_request_base64, source, diff, or prompt field)",
-		})
+		return respondErrorMsg(c, fiber.StatusBadRequest, "at least one input is required (input, inputs, http_request_base64, source, diff, or prompt field)")
 	}
 
 	// Resolve intensity preset
-	swarmIntensity, intensityErr := agent.ValidateIntensity(req.Intensity)
-	if intensityErr != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{Error: intensityErr.Error()})
-	}
-	{
-		changed := map[string]bool{
-			"discover":          req.Discover,
-			"code-audit":        req.CodeAudit,
-			"triage":            req.Triage,
-			"max-iterations":    req.MaxIterations != 0,
-			"audit":             req.Audit != "",
-			"max-plan-records":  req.MaxPlanRecords != 0,
-			"master-batch-size": req.MasterBatchSize != 0,
-			"batch-concurrency": req.BatchConcurrency != 0,
-			"probe-concurrency": req.ProbeConcurrency != 0,
-			"browser":           req.Browser || req.RequiresBrowser,
-			"auth":              req.Auth || req.AuthRequired || req.RequiresBrowser,
-			"swarm-duration":    req.Timeout != "",
-		}
-		result := agent.ResolveSwarmIntensity(swarmIntensity, agent.SwarmIntensityPreset{
-			Discover:         req.Discover,
-			CodeAudit:        req.CodeAudit,
-			Triage:           req.Triage,
-			MaxIterations:    req.MaxIterations,
-			Audit:            req.Audit,
-			MaxPlanRecords:   req.MaxPlanRecords,
-			MasterBatchSize:  req.MasterBatchSize,
-			BatchConcurrency: req.BatchConcurrency,
-			ProbeConcurrency: req.ProbeConcurrency,
-			Browser:          req.Browser || req.RequiresBrowser,
-			Auth:             req.Auth || req.AuthRequired || req.RequiresBrowser,
-			SwarmDuration:    parseDurationOrDefault(req.Timeout, 12*time.Hour),
-		}, changed)
-		req.Discover = result.Discover
-		req.CodeAudit = result.CodeAudit
-		req.Triage = result.Triage
-		if req.MaxIterations == 0 {
-			req.MaxIterations = result.MaxIterations
-		}
-		if req.Audit == "" {
-			req.Audit = result.Audit
-		}
-		if req.MaxPlanRecords == 0 {
-			req.MaxPlanRecords = result.MaxPlanRecords
-		}
-		if req.MasterBatchSize == 0 {
-			req.MasterBatchSize = result.MasterBatchSize
-		}
-		if req.BatchConcurrency == 0 {
-			req.BatchConcurrency = result.BatchConcurrency
-		}
-		if req.ProbeConcurrency == 0 {
-			req.ProbeConcurrency = result.ProbeConcurrency
-		}
-		if !req.Browser {
-			req.Browser = result.Browser
-		}
-		if !req.Auth {
-			req.Auth = result.Auth
-		}
-		if req.Timeout == "" {
-			req.Timeout = result.SwarmDuration.String()
-		}
+	if err := applySwarmIntensityPreset(&req); err != nil {
+		return respondError(c, fiber.StatusBadRequest, err)
 	}
 
 	timeout := parseDurationOrDefault(req.Timeout, 12*time.Hour)
 
 	eng, cleanup, byokErr := h.engineForRequest(req.AgentBYOK)
 	if byokErr != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "byok: " + byokErr.Error(),
-		})
+		return respondError(c, fiber.StatusBadRequest, fmt.Errorf("byok: %w", byokErr))
 	}
 
 	return h.startSwarmRun(c, req, timeout, eng, cleanup)
 }
 
+// applySwarmIntensityPreset fills the request fields the caller left unset
+// from its intensity preset (quick/balanced/deep). The preset never sets
+// audit/piolium: a nested audit harness runs only when the request asks for
+// one.
+func applySwarmIntensityPreset(req *AgentSwarmRequest) error {
+	swarmIntensity, intensityErr := agent.ValidateIntensity(req.Intensity)
+	if intensityErr != nil {
+		return intensityErr
+	}
+	changed := map[string]bool{
+		"discover":       req.Discover,
+		"code-audit":     req.CodeAudit,
+		"triage":         req.Triage,
+		"max-iterations": req.MaxIterations != 0,
+		// The preset's audit mode is never applied: a nested agent CLI
+		// runs only when audit/piolium (or the prompt) asks for one.
+		"audit":             true,
+		"max-plan-records":  req.MaxPlanRecords != 0,
+		"master-batch-size": req.MasterBatchSize != 0,
+		"batch-concurrency": req.BatchConcurrency != 0,
+		"probe-concurrency": req.ProbeConcurrency != 0,
+		"browser":           req.Browser || req.RequiresBrowser,
+		"auth":              req.Auth || req.AuthRequired || req.RequiresBrowser,
+		"swarm-duration":    req.Timeout != "",
+	}
+	result := agent.ResolveSwarmIntensity(swarmIntensity, agent.SwarmIntensityPreset{
+		Discover:         req.Discover,
+		CodeAudit:        req.CodeAudit,
+		Triage:           req.Triage,
+		MaxIterations:    req.MaxIterations,
+		Audit:            req.Audit,
+		MaxPlanRecords:   req.MaxPlanRecords,
+		MasterBatchSize:  req.MasterBatchSize,
+		BatchConcurrency: req.BatchConcurrency,
+		ProbeConcurrency: req.ProbeConcurrency,
+		Browser:          req.Browser || req.RequiresBrowser,
+		Auth:             req.Auth || req.AuthRequired || req.RequiresBrowser,
+		SwarmDuration:    parseDurationOrDefault(req.Timeout, 12*time.Hour),
+	}, changed)
+	req.Discover = result.Discover
+	req.CodeAudit = result.CodeAudit
+	req.Triage = result.Triage
+	if req.MaxIterations == 0 {
+		req.MaxIterations = result.MaxIterations
+	}
+	if req.MaxPlanRecords == 0 {
+		req.MaxPlanRecords = result.MaxPlanRecords
+	}
+	if req.MasterBatchSize == 0 {
+		req.MasterBatchSize = result.MasterBatchSize
+	}
+	if req.BatchConcurrency == 0 {
+		req.BatchConcurrency = result.BatchConcurrency
+	}
+	if req.ProbeConcurrency == 0 {
+		req.ProbeConcurrency = result.ProbeConcurrency
+	}
+	if !req.Browser {
+		req.Browser = result.Browser
+	}
+	if !req.Auth {
+		req.Auth = result.Auth
+	}
+	if req.Timeout == "" {
+		req.Timeout = result.SwarmDuration.String()
+	}
+	return nil
+}
+
 // ingestSwarmBase64 decodes the base64-encoded HTTP request (and optional response),
 // saves it as an http_record, and returns the record UUID.
-func (h *Handlers) ingestSwarmBase64(c fiber.Ctx, req *AgentSwarmRequest) (string, error) {
+func (h *Handlers) ingestSwarmBase64(c fiber.Ctx, req *AgentSwarmRequest) (recordUUID string, answered bool, err error) {
 	if h.repo == nil {
-		return "", c.Status(fiber.StatusServiceUnavailable).JSON(ErrorResponse{
-			Error: ErrDatabaseRequired.Error(),
-			Code:  fiber.StatusServiceUnavailable,
-		})
+		return "", true, respondError(c, fiber.StatusServiceUnavailable, ErrDatabaseRequired)
 	}
 
 	rawReq, err := base64.StdEncoding.DecodeString(req.HTTPRequestBase64)
 	if err != nil {
-		return "", c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "invalid base64 in http_request_base64: " + err.Error(),
-			Code:  fiber.StatusBadRequest,
-		})
+		return "", true, respondError(c, fiber.StatusBadRequest, fmt.Errorf("invalid base64 in http_request_base64: %w", err))
 	}
 
 	var rr *httpmsg.HttpRequestResponse
@@ -230,10 +226,7 @@ func (h *Handlers) ingestSwarmBase64(c fiber.Ctx, req *AgentSwarmRequest) (strin
 		rr, err = httpmsg.ParseRawRequest(string(rawReq))
 	}
 	if err != nil {
-		return "", c.Status(fiber.StatusBadRequest).JSON(ErrorResponse{
-			Error: "failed to parse raw request: " + err.Error(),
-			Code:  fiber.StatusBadRequest,
-		})
+		return "", true, respondError(c, fiber.StatusBadRequest, fmt.Errorf("failed to parse raw request: %w", err))
 	}
 
 	// Attach response if provided.
@@ -254,16 +247,13 @@ func (h *Handlers) ingestSwarmBase64(c fiber.Ctx, req *AgentSwarmRequest) (strin
 		projectUUID = getProjectUUID(c)
 	}
 
-	recordUUID, err := h.saveRecord(c.Context(), rr, "agent-swarm", projectUUID)
+	recordUUID, err = h.saveRecord(c.Context(), rr, "agent-swarm", projectUUID)
 	if err != nil {
 		zap.L().Error("Failed to save ingested record for swarm", zap.Error(err))
-		return "", c.Status(fiber.StatusInternalServerError).JSON(ErrorResponse{
-			Error: "failed to save record: " + err.Error(),
-			Code:  fiber.StatusInternalServerError,
-		})
+		return "", true, respondError(c, fiber.StatusInternalServerError, fmt.Errorf("failed to save record: %w", err))
 	}
 
-	return recordUUID, nil
+	return recordUUID, false, nil
 }
 
 // startSwarmRun acquires a heavy agent slot, creates status tracking, and runs the agent swarm.
@@ -281,7 +271,7 @@ func (h *Handlers) startSwarmRun(c fiber.Ctx, req AgentSwarmRequest, timeout tim
 		return nil // 429 already sent
 	}
 
-	agenticScanUUID, err := h.registerRunningAgenticScan("swarm", req.Agent, req.ScanUUID)
+	agenticScanUUID, err := h.registerRunningAgenticScan("swarm", req.Agent, req.ScanUUID, projectUUID)
 	if err != nil {
 		h.releaseHeavyAgentSlotForProject(projectUUID)
 		if byokCleanup != nil {
@@ -322,16 +312,27 @@ func (h *Handlers) buildSwarmConfig(req AgentSwarmRequest, projectUUID string) a
 		normalizedSkip = append(normalizedSkip, agent.SwarmPhaseTriage)
 	}
 
-	// Apply scanning profile if specified
-	settings := h.settings
+	// Global → the project's overlay → the request's scanning profile. A
+	// private deep copy (settingsForProject): the profile overlay decodes into
+	// existing maps and pointers, which a shallow copy shares with h.settings.
+	settings, settingsErr := h.settingsForProject(projectUUID)
+	if settingsErr != nil {
+		// buildSwarmConfig has no error path; say so loudly rather than
+		// pretending the overlay applied.
+		zap.L().Warn("Project config overlay not applied to agent swarm; using global settings",
+			zap.String("project_uuid", projectUUID), zap.Error(settingsErr))
+		h.configWatcher.RLock()
+		settings = config.CloneSettings(h.settings)
+		h.configWatcher.RUnlock()
+		if settings == nil {
+			settings = config.DefaultSettings()
+		}
+	}
 	if req.Profile != "" {
 		profilePath := settings.ScanningStrategy.ResolveProfilePath(req.Profile)
 		profile, profileErr := config.LoadProfile(profilePath)
 		if profileErr == nil {
-			settingsCopy := *settings
-			if applyErr := config.ApplyProfile(&settingsCopy, profile); applyErr == nil {
-				settings = &settingsCopy
-			}
+			_ = config.ApplyProfile(settings, profile)
 		}
 	}
 
@@ -414,7 +415,7 @@ func (h *Handlers) buildSwarmConfig(req AgentSwarmRequest, projectUUID string) a
 
 	// Resolve a target URL for the scan runner.
 	// The runner needs at least one target to create an input source.
-	targetURL := h.resolveSwarmTargetURL(req)
+	targetURL := h.resolveSwarmTargetURL(req, projectUUID)
 
 	// Wire scan callback using the server's runner infrastructure
 	cfg.ScanFunc = h.buildServerAgentSwarmFunc(targetURL, projectUUID, req.ScanUUID, req.OnlyPhase, req.SkipPhases, settings, &generatedAuthConfig)
@@ -434,7 +435,8 @@ func (h *Handlers) buildSwarmConfig(req AgentSwarmRequest, projectUUID string) a
 		}
 	}
 
-	// Wire audit harness (audit or piolium, with auto-pick on availability).
+	// Wire the nested audit harness: only an explicit audit/piolium field (or
+	// a prompt that asks for one) launches it.
 	auditCfg, harness := h.resolveSwarmAuditCfgServer(req, sourcePath)
 	if auditCfg != nil {
 		cfg.Audit = auditCfg
@@ -454,7 +456,13 @@ func (h *Handlers) buildServerAgentSwarmFunc(targetURL, projectUUID, scanUUID, o
 			opts.Targets = []string{targetURL}
 		}
 		opts.ProjectUUID = projectUUID
+		// Prefer the pipeline-owned run-unique scan_uuid (passed via the
+		// ScanRequest) so it can attribute these findings to the run; fall back
+		// to any client-pinned scan_uuid.
 		opts.ScanUUID = scanUUID
+		if req.ScanUUID != "" {
+			opts.ScanUUID = req.ScanUUID
+		}
 		opts.HeuristicsCheck = "none"
 		opts.PassiveModules = []string{"all"}
 		opts.Silent = true
@@ -480,8 +488,12 @@ func (h *Handlers) buildServerAgentSwarmFunc(targetURL, projectUUID, scanUUID, o
 			}
 		}
 
-		// Clone settings to apply extension dir without mutating global
+		// Clone settings to apply extension dir without mutating global.
+		// Snapshot under the config-watcher read lock so a concurrent hot-reload
+		// swapping settings sections can't tear this value copy.
+		h.configWatcher.RLock()
 		settingsCopy := *settings
+		h.configWatcher.RUnlock()
 		if req.ExtensionDir != "" {
 			settingsCopy.DynamicAssessment.Extensions.Enabled = true
 			settingsCopy.DynamicAssessment.Extensions.ExtensionDir = req.ExtensionDir
@@ -578,7 +590,7 @@ func buildServerSyntheticCheckpoint(startFrom string) *agent.SwarmCheckpoint {
 
 // resolveSwarmTargetURL extracts a target URL from the swarm request.
 // It checks the URL hint, then tries each input to find a usable target.
-func (h *Handlers) resolveSwarmTargetURL(req AgentSwarmRequest) string {
+func (h *Handlers) resolveSwarmTargetURL(req AgentSwarmRequest, projectUUID string) string {
 	// The URL field is an explicit hint — use it directly if provided.
 	if req.URL != "" {
 		return req.URL
@@ -591,7 +603,9 @@ func (h *Handlers) resolveSwarmTargetURL(req AgentSwarmRequest) string {
 			return input
 		}
 		if h.repo != nil && len(input) == 36 && strings.Count(input, "-") == 4 {
-			if rec, err := h.repo.GetRecordByUUID(context.Background(), input); err == nil && rec != nil {
+			// Scope the record lookup to the request's active project so a raw
+			// UUID can't resolve a target from another project's traffic.
+			if rec, err := h.repo.GetRecordByUUID(context.Background(), input); err == nil && rec != nil && rec.ProjectUUID == projectUUID {
 				scheme := rec.Scheme
 				if scheme == "" {
 					scheme = "https"
@@ -620,8 +634,10 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 			defer byokCleanup()
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(h.runContext(), timeout)
 		defer cancel()
+		h.registerRunCancel(agenticScanUUID, cancel)
+		defer h.unregisterRunCancel(agenticScanUUID)
 
 		cfg := h.buildSwarmConfig(req, projectUUID)
 
@@ -646,6 +662,13 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 			})
 		}
 
+		// All SSE writes for this run funnel through one sink: the phase and
+		// progress callbacks below fire from the swarm runner's goroutines,
+		// concurrently with the chunk-drain loop and the finalization writes —
+		// a bufio.Writer is not safe for concurrent use, so the sink serializes
+		// them.
+		sink := newSSESink(w)
+
 		// Wire phase callback for SSE events
 		cfg.PhaseCallback = func(phase string) {
 			h.agentMu.Lock()
@@ -654,19 +677,21 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 			}
 			h.agentMu.Unlock()
 
-			_ = writeSSE(w, sseEvent{Type: "phase", Phase: phase})
+			_ = sink.send(sseEvent{Type: "phase", Phase: phase})
 		}
 
 		// Wire progress callback for SSE events
 		cfg.ProgressCallback = func(evt agent.ProgressEvent) {
-			_ = writeSSE(w, sseEvent{Type: "progress", Progress: &evt})
+			_ = sink.send(sseEvent{Type: "progress", Progress: &evt})
 		}
 
-		// Set up stream writer pipe AND tee to runtime.log.
+		// Set up stream writer pipe AND tee to runtime.log. Log file FIRST so
+		// the disk record is never gated on the SSE client; drainAgentPipeToSSE
+		// keeps reading pr after a disconnect so pw.Write never blocks.
 		pr, pw := io.Pipe()
 		var streamWriter io.Writer = pw
 		if logFile := h.openSessionRuntimeLog(sessionDir, agenticScanUUID); logFile != nil {
-			streamWriter = io.MultiWriter(pw, logFile)
+			streamWriter = io.MultiWriter(logFile, pw)
 			defer func() { _ = logFile.Close() }()
 		}
 		cfg.StreamWriter = streamWriter
@@ -684,21 +709,9 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 			done <- swarmRunResult{result: result, err: runErr}
 		}()
 
-		// Stream chunks
-		buf := make([]byte, 4096)
-		for {
-			n, readErr := pr.Read(buf)
-			if n > 0 {
-				if writeErr := writeSSE(w, sseEvent{Type: "chunk", Text: string(buf[:n])}); writeErr != nil {
-					_ = pr.Close()
-					<-done
-					return
-				}
-			}
-			if readErr != nil {
-				break
-			}
-		}
+		// Stream chunks. On client disconnect, keep draining to EOF so the
+		// finalization below (DB status → completed/failed) always runs.
+		clientConnected := drainAgentPipeToSSE(sink, pr, cancel)
 
 		res := <-done
 		now := time.Now()
@@ -706,8 +719,9 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 		status := h.agenticScanStatus[agenticScanUUID]
 
 		if res.err != nil {
+			runStatus := terminalStatusForRunErr(res.err)
 			if status != nil {
-				status.Status = "failed"
+				status.Status = runStatus
 				status.Error = res.err.Error()
 				status.CompletedAt = &now
 			}
@@ -719,13 +733,15 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 			// preflight failure). With UpdateAgenticScan's OmitZero, the
 			// re-write is idempotent if the runner already wrote.
 			h.enrichAgenticScanRecord(agenticScanUUID, func(run *database.AgenticScan) {
-				run.Status = "failed"
+				run.Status = runStatus
 				run.ErrorMessage = res.err.Error()
 				run.CompletedAt = now
 				run.DurationMs = now.Sub(run.StartedAt).Milliseconds()
 			})
 
-			_ = writeSSE(w, sseEvent{Type: "error", Error: res.err.Error()})
+			if clientConnected {
+				_ = sink.send(sseEvent{Type: "error", Error: res.err.Error()})
+			}
 			zap.L().Error("Agent swarm failed (streaming)",
 				zap.String("agentic_scan_uuid", agenticScanUUID),
 				zap.Error(res.err))
@@ -733,7 +749,7 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 		}
 
 		if status != nil && res.result != nil {
-			status.Status = "completed"
+			status.Status = database.CompletedAgenticScanStatus(res.result.Degraded)
 			status.CompletedAt = &now
 			status.FindingCount = res.result.TotalFindings
 			status.SwarmResult = res.result
@@ -747,7 +763,13 @@ func (h *Handlers) handleSwarmSSE(c fiber.Ctx, agenticScanUUID string, req Agent
 
 		webhook.FireAgenticScan(h.settings, h.repo, agenticScanUUID)
 
-		_ = writeSSE(w, sseEvent{Type: "done", SwarmResult: res.result})
+		if clientConnected {
+			_ = sink.send(sseEvent{Type: "done", SwarmResult: res.result})
+		}
+
+		// Drop the heavy swarm result from the long-lived status map now that
+		// it's persisted and streamed (the SSE used res.result, not the stored copy).
+		h.shedAgenticScanResult(agenticScanUUID)
 		zap.L().Info("Agent swarm completed (streaming)",
 			zap.String("agentic_scan_uuid", agenticScanUUID),
 			zap.Int("findings", res.result.TotalFindings))
@@ -761,8 +783,10 @@ func (h *Handlers) runBackgroundAgentSwarm(agenticScanUUID string, req AgentSwar
 		defer byokCleanup()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(h.runContext(), timeout)
 	defer cancel()
+	h.registerRunCancel(agenticScanUUID, cancel)
+	defer h.unregisterRunCancel(agenticScanUUID)
 
 	cfg := h.buildSwarmConfig(req, projectUUID)
 	// Pin the swarm runner's DB record UUID to our agenticScanUUID so its internal
@@ -853,7 +877,7 @@ func (h *Handlers) runBackgroundAgentSwarm(agenticScanUUID string, req AgentSwar
 		status.Error = runErr.Error()
 		status.CompletedAt = &now
 	} else {
-		status.Status = "completed"
+		status.Status = database.CompletedAgenticScanStatus(result != nil && result.Degraded)
 		status.CompletedAt = &now
 		if result != nil {
 			status.FindingCount = result.TotalFindings
@@ -864,6 +888,10 @@ func (h *Handlers) runBackgroundAgentSwarm(agenticScanUUID string, req AgentSwar
 	h.agentMu.Unlock()
 
 	h.persistAgenticScanCompleted(agenticScanUUID, &statusSnapshot)
+
+	// Drop the heavy swarm result blob from the status map post-persist (findings
+	// /records remain queryable from the DB).
+	h.shedAgenticScanResult(agenticScanUUID)
 
 	if runErr != nil {
 		webhook.FireAgenticScan(h.settings, h.repo, agenticScanUUID)

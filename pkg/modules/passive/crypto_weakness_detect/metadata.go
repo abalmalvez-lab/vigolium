@@ -9,23 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects cryptographic weaknesses in HTTP responses and cookies, including PHP magic hashes,
-weak hash algorithms near sensitive contexts, padding oracle indicators, and encrypted cookies
-without integrity protection (MAC).
+	ModuleDesc = `**What it means:** This passive check records cryptographic indicators, not proof: magic-hash or legacy credential-digest values, disclosed padding/decryption errors, and opaque block-aligned session cookies. Wire shape can't prove a cookie lacks integrity, and one error can't prove an oracle.
 
-## Notes
-- Analyzes both request cookies and response headers/body
-- Checks for MD5/SHA1 usage near password, token, or hash keywords
-- Detects padding oracle error messages that may enable ciphertext manipulation
-- Identifies encrypted cookie values that lack HMAC integrity verification
+**How it's exploited:** A magic hash bypasses loose comparisons via type juggling. MD5/SHA1 hashes are cheaply cracked. A padding-oracle error lets an attacker decrypt or forge ciphertext byte by byte. Unauthenticated cookies allow bit-flipping.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/09-Testing_for_Weak_Cryptography/
-- https://www.whitehatsec.com/blog/magic-hashes/`
+**Fix:** Use strict comparison, modern hashing (bcrypt/argon2, SHA-256+), authenticated encryption (AES-GCM or encrypt-then-HMAC), and generic errors that hide padding details.`
 
-	ModuleConfirmation = "Confirmed when response contains identifiable cryptographic weakness patterns such as magic hashes, weak hash usage, padding oracle errors, or unprotected encrypted cookies"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Passive indicators are observations/candidates only; confirmation requires code-level algorithm evidence or repeatable active comparison/ciphertext-mutation behavior"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"cryptography", "misconfiguration", "light"}
 )

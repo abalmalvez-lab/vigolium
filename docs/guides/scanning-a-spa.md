@@ -39,7 +39,7 @@ Vigolium requires a Chromium-based browser for spidering. On first use, it autom
 
 For environments where auto-download is not possible (air-gapped systems, containers), you can:
 
-1. Pre-install Chromium and point Vigolium to it via the `browser.executable_path` config option.
+1. Pre-install Chromium and set `spidering.browser_path`.
 2. Build an embedded binary that bundles Chromium:
    ```bash
    make deps-chrome && make build-embedded
@@ -48,7 +48,9 @@ For environments where auto-download is not possible (air-gapped systems, contai
 To verify the browser is available:
 
 ```bash
-vigolium scan -t https://example.com --only spidering --dry-run
+vigolium doctor --json
+# Install a managed Chrome for Testing when needed
+vigolium doctor --fix --only chrome
 ```
 
 ## Tuning Spidering
@@ -57,16 +59,57 @@ Spidering behavior is configurable via `vigolium-configs.yaml` or CLI flags:
 
 ```yaml
 spidering:
-  max_depth: 5          # Maximum navigation depth from the entry point
-  max_pages: 100        # Maximum number of pages to visit
-  max_duration: 300     # Timeout in seconds for the spidering phase
-  interaction:
-    click_buttons: true  # Click discovered buttons
-    fill_forms: true     # Auto-fill and submit forms
-    scroll: true         # Scroll pages to trigger lazy loading
+  max_depth: 5            # 0 means unlimited
+  max_states: 100         # 0 means unlimited
+  max_duration: 10m       # Go duration string
+  max_consecutive_fails: 100
+  browser_count: 1        # one browser per crawl; >1 is clamped to 1
+  tabs: 1                 # tabs of that browser crawling in parallel (max 16)
+  strategy: adaptive      # normal, random, oldest_first, shallow_first, adaptive
+  browser_engine: chromium # chromium, ungoogled, fingerprint
+  headless: true
+  no_cdp: false
+  max_listener_probe_nodes: 2000  # 0 = 2000, -1 = no cap
+  no_forms: false
 ```
 
-For large SPAs, increase `max_pages` and `max_depth` to ensure full coverage. For quick assessments, reduce them to keep scan times short.
+For large SPAs, increase `max_states`, depth, or duration. CLI
+`--spider-max-time`, `--browsers`, `--browser-engine`, `--headed`, `--no-cdp`,
+and `--no-forms` override the common runtime controls. `browser_count` /
+`--browsers` above 1 does not add parallelism: the crawler drives one browser
+and clamps the count to 1 (with a warning). `spidering.tabs` does: N tabs of
+that browser share one state graph and frontier, each claiming a state and
+firing its actions while the others work elsewhere. It stays `1` at every
+intensity until a multi-tab soak has passed. Tabs share one cookie jar, so on
+an app where a click can log the session out, set `tab_isolation: context` to
+give each extra tab its own. To crawl several targets at once, run them as
+separate processes.
+
+### Web components and shadow DOM
+
+The crawler finds clickables inside web components (Lit, Stencil, Angular
+`ShadowDom` encapsulation, design systems) as well as in the light DOM:
+
+- Elements matching the click selectors are found in every open shadow root,
+  every closed shadow root (through CDP; no page script can see inside one),
+  and same-origin iframes that a component renders inside its shadow root.
+- With CDP detection on (the default; `--no-cdp` turns it off), one pierced
+  `DOMDebugger.getEventListeners` call per state finds every element with a
+  `click` listener, closed roots included. `max_listener_probe_nodes` caps how
+  many of those become candidates per state.
+
+An element behind a shadow boundary is identified by a locator: the XPath of
+each shadow host, outermost first, then the element's XPath under the last
+root, e.g.
+`{"hostChain":["/html[1]/body[1]/x-cart[1]"],"innerXPath":"/div[1]/button[1]"}`.
+This is the action's identification in crawl graphs (`how: "locator"`).
+Light-DOM elements keep their plain XPath. Iframes in the light DOM are still
+crawled as frames; an iframe nested inside a frame that a shadow root hosts is
+not crawled.
+
+What the crawl may change (form edits, submissions, uploads, account actions,
+dialog answers) and which browser security exceptions are in force are
+explained in [Browser policy](browser-policy.md).
 
 ## Common Issues
 
@@ -74,20 +117,20 @@ For large SPAs, increase `max_pages` and `max_depth` to ensure full coverage. Fo
 
 If you see an error about a missing browser executable:
 
-- Ensure you have internet access for the auto-download, or set `browser.executable_path` to a local Chromium installation.
+- Ensure you have internet access for the auto-download, or set `spidering.browser_path` to a local Chromium installation.
 - In Docker containers, use the embedded build or install Chromium in the image.
 
 ### Timeouts
 
 SPAs with heavy client-side rendering or slow APIs may cause page load timeouts:
 
-- Increase the page timeout via `spidering.page_timeout` in the config.
+- Increase `spidering.max_duration` or pass `--spider-max-time`.
 - Ensure the target application is responsive and accessible from the scanner host.
 
 ### Headless Detection
 
 Some applications block headless browsers. Vigolium applies common evasion techniques by default, but if the application still blocks requests:
 
-- Try setting `browser.headless: false` for headed mode (requires a display server or Xvfb).
-- Use a custom user agent via `browser.user_agent` in the config.
+- Pass `--headed` or set `spidering.headless: false` (requires a display server or Xvfb).
+- Set `scanning_strategy.http.user_agent` or `VIGOLIUM_DEFAULT_UA`.
 - Consider feeding pre-recorded traffic (HAR, Burp XML) as input instead of relying on live spidering.

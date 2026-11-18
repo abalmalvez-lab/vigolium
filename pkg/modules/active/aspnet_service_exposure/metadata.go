@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed ASP.NET service endpoints. For .asmx URLs in traffic, probes
-?WSDL and ?disco for WSDL disclosure. For .svc URLs, probes ?wsdl and sends
-malformed SOAP to detect WCF detailed faults. Also probes common paths for
-OData metadata and legacy service endpoints.
+	ModuleDesc = `**What it means:** An ASP.NET web service leaks its internal definition or error details - an ASMX/WCF service serving its WSDL, an OData service exposing $metadata, or a WCF endpoint returning verbose .NET faults (includeExceptionDetailInFaults left on).
 
-## Notes
-- Runs once per host
-- Traffic-aware: inspects original request URL for .asmx/.svc extensions
-- Probes OData $metadata and common service paths
-- Tests WCF for verbose fault disclosure (includeExceptionDetailInFaults)
-- Fingerprints 404 to avoid false positives
+**How it's exploited:** An attacker reads the WSDL or OData metadata to enumerate every operation, parameter, and data type, then crafts targeted SOAP or OData calls to reach hidden functionality. Verbose faults leak stack traces and file paths, easing further attacks.
 
-## References
-- https://learn.microsoft.com/en-us/dotnet/framework/wcf/
-- https://learn.microsoft.com/en-us/aspnet/web-api/overview/odata-support-in-aspnet-web-api/`
+**Fix:** Disable WSDL/metadata publishing on production endpoints, restrict directory browsing, and set includeExceptionDetailInFaults to false.`
 
 	ModuleConfirmation = "Confirmed when service endpoints return WSDL definitions, OData metadata, or verbose fault details"
 	ModuleSeverity     = severity.Medium

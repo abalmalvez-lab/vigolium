@@ -9,21 +9,17 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects GraphQL introspection responses that leak the full API schema,
-including types, queries, mutations, and subscriptions.
+	ModuleDesc = `**What it means:** A captured JSON response structurally contains GraphQL data.__schema or data.__type with usable type information. This observes schema discovery, which many public GraphQL APIs intentionally support.
 
-## Notes
-- Checks JSON response bodies for introspection-specific fields (__schema, __type)
-- Requires confirmation fields (queryType, mutationType, subscriptionType, types) to avoid false positives
-- Runs per-request to catch endpoint-specific disclosures
+**How it's exploited:** Schema knowledge helps reconnaissance, but it does not show that a resolver is unauthorized, data is sensitive, or mutations are callable. Those require separate active authorization tests.
 
-## References
-- https://graphql.org/learn/introspection/
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/12-API_Testing/01-Testing_GraphQL`
+**Fix:** Disable GraphQL introspection in production (set introspection to false) and restrict schema access to trusted internal or development environments only.`
 
-	ModuleConfirmation = "Confirmed when response contains GraphQL introspection fields (__schema/__type) with schema definition markers"
-	ModuleSeverity     = severity.Medium
-	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"graphql", "api", "info-disclosure", "light"}
+	ModuleConfirmation = "Observed only when parsed JSON contains a usable data.__schema or data.__type object; resolver access and sensitivity are not inferred"
+	// Introspection being enabled is schema disclosure / a hardening gap, not a
+	// vulnerability on its own — many public GraphQL APIs enable it by design — so
+	// it is a Low-severity lead rather than Medium.
+	ModuleSeverity   = severity.Info
+	ModuleConfidence = severity.Firm
+	ModuleTags       = []string{"graphql", "api", "info-disclosure", "light"}
 )

@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,10 +12,38 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/audit/bin"
 	"github.com/vigolium/vigolium/pkg/cftbrowser"
+	"github.com/vigolium/vigolium/pkg/nucleitemplates"
 	"github.com/vigolium/vigolium/pkg/piolium"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
+
+// fixOut is where installation progress goes. It is stderr, not stdout, and
+// that is the whole point.
+//
+// This package is reached two ways. Interactively it is `vigolium doctor --fix`,
+// where the chatter is the user's feedback. It is also `vigolium init`, which
+// installs nuclei templates and Chrome for Testing as part of setup (scans
+// themselves fetch them lazily, per phase). That may be running under `--events
+// ndjson`, whose contract is that stdout carries the event stream and nothing
+// else, or it may be `doctor --fix --json`, which prints one JSON document.
+// Every line below was a bare fmt.Printf and every subprocess inherited
+// os.Stdout, so the very first run a new user or a CI job makes injected four
+// non-JSON lines plus a git clone's output into a machine stream — at exactly
+// the moment a consumer has no prior output to recover from.
+//
+// Routing all of it to stderr costs the interactive path nothing (a terminal
+// shows both) and makes the machine path correct by construction. Mirrors
+// cftbrowser.progressOut, which was fixed the same way for the same reason.
+var fixOut io.Writer = os.Stderr
+
+// fixf writes one progress line to fixOut. A failed write is dropped: this is
+// progress chatter, and losing a line to a closed stderr must not fail an
+// install that is otherwise working.
+func fixf(format string, args ...any) {
+	_, _ = fmt.Fprintf(fixOut, format, args...)
+}
 
 // FixResult holds the outcome of a single fix attempt.
 type FixResult struct {
@@ -22,6 +51,16 @@ type FixResult struct {
 	Label   string `json:"label"`
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// Skipped marks an install that was not attempted because it pipes a
+	// vendor installer into a shell and consent was not given.
+	Skipped bool `json:"skipped,omitempty"`
+	// Planned marks a --dry-run row: the install that would run, how, where
+	// to and roughly how large.
+	Planned     bool   `json:"planned,omitempty"`
+	Method      string `json:"method,omitempty"`
+	Source      string `json:"source,omitempty"`
+	Destination string `json:"destination,omitempty"`
+	Size        string `json:"size,omitempty"`
 }
 
 // fixableItem defines a fixable doctor check.
@@ -35,6 +74,29 @@ type fixableItem struct {
 	DependsOn []string
 	IsFailing func(*Report) bool
 	Fix       func(ctx context.Context, settings *config.Settings) error
+	// VendorScript marks an install that runs (or may bootstrap) a vendor
+	// script piped into a shell, or installs global agent tooling. It runs
+	// only with consent: named in --only, --yes, or a TTY confirmation.
+	VendorScript bool
+	// Refreshable items re-install when named in --only even if their check
+	// passes (`doctor --fix --only nuclei` refreshes the templates).
+	Refreshable bool
+	// Method, Destination and Size describe the install for --dry-run. Size
+	// is an approximate constant, or "unknown".
+	Method      string
+	Destination func(settings *config.Settings) string
+	Size        string
+}
+
+// FixOptions governs consent for VendorScript installs.
+type FixOptions struct {
+	// AssumeYes consents to every vendor install (doctor --fix --yes).
+	AssumeYes bool
+	// Confirm, when set, is asked per vendor install not named in --only
+	// (an interactive prompt); nil means no consent.
+	Confirm func(label, source string) bool
+	// DryRun lists the installs that would run (Planned rows) and runs none.
+	DryRun bool
 }
 
 // aliases maps short names to canonical fix keys.
@@ -76,21 +138,27 @@ func ResolveFixKey(name string) string {
 //  1. nuclei-templates / chromium — Native scan dependencies, surfaced first.
 //  2. bun — installed only when no npm is present (npm-equipped hosts use
 //     npm for the global installs); `--only bun` force-installs regardless.
-//  3. claude — Audit Path A (claude+audit).
-//  4. agent-browser — Olium-based modes (autopilot + swarm).
-//  5. pi — the runtime piolium loads into; Audit Path B.
-//  6. piolium — Audit Path B. Installs the @vigolium/piolium Pi extension
+//  3. vigolium-audit — prefetches the pinned helper (audit_external builds
+//     only; embedded builds never report it as fixable).
+//  4. claude — Audit Path A (claude+audit).
+//  5. agent-browser — Olium-based modes (autopilot + swarm).
+//  6. pi — the runtime piolium loads into; Audit Path B.
+//  7. piolium — Audit Path B. Installs the @vigolium/piolium Pi extension
 //     via `pi install npm:@vigolium/piolium`, self-resolving pi if missing.
 func fixRegistry() []fixableItem {
 	return []fixableItem{
 		{
-			Key:    "nuclei-templates",
-			Label:  "Nuclei Templates",
-			Source: "git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git ~/nuclei-templates",
+			Key:         "nuclei-templates",
+			Label:       "Nuclei Templates",
+			Source:      "release archive from github.com/projectdiscovery/nuclei-templates (pinned by known_issue_scan.templates_version)",
+			Refreshable: true,
 			IsFailing: func(r *Report) bool {
 				return r.NucleiTemplates != nil && r.NucleiTemplates.Status != StatusOK
 			},
-			Fix: fixNucleiTemplates,
+			Fix:         fixNucleiTemplates,
+			Method:      "download",
+			Destination: func(s *config.Settings) string { return config.ContractPath(nucleiTemplatesDir(s)) },
+			Size:        "~100 MB",
 		},
 		{
 			Key:     "chromium",
@@ -98,46 +166,82 @@ func fixRegistry() []fixableItem {
 			Source:  "Chrome for Testing (downloads via cftbrowser to local cache)",
 			ToolKey: "chromium",
 			Fix:     fixChromium,
+			Method:  "download",
+			Destination: func(*config.Settings) string {
+				return "~/.cache/vigolium/"
+			},
+			Size: "~150 MB",
 		},
 		{
-			Key:     "bun",
-			Label:   "Bun",
-			Source:  "curl -fsSL https://bun.sh/install | bash",
-			ToolKey: "bun",
-			Fix:     fixBun,
+			VendorScript: true,
+			Key:          "bun",
+			Label:        "Bun",
+			Source:       "curl -fsSL https://bun.sh/install | bash",
+			ToolKey:      "bun",
+			Fix:          fixBun,
+			Method:       "vendor installer script",
+			Destination:  func(*config.Settings) string { return "~/.bun/" },
+			Size:         "~100 MB",
 		},
 		{
-			Key:     "claude",
-			Label:   "Claude Code",
-			Source:  "curl -fsSL https://claude.ai/install.sh | bash",
-			ToolKey: "claude",
-			Fix:     fixClaude,
+			// Only an audit_external build has anything to fix here: it
+			// downloads the pinned helper, and --fix prefetches it so the
+			// first audit run does not. Embedded builds extract at check time.
+			Key:    "vigolium-audit",
+			Label:  "vigolium-audit helper",
+			Source: "download the pinned helper from " + bin.BaseURLEnv + " (audit_external builds)",
+			IsFailing: func(r *Report) bool {
+				c := r.EmbeddedBinaries["vigolium-audit"]
+				return bin.External() && c != nil && c.Status != StatusOK
+			},
+			Fix:    fixAuditHelper,
+			Method: "download",
+			Size:   "unknown",
 		},
 		{
-			Key:     "agent-browser",
-			Label:   "agent-browser",
-			Source:  "bun install --global agent-browser  (or npm install -g agent-browser)",
-			ToolKey: "agent-browser",
-			Fix:     fixAgentBrowser,
+			VendorScript: true,
+			Key:          "claude",
+			Label:        "Claude Code",
+			Source:       "curl -fsSL https://claude.ai/install.sh | bash",
+			ToolKey:      "claude",
+			Fix:          fixClaude,
+			Method:       "vendor installer script",
+			Size:         "unknown",
 		},
 		{
-			Key:     "pi",
-			Label:   "Pi (pi-coding-agent)",
-			Source:  "bun add -g @earendil-works/pi-coding-agent  (or npm install -g …)",
-			ToolKey: "pi",
-			Fix:     fixPi,
+			VendorScript: true,
+			Key:          "agent-browser",
+			Label:        "agent-browser",
+			Source:       "bun install --global agent-browser  (or npm install -g agent-browser)",
+			ToolKey:      "agent-browser",
+			Fix:          fixAgentBrowser,
+			Method:       "global package install (bun or npm)",
+			Size:         "unknown",
 		},
 		{
-			Key:    "piolium",
-			Label:  "Piolium (Pi extension)",
-			Source: "pi install npm:@vigolium/piolium",
+			VendorScript: true,
+			Key:          "pi",
+			Label:        "Pi (pi-coding-agent)",
+			Source:       "bun add -g @earendil-works/pi-coding-agent  (or npm install -g …)",
+			ToolKey:      "pi",
+			Fix:          fixPi,
+			Method:       "global package install (bun or npm)",
+			Size:         "unknown",
+		},
+		{
+			VendorScript: true,
+			Key:          "piolium",
+			Label:        "Piolium (Pi extension)",
+			Source:       "pi install npm:@vigolium/piolium",
 			IsFailing: func(r *Report) bool {
 				return r.Piolium != nil && r.Piolium.Status != StatusOK
 			},
 			// No DependsOn — fixPiolium self-resolves pi (and the JS
 			// package manager) so it works standalone under
 			// `--fix --only piolium` even on a bare host.
-			Fix: fixPiolium,
+			Fix:    fixPiolium,
+			Method: "pi extension install",
+			Size:   "unknown",
 		},
 	}
 }
@@ -197,7 +301,16 @@ func HasFixableIssues(r *Report) bool {
 // The standalone bun install is skipped by default when npm is present —
 // npm-equipped hosts use npm for the global installs. `--only bun` force-
 // installs bun regardless.
+//
+// Installs that pipe a vendor script into a shell or add global agent tooling
+// (VendorScript: bun, claude, agent-browser, pi, piolium) are skipped unless
+// named in only; RunFixesWith adds --yes and an interactive confirmation.
 func RunFixes(ctx context.Context, report *Report, settings *config.Settings, only []string) []FixResult {
+	return RunFixesWith(ctx, report, settings, only, FixOptions{})
+}
+
+// RunFixesWith is RunFixes with consent options for vendor installs.
+func RunFixesWith(ctx context.Context, report *Report, settings *config.Settings, only []string, opts FixOptions) []FixResult {
 	registry := fixRegistry()
 
 	// Resolve aliases in only list.
@@ -248,7 +361,37 @@ func RunFixes(ctx context.Context, report *Report, settings *config.Settings, on
 			key := item.ToolKey
 			isFailing = func(r *Report) bool { return toolFailing(r, key) }
 		}
-		if isFailing != nil && !isFailing(report) {
+		refresh := item.Refreshable && onlySet[item.Key]
+		if isFailing != nil && !isFailing(report) && !refresh {
+			continue
+		}
+
+		if opts.DryRun {
+			plan := FixResult{Key: item.Key, Label: item.Label, Planned: true, Method: item.Method,
+				Source: item.Source, Size: item.Size, Message: "would install"}
+			if plan.Size == "" {
+				plan.Size = "unknown"
+			}
+			if item.Destination != nil {
+				plan.Destination = item.Destination(settings)
+			}
+			if item.VendorScript && !onlySet[item.Key] && !opts.AssumeYes {
+				plan.Message = fmt.Sprintf("would ask before running `%s` (name it with --only %s or pass --yes)", item.Source, item.Key)
+			}
+			results = append(results, plan)
+			continue
+		}
+
+		// A vendor installer piped into a shell, or global agent tooling,
+		// runs only with consent: named in --only, --yes, or confirmed.
+		if item.VendorScript && !onlySet[item.Key] && !opts.AssumeYes &&
+			(opts.Confirm == nil || !opts.Confirm(item.Label, item.Source)) {
+			results = append(results, FixResult{
+				Key:     item.Key,
+				Label:   item.Label,
+				Skipped: true,
+				Message: fmt.Sprintf("skipped: runs `%s`; name it with --only %s or pass --yes", item.Source, item.Key),
+			})
 			continue
 		}
 
@@ -270,13 +413,13 @@ func RunFixes(ctx context.Context, report *Report, settings *config.Settings, on
 			continue
 		}
 
-		fmt.Printf("  %s %s %s\n",
+		fixf("  %s %s %s\n",
 			terminal.BoldCyan(terminal.SymbolStart),
 			terminal.White("Installing"),
 			terminal.BoldCyan(item.Label+"..."),
 		)
 		if item.Source != "" {
-			fmt.Printf("    %s %s\n", terminal.Gray("$"), terminal.Gray(item.Source))
+			fixf("    %s %s\n", terminal.Gray("$"), terminal.Gray(item.Source))
 		}
 
 		fixCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -310,18 +453,41 @@ func findBun() (string, error) {
 		return p, nil
 	}
 	candidate := config.ExpandPath("~/.bun/bin/bun")
-	if _, err := exec.LookPath(candidate); err == nil {
-		return candidate, nil
+	// Return LookPath's resolved path, not the candidate: on Windows the file
+	// on disk is bun.exe, and LookPath appends the PATHEXT extension it matched.
+	// Handing back the extensionless candidate would fail at exec time.
+	if p, err := exec.LookPath(candidate); err == nil {
+		return p, nil
 	}
 	return "", fmt.Errorf("bun not found in PATH or ~/.bun/bin/bun")
 }
 
-func fixBun(ctx context.Context, _ *config.Settings) error {
-	cmd := exec.CommandContext(ctx, "bash", "-c", "curl -fsSL https://bun.sh/install | bash")
-	cmd.Stdout = os.Stdout
+// runVendorInstaller runs a third-party install script, picking the flavor that
+// exists on this host: the POSIX `curl … | bash` one-liner everywhere, and the
+// vendor's PowerShell installer on Windows (a stock Windows box has neither
+// bash nor curl on PATH, so the POSIX form fails with a bare
+// "bash: file not found" that says nothing about what to do next).
+func runVendorInstaller(ctx context.Context, label, posixURL, windowsURL string) error {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		// -NoProfile keeps a user's profile from altering the install, and
+		// irm|iex is the invocation both vendors document for Windows.
+		cmd = exec.CommandContext(ctx, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+			"-Command", "irm "+windowsURL+" | iex")
+	} else {
+		cmd = exec.CommandContext(ctx, "bash", "-c", "curl -fsSL "+posixURL+" | bash")
+	}
+	cmd.Stdout = fixOut
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("bun install script failed: %w", err)
+		return fmt.Errorf("%s install script failed: %w", label, err)
+	}
+	return nil
+}
+
+func fixBun(ctx context.Context, _ *config.Settings) error {
+	if err := runVendorInstaller(ctx, "bun", "https://bun.sh/install", "https://bun.sh/install.ps1"); err != nil {
+		return err
 	}
 	// Verify installation.
 	if _, err := findBun(); err != nil {
@@ -331,42 +497,37 @@ func fixBun(ctx context.Context, _ *config.Settings) error {
 }
 
 func fixClaude(ctx context.Context, _ *config.Settings) error {
-	cmd := exec.CommandContext(ctx, "bash", "-c", "curl -fsSL https://claude.ai/install.sh | bash")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("claude install script failed: %w", err)
-	}
-	return nil
+	return runVendorInstaller(ctx, "claude", "https://claude.ai/install.sh", "https://claude.ai/install.ps1")
 }
 
 func fixChromium(ctx context.Context, _ *config.Settings) error {
 	if !cftbrowser.IsSupported() {
 		return fmt.Errorf("chrome for Testing not available for %s/%s — install Chromium manually", runtime.GOOS, runtime.GOARCH)
 	}
-	binPath, err := cftbrowser.EnsureBrowser(ctx)
+	binPath, err := cftbrowser.EnsureBrowser(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("chrome for Testing download failed: %w", err)
 	}
-	fmt.Printf("    Chrome for Testing installed: %s\n", binPath)
+	fixf("    Chrome for Testing installed: %s\n", binPath)
 	return nil
 }
 
 func fixNucleiTemplates(ctx context.Context, settings *config.Settings) error {
 	dir := nucleiTemplatesDir(settings)
-	// --quiet suppresses the "Cloning into…", "remote: …", and
-	// "Receiving/Resolving" progress chatter so `vigolium doctor --fix` and
-	// the first-run setup show a single success line. Real errors still go
-	// to stderr.
-	cmd := exec.CommandContext(ctx, "git", "clone", "--quiet", "--depth", "1",
-		"https://github.com/projectdiscovery/nuclei-templates.git", dir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
+	pin := nucleitemplates.Pin{}
+	if settings != nil {
+		pin = nucleitemplates.Pin{Version: settings.KnownIssueScan.TemplatesVersion, SHA256: settings.KnownIssueScan.TemplatesSHA256}
 	}
+	m, err := installTemplates(ctx, dir, pin)
+	if err != nil {
+		return err
+	}
+	fixf("    nuclei-templates %s installed at %s (sha256 %s)\n", m.Version, config.ContractPath(dir), shortDigest(m.SHA256))
 	return nil
 }
+
+// installTemplates is nucleitemplates.Install, replaceable in tests.
+var installTemplates = nucleitemplates.Install
 
 // findNpm locates the npm binary on PATH. npm ships with Node, so unlike
 // bun there's no well-known fixed install location to fall back to.
@@ -418,7 +579,7 @@ func ensureJSPM(ctx context.Context) (jsPM, error) {
 	if pm, ok := resolveJSPM(); ok {
 		return pm, nil
 	}
-	fmt.Printf("    %s no bun or npm found — bootstrapping bun\n",
+	fixf("    %s no bun or npm found — bootstrapping bun\n",
 		terminal.Gray(terminal.SymbolDot))
 	if err := fixBun(ctx, nil); err != nil {
 		return jsPM{}, fmt.Errorf("bootstrap bun: %w", err)
@@ -442,7 +603,7 @@ func (pm jsPM) installGlobal(ctx context.Context, pkg string) error {
 	default:
 		return fmt.Errorf("unknown package manager %q", pm.name)
 	}
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = fixOut
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s global install %s failed: %w", pm.name, pkg, err)
@@ -518,7 +679,7 @@ func fixPiolium(ctx context.Context, settings *config.Settings) error {
 		}
 	}
 	cmd := exec.CommandContext(ctx, piPath, "install", pioliumPiPackage)
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = fixOut
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("pi install %s failed: %w", pioliumPiPackage, err)
@@ -526,5 +687,16 @@ func fixPiolium(ctx context.Context, settings *config.Settings) error {
 	if err := piolium.Diagnose(); err != nil {
 		return fmt.Errorf("piolium installed but verification failed: %w", err)
 	}
+	return nil
+}
+
+// fixAuditHelper downloads, verifies and caches the pinned vigolium-audit
+// helper of an audit_external build.
+func fixAuditHelper(ctx context.Context, _ *config.Settings) error {
+	path, err := bin.PathContext(ctx)
+	if err != nil {
+		return err
+	}
+	fixf("    %s %s\n", terminal.Gray("installed"), terminal.Gray(config.ContractPath(path)))
 	return nil
 }

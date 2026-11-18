@@ -2,20 +2,23 @@
 
 ## Overview
 
-The agent API provides three run modes that mirror the `vigolium agent` CLI subcommands, plus session history and status endpoints:
+The agent API provides four run modes, plus session history and status endpoints:
 
 | Endpoint                         | CLI Equivalent              | Description                              |
 |----------------------------------|-----------------------------|------------------------------------------|
 | `POST /api/agent/run/query`      | `vigolium agent query`      | Single-shot prompt execution             |
 | `POST /api/agent/run/autopilot`  | `vigolium agent autopilot`  | Autonomous AI-driven scanning session    |
 | `POST /api/agent/run/swarm`      | `vigolium agent swarm`      | AI-guided multi-phase vulnerability swarm|
+| `POST /api/agent/run/audit`      | `vigolium agent audit`      | Unified audit / piolium dispatcher        |
 | `GET /api/agent/status/list`     | —                           | List runs with in-memory status          |
 | `GET /api/agent/status/:id`      | —                           | Get run status by ID                     |
-| `GET /api/agent/sessions`        | `vigolium agent sessions`   | Paginated session history from DB        |
+| `GET /api/agent/sessions`        | `vigolium agent session`    | Paginated session history from DB        |
 | `GET /api/agent/sessions/:id`    | —                           | Full session detail with debug fields    |
 | `GET /api/agent/sessions/:id/logs`| —                          | Raw console `runtime.log` (plain text or SSE tail)|
 
-All run modes share a global concurrency lock — only one agent run can be active at a time. Attempting to start a second run returns `409 Conflict`.
+Agent work is admission-controlled through separate light and heavy concurrency
+pools. A request waits up to `server.agent_queue_timeout` when its pool is full,
+then returns `429 Too Many Requests`; heavy runs also have a per-project cap.
 
 ---
 
@@ -82,7 +85,7 @@ Launches an AI agent that autonomously discovers, scans, and triages vulnerabili
 | Field              | Type     | Required | Description                                                    |
 |--------------------|----------|----------|----------------------------------------------------------------|
 | `prompt`           | string   | No       | Natural language scan prompt (parsed into target/source/focus when explicit fields are empty) |
-| `intensity`        | string   | No       | Scan intensity preset: `"quick"`, `"balanced"` (default), or `"deep"`. Bundles `max_commands`, `timeout`, `audit_mode`, and `browser` settings |
+| `intensity`        | string   | No       | Scan intensity preset: `"quick"`, `"balanced"` (default), or `"deep"`. Bundles `max_commands`, `timeout`, and `browser` settings (never the audit harness) |
 | `target`           | string   | No*      | Target URL to scan (derived from `input` if not set)           |
 | `input`            | string   | No       | Raw input (curl, raw HTTP, Burp XML, URL) — target extracted automatically |
 | `agent`            | string   | No       | Optional descriptive label persisted to the run record (provider is server-side from `agent.olium.*`) |
@@ -98,11 +101,14 @@ Launches an AI agent that autonomously discovers, scans, and triages vulnerabili
 | `stream`           | bool     | No       | If `true`, returns an SSE stream                               |
 | `scan_uuid`        | string   | No       | Link results to a specific scan UUID                           |
 | `project_uuid`     | string   | No       | Scope results to a project (falls back to `X-Project-UUID` header) |
-| `no_audit`        | bool     | No       | Disable automatic vigolium-audit (enabled by default when `source` is set) |
-| `audit_mode`      | string   | No       | Vigolium Audit mode: `"lite"` (default, 3-phase), `"balanced"` (9-phase), or `"deep"` (12-phase) |
+| `audit_mode`      | string   | No       | Run the nested vigolium-audit harness (a claude/codex CLI before the operator; needs `source`): `"lite"` (3-phase), `"balanced"` (9-phase), `"deep"` (12-phase) or `"mock"`. Empty = off |
+| `piolium`         | string   | No       | Run the nested piolium harness instead (needs `source`): `"lite"`, `"balanced"`, `"deep"`, `"longshot"`, … Empty = off; an installed piolium is never auto-selected |
+| `no_audit`        | bool     | No       | Keep the audit harness off (the default; kept for older clients) |
 | `audit`           | string   | No       | **DEPRECATED** — use `no_audit` + `audit_mode` instead. Legacy values: `"lite"`, `"balanced"`, `"deep"`, `"off"` |
 
 \* At least one of `target`, `input`, `source`, `diff`, or `prompt` is required.
+
+**Audit harness:** off by default, as with `vigolium agent autopilot` (`--audit` defaults to `off`). A `source` path or an `intensity` preset no longer starts it; set `audit_mode`, `audit` or `piolium` (or name an audit in `prompt`) to run one.
 
 **Source resolution:** The `source` field accepts local paths, git URLs (HTTPS or SSH), git URLs with embedded OAuth tokens (`https://oauth2:TOKEN@github.com/...`), and archive files. Git repos are cloned with `--depth 1` and archives are extracted into the session directory. OAuth tokens are stripped from logs.
 
@@ -202,17 +208,21 @@ curl -s -X POST http://localhost:9002/api/agent/run/autopilot \
 Launches an AI-guided multi-phase vulnerability swarm. The master agent analyzes inputs, selects scanner modules, generates custom JS extensions, executes scans, and triages results. The swarm phases are:
 
 1. **Normalize** — Parse and normalize inputs (native, no AI)
-2. **Auth** — Browser-based login (native, optional, requires `--browser-auth` + `--browser`)
+2. **Auth** — Browser-based login (optional; requires enabled browser integration and `auth: true`)
 3. **Source Analysis** — AI agents extract routes, auth flows, and extensions from source code *(conditional, requires source path)*
 4. **Code Audit** — AI security code audit *(conditional, requires `code_audit: true`)*
 5. **Discovery** — Content discovery and spidering *(conditional, requires discover flag)*
-6. **Plan** — Master agent analyzes targets, selects modules, generates quick checks and extensions
-7. **Extension** — Validate, merge, and write JS extensions to disk (native)
-8. **Scan** — Execute scanner modules with agent-selected filters and extensions (native)
-9. **Triage** — AI agent reviews findings, confirms or marks as false positive *(optional, requires `triage: true`)*
-10. **Rescan** — Targeted re-scanning based on triage follow-ups *(conditional, triggered by triage)*
+6. **Recon** — GET-only stack probe when source analysis did not supply usable facts
+7. **Plan** — Master agent selects modules, quick checks, and extensions
+8. **Discover re-entry** — Probe planner-referenced paths not yet tested
+9. **Extension** — Validate, merge, and write JS extensions (native)
+10. **Scan** — Execute native modules and extensions
+11. **Replan on empty** — Supplemental business-logic pass when the first scan is empty but signal remains
+12. **Triage / rescan** — Review findings and run targeted follow-ups when enabled
 
-AI agents are called at phases 3, 4, 6, and 9. When inputs exceed `master_batch_size` records, the master agent runs in parallel batches (default 5 records per batch) with plan merging.
+When inputs exceed `master_batch_size`, planning runs in bounded parallel
+batches and merges the plans. Exact conditional steps evolve with the pipeline;
+the response stream's phase events are authoritative for a run.
 
 **Request body:**
 
@@ -255,7 +265,7 @@ AI agents are called at phases 3, 4, 6, and 9. When inputs exceed `master_batch_
 | `module_names`         | string[] | No       | Explicit module IDs to use                                            |
 | `only_phase`           | string   | No       | Isolate a single phase                                                |
 | `skip_phases`          | string[] | No       | Skip specific phases                                                  |
-| `start_from`           | string   | No       | Resume from a specific phase (e.g. `"plan"`, `"triage"`)              |
+| `start_from`           | string   | No       | Start this new run at a specific phase (e.g. `"plan"`, `"triage"`); not checkpoint resume |
 | `max_iterations`       | int      | No       | Max triage→rescan rounds (default `3`)                                |
 | `discover`             | bool     | No       | Run discovery+spidering before master agent planning                  |
 | `code_audit`           | bool     | No       | Enable AI security code audit phase (requires `source`)               |
@@ -485,7 +495,7 @@ curl -s -X POST http://localhost:9002/api/agent/run/swarm \
   -H "Content-Type: application/json" \
   -d '{
     "input": "https://example.com/api/users?id=1",
-    "module_names": ["sqli-error-based", "sqli-blind-time", "sqli-blind-boolean"]
+    "module_names": ["sqli-error-based", "sqli-time-blind", "sqli-boolean-blind"]
   }' | jq .
 
 # Skip specific phases (e.g. skip triage for raw scan results)
@@ -496,7 +506,7 @@ curl -s -X POST http://localhost:9002/api/agent/run/swarm \
     "skip_phases": ["triage", "native-rescan"]
   }' | jq .
 
-# Resume from a specific phase (e.g. re-run triage after reviewing plan)
+# Start a new run at a specific phase (e.g. run triage directly)
 curl -s -X POST http://localhost:9002/api/agent/run/swarm \
   -H "Content-Type: application/json" \
   -d '{
@@ -575,6 +585,62 @@ curl -N -X POST http://localhost:9002/api/agent/run/swarm \
   "message": "swarm run started"
 }
 ```
+
+---
+
+## POST /api/agent/run/audit — Unified Source Audit
+
+Runs the Vigolium Audit harness, Piolium, or both against one source tree. The
+default `driver` is `auto`: run Audit when its resolved Claude/Codex CLI is
+available, otherwise fall back to Piolium. `both` runs the two drivers
+sequentially under one parent `AgenticScan` and performs a project-wide finding
+dedup pass afterward.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `source` | string | Yes | Local directory, Git URL, `gs://` archive, or local `.zip`/`.tar.*` archive |
+| `driver` | string | No | `auto` (default), `both`, `audit`, or `piolium` |
+| `intensity` | string | No | `quick`, `balanced` (default), or `deep` |
+| `mode` | string | No | One explicit mode; overrides `intensity` |
+| `modes` | string[] | No | Ordered mode chain; overrides `mode` and `intensity` |
+| `agent` | string | No | `claude` or `codex` for the Audit leg; ignored for Piolium-only runs |
+| `target` | string | No | Optional target URL stored with the run |
+| `timeout` | string | No | Go-duration override |
+| `commit_depth` | int | No | Git clone depth (`0` means full history) |
+| `diff` | string | No | GitHub PR URL, ref range, or `HEAD~N` focus |
+| `last_commits` | int | No | Shorthand for a `HEAD~N` diff |
+| `files` | string[] | No | Source files to prioritize |
+| `stream` | bool | No | Return SSE; multi-driver events include a `driver` field |
+| `keep_raw` | bool | No | Retain Audit draft, SAST, and workspace artifacts |
+| `no_dedup` | bool | No | Skip post-pass dedup for `auto`/`both` |
+| `upload_results` | bool | No | Upload the session bundle when storage is enabled |
+| `project_uuid` | string | No | Project scope; falls back to `X-Project-UUID` |
+| `scan_uuid` | string | No | Associate the audit with an existing scan |
+| `pi_provider`, `pi_model` | string | No | Pi runtime overrides for the Piolium leg |
+| `plm_*` | mixed | No | Piolium scan/retry/longshot passthrough settings |
+| `api_key`, `oauth_token`, `oauth_cred_file`, `oauth_cred_json` | string | No | Top-level BYOK override |
+| `audit_auth`, `piolium_auth` | object | No | Per-driver BYOK overrides for `auto`/`both` |
+
+Shared modes for multi-driver runs are `lite`, `balanced`, `deep`, `revisit`,
+`confirm`, and `merge`. Driver-specific modes require `driver: "audit"` or
+`driver: "piolium"`. With `modes`, each driver receives only the modes it
+supports; a mode unknown to both selected drivers is rejected.
+
+```bash
+curl -s -X POST http://localhost:9002/api/agent/run/audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source": "/home/user/src/my-app",
+    "driver": "audit",
+    "agent": "codex",
+    "modes": ["deep", "confirm"],
+    "keep_raw": true
+  }' | jq .
+```
+
+The asynchronous response uses the same `agentic_scan_uuid`, `status`, and
+`message` envelope as the other run endpoints. Follow it through
+`GET /api/agent/status/:id` or session artifacts.
 
 ---
 
@@ -870,7 +936,7 @@ curl -s "http://localhost:9002/api/agent/sessions?mode=swarm&limit=10&offset=0" 
 
 ```json
 {
-  "project_uuid": "default",
+  "project_uuid": "00000000-0000-0000-defa-c01001000001",
   "data": [
     {
       "uuid": "agt-550e8400-e29b-41d4-a716-446655440000",
@@ -958,7 +1024,7 @@ curl -s http://localhost:9002/api/agent/sessions/agt-550e8400-e29b-41d4-a716-446
   "source_path": "/home/user/src/my-app",
   "source_type": "local",
   "input_raw": "https://example.com/api/search?q=test",
-  "module_names": ["xss-reflected", "sqli-error"],
+  "module_names": ["xss-light-url-params", "sqli-error-based"],
   "session_id": "",
   "prompt_sent": "You are a security scanning agent...",
   "agent_raw_output": "I'll analyze the target for vulnerabilities...",
@@ -1021,12 +1087,15 @@ curl -N -H 'Accept: text/event-stream' \
 
 On a read error the stream emits `{"type":"error","error":"..."}` and closes.
 
+A new connection starts with the last 512 KB of the log (prefixed by `...[earlier output omitted]...`), not byte 0, so reconnecting is cheap. While the log is idle the server writes an SSE comment (`: ping`) every 15 s to detect clients that went away. If the follower hits its 2 h safety cap while the run is still going, it ends with `{"type":"reconnect"}` instead of `done`: reconnect, and treat the replayed backlog as a replacement for what you have.
+
 **Notes:**
 
 - The endpoint reads `runtime.log` from the session directory recorded on the DB row (`session_dir`). For rows created before that field was persisted, it falls back to `<sessions_dir>/<agentic_scan_uuid>/runtime.log`.
 - All three agent modes (query, autopilot, swarm) write `runtime.log` when started via the REST API, so the endpoint works uniformly across modes.
 - Structured data (findings, attack plan, triage result, final raw output blob) still lives on `GET /api/agent/sessions/:id` — this endpoint is the *unstructured* console stream only.
-- When ANSI stripping is enabled on the SSE path, an escape sequence that happens to span a read boundary may leak through as a cosmetic artifact. The plain-text path is not affected.
+- Chunks never split a UTF-8 character or an ANSI escape across events, so ANSI stripping on the SSE path is exact.
+- Terminal statuses: `completed`, `completed_with_warnings` (the run finished but was degraded - e.g. the audit failed to start, or the model never called a tool; the reason is in `error_message`), `completed_with_errors` (a multi-driver audit where some drivers failed), `failed`, `cancelled`, `timeout`, `error`.
 
 **Error responses:**
 
@@ -1045,7 +1114,9 @@ Accepts an OpenAI-compatible Chat Completions request and returns an OpenAI-comp
 
 The `model` field is currently ignored — every request is dispatched through the olium engine using the provider configured under `agent.olium.*` in `vigolium-configs.yaml`. The field is required by the OpenAI schema but the value is informational only.
 
-This endpoint is **synchronous** — it blocks until the agent completes. It shares the concurrency lock with the run endpoints (returns `409 Conflict` if an agent is already running).
+This endpoint is **synchronous** — it blocks until the agent completes. It uses
+the light-agent concurrency pool and returns `429 Too Many Requests` if no slot
+opens before `server.agent_queue_timeout`.
 
 **Request body:**
 
@@ -1108,4 +1179,4 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-See [Agent Mode](../agents/agent-mode.md) for full agent documentation.
+See [Agent Mode](../agentic-scan/agent-mode.md) for full agent documentation.

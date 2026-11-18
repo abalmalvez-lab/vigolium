@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects login endpoints from observed traffic and tests them with common default credential
-pairs. Uses intelligent login form detection, CAPTCHA awareness, and lockout protection.
+	ModuleDesc = `**What it means:** A login endpoint accepts a well-known default credential pair (admin/admin, root/root, tomcat/tomcat) never changed after install, granting authenticated access.
 
-## Notes
-- Only tests POST requests with form-encoded or JSON bodies
-- Detects login endpoints by matching parameter names and URL paths
-- Sends baseline invalid credentials first to establish failure response
-- Stops on first successful login or lockout detection
-- 500ms delay between credential attempts to avoid rate limiting
-- Preserves CSRF tokens and hidden form fields during testing
+**How it's exploited:** An attacker logs in with the same pair to take over the account, often gaining admin access. Confirmed only when a default pair yields a response different from the invalid-credential baseline that reproduces but not for random credentials; a bare session cookie or a redirect back to login is not enough.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/04-Authentication_Testing/02-Testing_for_Default_Credentials`
+**Fix:** Force a password change on all default accounts at first use, disable demo accounts, and enforce strong unique passwords.`
 
 	ModuleConfirmation = "Confirmed when a known credential pair produces a response significantly different from the invalid-credential baseline, indicating successful authentication"
 	ModuleSeverity     = severity.High

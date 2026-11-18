@@ -38,9 +38,10 @@ vigolium scan -t https://example.com --strategy lite -c 5 -r 20
 
 **Solutions:**
 
-Chromium is automatically downloaded on first use to `~/.cache/spitolas/chromium-<version>/`. If this download is blocked by network restrictions:
+When no system Chrome/Chromium is found, Chrome for Testing is downloaded on first use to `~/.cache/vigolium/chrome-for-testing-<version>/` (embedded-browser builds extract to `~/.cache/spitolas/<engine>-<version>/`). `vigolium doctor --fix --only chrome` pre-downloads it. If this download is blocked by network restrictions:
 
-1. Use `make deps-chrome` to build with an embedded Chromium binary.
+1. Build an embedded-browser binary with
+   `make deps-chrome && make build-embedded`.
 2. Alternatively, skip the spidering phase entirely:
 
 ```bash
@@ -49,16 +50,16 @@ vigolium scan -t https://example.com --skip spidering
 
 ## Scope Mismatch (No Results)
 
-**Symptoms:** Scan completes but produces zero findings or skips all requests.
+**Symptoms:** The scan exits `1` with `no_targets_in_scope` and lists each target with the rule that refused it (`scope.host.include`, `scope.path.exclude`, `static_file`, …). Or it completes `partial` with reason `targets_out_of_scope`, or produces zero findings.
 
 **Solutions:**
 
-Verify the target URL matches the configured scope. The scanner only tests URLs that fall within the defined scope.
+Verify the target URL matches the configured scope. The scanner only tests URLs that fall within the defined scope, and checks every target against it before sending anything: when scope refuses all of them the scan stops there (nothing is sent, the scan row is `failed` with `stop_reason: no_targets_in_scope`); when it refuses some, the rest are scanned and the refused ones are listed in the banner and under the row's `preflight` outcome. `scan-url` and `scan-request` apply the same rules, with or without `-S`; pass `--ignore-scope` to scan a single target the scope refuses.
 
 Check the current scope configuration:
 
 ```bash
-vigolium project config
+vigolium config ls scope
 ```
 
 Explicitly set the scope to include your target by updating the config:
@@ -69,13 +70,21 @@ vigolium config set scope.host.include "*.example.com"
 
 Ensure the target URL scheme (http vs https) and hostname match what the scope expects. Subdomains are not included by default unless a wildcard pattern is used.
 
+Run `vigolium config validate` to catch scope rules that can never match (a host
+pattern with `https://` or a path, a `:port` suffix, quote or bracket residue
+from a JSON list split on commas) or that admit none of your recent scan targets.
+Each issue prints the exact `config set` that fixes it; `vigolium doctor` shows
+the same scope check.
+
 ## OAST Not Working
 
 **Symptoms:** No out-of-band findings are reported, even for vulnerabilities that typically produce OAST interactions (e.g., blind SSRF, blind XXE).
 
 **Solutions:**
 
-OAST requires outbound DNS and HTTP connectivity from the target application to the OAST callback server. Check that:
+If the scan printed `OAST unavailable (<server>: <reason>) — blind/out-of-band checks skipped` (event `oast.unavailable`, reason `oast_unavailable`), the scanner itself could not register with the interactsh server within 3s: check outbound https from the scanning host to `oast.server_url`, the `oast.token`, or point `server_url` at a reachable server.
+
+Otherwise, OAST requires outbound DNS and HTTP connectivity from the target application to the OAST callback server. Check that:
 
 1. The scanned application can make outbound DNS queries.
 2. The scanned application can make outbound HTTP requests.
@@ -155,7 +164,8 @@ vigolium scan -t https://example.com --strategy lite --skip discovery --skip spi
 
 **Solutions:**
 
-The default database is SQLite, stored at `~/.vigolium/vigolium.db`.
+The default database is SQLite at
+`~/.vigolium/database-vgnm.sqlite`.
 
 To switch to a different database location:
 
@@ -166,10 +176,12 @@ vigolium scan --target https://example.com --db /path/to/other.db
 To reset the database and start fresh:
 
 ```bash
-vigolium db clean
+vigolium db reset --force
 ```
 
-For production deployments, consider using PostgreSQL instead of SQLite. Configure the database connection in `vigolium-configs.yaml` or via the `--db` flag with a PostgreSQL connection string.
+`--db` selects an alternate SQLite file. Configure PostgreSQL with
+`database.driver: postgres` and the `database.postgres` fields in
+`vigolium-configs.yaml`; `--db` is not a PostgreSQL DSN flag.
 
 ## Agent Mode Not Working
 
@@ -177,27 +189,42 @@ For production deployments, consider using PostgreSQL instead of SQLite. Configu
 
 **Solutions:**
 
-1. **Check backend configuration.** Agent backends are configured in the `agent` section of `vigolium-configs.yaml`. The default backend (`claude`) uses the SDK protocol and requires the `claude` CLI in PATH:
-
-```yaml
-agent:
-  default_agent: claude
-  backends:
-    claude:
-      command: claude
-      protocol: sdk
-```
-
-2. **Ensure the coding agent CLI is installed.** The default `claude` backend requires the Claude Code CLI. Other backends require their respective CLIs:
+1. **Inspect the active olium provider.** All query, Swarm, Autopilot, and
+triage calls use the in-process olium engine:
 
 ```bash
-# Verify Claude CLI is available
-claude --version
+vigolium agent --list-agents
+vigolium config ls olium
+vigolium doctor --json
 ```
 
-3. **Check API keys.** Ensure the required API keys are set as environment variables (e.g., `ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` for Codex).
+2. **Check the provider endpoint and credentials.** The provider is
+auto-detected unless `agent.olium.provider` is set; the generated config sets
+`openai-compatible` pointing at a local Ollama. `vigolium agent --list-agents`
+shows which one a run would use. Start that endpoint and choose a tool-capable
+model, or select another provider:
 
-4. **Verify session directory permissions.** Agent sessions are stored under `~/.vigolium/agent-sessions/` by default (configurable via `agent.sessions_dir` in `vigolium-configs.yaml`). Ensure this directory is writable.
+```bash
+vigolium config set agent.olium.provider openai-codex-oauth
+vigolium config set agent.olium.oauth_cred_path ~/.codex/auth.json
+```
+
+For key providers, set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`; the
+`anthropic-cli` provider is the one that requires a local `claude` binary.
+
+Before working, query, triage, swarm and autopilot ping the provider.
+`error.code: "provider_missing"` means no provider could be built from the
+configuration (unknown name, missing credentials); `preflight_failed` means it
+was built but did not answer. A local model that loads slowly may need a longer
+deadline: `--preflight-timeout 2m` or `agent.olium.preflight_timeout` (default
+`15s`, `60s` for a loopback endpoint). `--no-preflight` skips the ping.
+
+3. **Verify session directory permissions.** Agent sessions are stored under
+`~/.vigolium/agent-sessions/` by default. Ensure it is writable, then inspect a
+failed run with `vigolium agent session <uuid>` and `vigolium log <uuid>`.
+
+See [Set Up an AI Provider](getting-started/setup-agent.md) for all supported
+providers and credential fields.
 
 ## Permission Denied on Build
 

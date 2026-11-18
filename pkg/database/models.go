@@ -1,10 +1,13 @@
 package database
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
+	"github.com/vigolium/vigolium/pkg/agent/recon"
+	"github.com/vigolium/vigolium/pkg/tlsprobe"
 )
 
 // User represents a system user.
@@ -45,7 +48,6 @@ const (
 	ModuleTypeActive         = "active"
 	ModuleTypePassive        = "passive"
 	ModuleTypeNuclei         = "nuclei"
-	ModuleTypeSecretScan     = "secret-scan"
 	ModuleTypeAgent          = "agent"
 	ModuleTypeOAST           = "oast"
 	ModuleTypeExtension      = "extension"
@@ -62,15 +64,28 @@ const (
 	FindingSourceExtension         = "extension"
 	FindingSourceAudit             = "audit"
 	FindingSourceImport            = "import"
+	FindingSourceSpidering         = "spidering"
+)
+
+// Record-kind constants distinguish reportable vulnerabilities from retained
+// reconnaissance and unconfirmed hypotheses stored in the same table.
+const (
+	RecordKindFinding     = "finding"
+	RecordKindCandidate   = "candidate"
+	RecordKindObservation = "observation"
 )
 
 // Status constants represent the lifecycle state of a Finding.
 //
 // Lifecycle:
 //
-//	draft ──triage──▶ triaged ──fix──▶ fixed
+//	draft ──triage──▶ triaged ──verify──▶ confirmed ──fix──▶ fixed
 //	             ╲──▶ false_positive
 //	             ╲──▶ accepted_risk
+//
+// confirmed means a human or a re-verification reproduced the finding; it is a
+// status, not a verification result (that is Finding.Verification, kept apart
+// so re-running `finding verify` never silently rewrites a triage verdict).
 //
 // Trust model: deterministic engines (native scan, SAST tools) produce
 // findings as `triaged`. LLM/agent-driven and externally imported findings
@@ -78,10 +93,18 @@ const (
 const (
 	StatusDraft         = "draft"
 	StatusTriaged       = "triaged"
+	StatusConfirmed     = "confirmed"
 	StatusFalsePositive = "false_positive"
 	StatusAcceptedRisk  = "accepted_risk"
 	StatusFixed         = "fixed"
 )
+
+// FindingStatuses is the closed finding-status vocabulary, in lifecycle order.
+// IsValidFindingStatus, the REST validation message and any closed-enum
+// consumer read this list rather than keeping their own.
+var FindingStatuses = []string{
+	StatusDraft, StatusTriaged, StatusConfirmed, StatusFalsePositive, StatusAcceptedRisk, StatusFixed,
+}
 
 // Severity constants represent the canonical severity strings stored on a
 // Finding. They match the lowercase keys used by `vigolium finding --severity`
@@ -135,6 +158,16 @@ type Scan struct {
 	Threads int    `bun:"threads,default:0" json:"threads"`
 
 	// Scan context
+	// ScopeOriginMode is the RESOLVED origin-scope mode the scan ran under (all,
+	// relaxed, balanced, strict) — never the raw --scope-origin value, which is
+	// empty on the common run that takes the default. Persisted because it is the
+	// setting that decides which HOSTS the scan was allowed to touch: on a
+	// database carrying traffic from earlier scans, "balanced" admits every
+	// sibling subdomain of the target's eTLD+1, so a result set cannot be read
+	// correctly without it. Written by the runner (the single owner of the
+	// fallback chain) for CLI, server and scan-on-receive runs alike, and carried
+	// out through the `scan` envelope of --format jsonl and the REST scan object.
+	ScopeOriginMode string   `bun:"scope_origin_mode,nullzero" json:"scope_origin_mode"`
 	Profile         string   `bun:"profile,nullzero" json:"profile"`                     // scanning profile used (light, full, api, etc.)
 	SourcePath      string   `bun:"source_path,nullzero" json:"source_path"`             // source code path for audit/agent scans
 	SourceType      string   `bun:"source_type,nullzero" json:"source_type"`             // local, git-url, gcs
@@ -173,6 +206,51 @@ type Scan struct {
 
 	StorageURL string `bun:"storage_url,nullzero" json:"storage_url"`
 
+	// Scan completeness — whether the scan covered everything it was given, and
+	// if not, why and where. Written by the runner's finalizer, which is the only
+	// component that sees every phase's outcome.
+	//
+	// Status alone could never answer this: "completed" meant "the process
+	// reached the end", so a scan whose total budget fired after two of seven
+	// phases, or whose dynamic assessment was cut off at its own deadline, was
+	// indistinguishable from one that finished the whole plan. That mattered
+	// beyond reporting — scan-on-receive treats a completed scan as a valid
+	// predecessor and inherits its cursor, so a curtailed run that looked clean
+	// made the NEXT run skip the records the first one never processed.
+	//
+	// An EMPTY Completeness means unknown (an older binary, or an agent/server
+	// caller with no outcome data) and must never be read as "complete".
+	Completeness  string         `bun:"completeness,nullzero" json:"completeness,omitempty"`
+	StopReason    string         `bun:"stop_reason,nullzero" json:"stop_reason,omitempty"`
+	PhaseOutcomes []PhaseOutcome `bun:"phase_outcomes,type:jsonb,nullzero" json:"phase_outcomes,omitempty"`
+
+	// Plan is the resolved scan plan (phases, budgets, pacing) as JSON, written
+	// once when the run starts. Opaque here: the plan resolver owns its shape.
+	Plan json.RawMessage `bun:"plan,type:jsonb,nullzero" json:"plan,omitempty"`
+
+	// Run liveness, refreshed by the runner's heartbeat while the scan runs.
+	// A row whose heartbeat stopped advancing while status is still "running"
+	// belongs to a process that died; PID and RunnerHost let a reader on the
+	// same host confirm that without waiting out the staleness window.
+	HeartbeatAt  *time.Time `bun:"heartbeat_at,nullzero" json:"heartbeat_at,omitempty"`
+	CurrentPhase string     `bun:"current_phase,nullzero" json:"current_phase,omitempty"`
+	PID          int        `bun:"pid,nullzero" json:"pid,omitempty"`
+	RunnerHost   string     `bun:"runner_host,nullzero" json:"runner_host,omitempty"`
+
+	// ModuleErrors counts errors per module ID over the run; ExtensionsFailed
+	// lists extensions that failed to load. scan.finished reads both back from
+	// the row.
+	ModuleErrors     map[string]int64 `bun:"module_errors,type:jsonb,nullzero" json:"module_errors,omitempty"`
+	ExtensionsFailed []string         `bun:"extensions_failed,type:jsonb,nullzero" json:"extensions_failed,omitempty"`
+	// ModuleStats is the per-module ledger (schema v6): calls, wire requests,
+	// errors and skips by reason, so "why was this module not run / what did it
+	// cost" has an answer on the row.
+	ModuleStats map[string]ModuleStat `bun:"module_stats,type:jsonb,nullzero" json:"module_stats,omitempty"`
+
+	// CoverageModules is the module ordinal order scan_record_progress.done_bits
+	// refers to.
+	CoverageModules []string `bun:"coverage_modules,type:jsonb,nullzero" json:"coverage_modules,omitempty"`
+
 	CreatedAt time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt time.Time `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
 }
@@ -189,7 +267,7 @@ type HTTPRecord struct {
 	Scheme   string `bun:"scheme,notnull" json:"scheme"`
 	Hostname string `bun:"hostname,notnull" json:"hostname"`
 	Port     int    `bun:"port,notnull" json:"port"`
-	IP       string `bun:"ip,nullzero" json:"ip,omitempty"` // resolved IP address (cached per hostname)
+	IP       string `bun:"ip,nullzero" json:"ip,omitempty"` // resolved IP address the request went to (httpx: host_ip)
 
 	// Request fields
 	Method               string `bun:"method,notnull" json:"method"`
@@ -210,10 +288,43 @@ type HTTPRecord struct {
 	ResponseContentLength int64  `bun:"response_content_length,default:0" json:"response_content_length"`
 	RawResponse           []byte `bun:"raw_response,type:bytea,nullzero" json:"raw_response,omitempty"`
 	ResponseHash          string `bun:"response_hash,nullzero" json:"response_hash,omitempty"`
-	ResponseTimeMs        int64  `bun:"response_time_ms,default:0" json:"response_time_ms"`
-	ResponseWords         int64  `bun:"response_words,default:0" json:"response_words"`
-	HasResponse           bool   `bun:"has_response,notnull,default:false" json:"has_response"`
-	ResponseTitle         string `bun:"response_title,nullzero" json:"response_title,omitempty"`
+	ResponseNormHash      string `bun:"response_norm_hash,nullzero" json:"response_norm_hash,omitempty"` // hash of the body with reflected URL/path + dynamic runs stripped, for reflected-URL-robust dedup
+	// ResponseTimeMs is 0 when the exchange was never timed, which is not the
+	// same as "it took no time". Only the requester measures, so every record
+	// rebuilt from stored bytes — and every intermediate redirect hop, which
+	// the transport followed inside one measurement — has nothing to report.
+	//
+	// omitempty so an unmeasured row omits the field entirely. A silent zero is
+	// worse than an absent one: a consumer averaging over a chain gets a number
+	// that is wrong rather than one it knows it cannot compute.
+	ResponseTimeMs int64  `bun:"response_time_ms,default:0" json:"response_time_ms,omitempty"`
+	ResponseWords  int64  `bun:"response_words,default:0" json:"response_words"`
+	HasResponse    bool   `bun:"has_response,notnull,default:false" json:"has_response"`
+	ResponseTitle  string `bun:"response_title,nullzero" json:"response_title,omitempty"`
+
+	// ResponseLocation is the Location header of a 3xx response, stored verbatim
+	// — relative values included, because rewriting them to absolute would be
+	// this column asserting something the server did not say.
+	//
+	// It exists because the redirect tree needs exactly one header out of a
+	// response whose body it has no use for. Without a column the destination is
+	// only recoverable by reading raw_response back, which on a `--glob-db` read
+	// means reopening every source file the selected redirects came from and
+	// holding an 8 KiB prefix per row until rendering finishes. Parsing it once at
+	// ingestion and storing ~30 bytes replaces all of that.
+	//
+	// Empty means "no Location", which for a record written by this version is
+	// also the answer for a non-redirect. It does NOT distinguish "not backfilled"
+	// on a record written before this column existed — see
+	// redirectLocationsAreBackfilled for how the read path handles that.
+	ResponseLocation string `bun:"response_location,nullzero" json:"response_location,omitempty"`
+
+	// ResponseDecodedFrom is the content-coding the wire carried ("gzip",
+	// "br", …) when the store removed it (response_decode.go): raw_response
+	// then holds the decoded body, without its Content-Encoding header and
+	// with Content-Length set to the decoded size. Empty means raw_response is
+	// stored exactly as received.
+	ResponseDecodedFrom string `bun:"response_decoded_from,nullzero" json:"response_decoded_from,omitempty"`
 
 	// Parameters (JSON array, replaces http_parameters table)
 	Parameters []EmbeddedParam `bun:"parameters,type:jsonb,nullzero" json:"parameters,omitempty"`
@@ -231,9 +342,138 @@ type HTTPRecord struct {
 	IsAuthenticated bool     `bun:"is_authenticated,notnull,default:false" json:"is_authenticated"` // whether request was sent with valid auth
 	ParentUUID      string   `bun:"parent_uuid,nullzero" json:"parent_uuid,omitempty"`              // parent record UUID (crawl/spider parent)
 
+	// Target is the input line this record's chain started from, as it appears
+	// in the run's target list (normalized to an absolute URL). Empty for
+	// records that did not come from a submitted target — crawl discoveries,
+	// ingest.
+	//
+	// It exists because hostname is THIS HOP's hostname, not the one that was
+	// asked about. A followed redirect that leaves the host produces records
+	// under names nobody submitted, and a consumer keying on hostname then
+	// reports a host it invented. Recovering the input otherwise means walking
+	// parent_uuid to the root, which no single record can answer and which a
+	// truncated chain can break outright.
+	Target string `bun:"target,nullzero" json:"target,omitempty"`
+	// RootUUID is the first record of this record's redirect chain — itself for
+	// a root. Redundant with walking ParentUUID, and deliberately so: the walk
+	// is O(chain) and needs the whole stream, this is O(1) on one record and
+	// survives the middle of a chain being dropped by the storage cap.
+	RootUUID string `bun:"root_uuid,nullzero" json:"root_uuid,omitempty"`
+	// ChainTruncated marks the last stored row of a redirect chain that did not
+	// reach its destination — the follow cap was hit, or the storage cap
+	// dropped hops after this one.
+	//
+	// Without it a 3xx at the end of a chain is ambiguous in a way that reads
+	// as an answer: "this redirect pointed somewhere that never replied" and
+	// "we stopped walking" produce an identical row, and the obvious consumer
+	// reading ("the terminal hop is the row nothing claims as a parent") takes
+	// the 3xx as final in both cases.
+	ChainTruncated bool `bun:"chain_truncated,notnull,default:false" json:"chain_truncated,omitempty"`
+
 	// Risk labeling (populated by background analysis)
 	Remarks   []string `bun:"remarks,type:jsonb,nullzero" json:"remarks,omitempty"`
 	RiskScore int      `bun:"risk_score,default:0" json:"risk_score"`
+
+	// SurfaceScore is the deterministic attack-surface score (0-100) written by
+	// the surface_scoring passive module, which owns the signal set and the
+	// scale — see pkg/modules/passive/surface_scoring. It
+	// answers "is this record worth attacking" from properties of the record
+	// itself, and is reproducible across scans.
+	//
+	// Deliberately NOT merged into RiskScore: that column holds anomaly_ranking's
+	// rank-within-batch percentile, which measures statistical rarity against
+	// whichever records happened to be flushed alongside it. The two are different
+	// scales from different inputs; sharing one column would mean whichever module
+	// flushed last silently overwrote the other.
+	SurfaceScore int `bun:"surface_score,default:0" json:"surface_score"`
+
+	// BodyCompaction is set when `vigolium db compact` replaced a stored body
+	// with its head, and records what the original was. Nil means RawRequest
+	// and RawResponse hold the bodies exactly as captured. See BodyCompaction.
+	BodyCompaction *BodyCompaction `bun:"body_compaction,type:jsonb,nullzero" json:"body_compaction,omitempty"`
+}
+
+// AnalysisArtifact stores immutable derived content linked to an HTTP record.
+// It deliberately lives beside, rather than inside, HTTPRecord so analysis can
+// never replace the raw evidence captured from the target.
+type AnalysisArtifact struct {
+	bun.BaseModel `bun:"table:analysis_artifacts,alias:aa" json:"-"`
+
+	ID             int64     `bun:"id,pk,autoincrement" json:"id"`
+	ProjectUUID    string    `bun:"project_uuid,notnull" json:"project_uuid"`
+	ScanUUID       string    `bun:"scan_uuid,nullzero" json:"scan_uuid,omitempty"`
+	HTTPRecordUUID string    `bun:"http_record_uuid,notnull" json:"http_record_uuid"`
+	Kind           string    `bun:"kind,notnull" json:"kind"`
+	Filename       string    `bun:"filename,nullzero" json:"filename,omitempty"`
+	MediaType      string    `bun:"media_type,nullzero" json:"media_type,omitempty"`
+	SHA256         string    `bun:"sha256,notnull" json:"sha256"`
+	ByteLength     int64     `bun:"byte_length,notnull" json:"byte_length"`
+	Content        []byte    `bun:"content,type:bytea,notnull" json:"content,omitempty"`
+	Metadata       string    `bun:"metadata,type:jsonb,nullzero" json:"metadata,omitempty"`
+	CreatedAt      time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+}
+
+// HostObservation is what one scan observed about one endpoint: the full DNS
+// answer and, under --tls-probe, the handshake and leaf certificate.
+//
+// It is the durable counterpart to the process-local caches HostFacts reads.
+// Those caches are bounded (8192 entries each) and evict in insertion order, so
+// on a sweep larger than that the hosts resolved FIRST had their answers dropped
+// before the export that wanted them - the work was done, the answer was known,
+// and the output silently omitted it. A row here survives eviction, the process,
+// and the run.
+//
+// One row per (scan, hostname, port). Re-probing a host adds an observation, it
+// does not replace one: the addresses a host resolved to during an earlier scan
+// are that scan's evidence, and an upsert keyed on the host alone would erase it.
+type HostObservation struct {
+	bun.BaseModel `bun:"table:host_observations,alias:ho" json:"-"`
+
+	ID          int64     `bun:"id,pk,autoincrement" json:"id"`
+	ProjectUUID string    `bun:"project_uuid,notnull" json:"project_uuid"`
+	ScanUUID    string    `bun:"scan_uuid,nullzero" json:"scan_uuid,omitempty"`
+	Hostname    string    `bun:"hostname,notnull" json:"hostname"`
+	Port        int       `bun:"port,notnull" json:"port"`
+	ObservedAt  time.Time `bun:"observed_at,notnull,default:current_timestamp" json:"observed_at"`
+
+	// DNS answers as jsonb columns, the same way Finding.Tags and
+	// HTTPRecord.Technology store their slices. Stored whole rather than as three
+	// child tables: they are read as a whole or not at all, and never queried by
+	// element.
+	DNSA     []string `bun:"dns_a,type:jsonb,nullzero" json:"dns_a,omitempty"`
+	DNSAAAA  []string `bun:"dns_aaaa,type:jsonb,nullzero" json:"dns_aaaa,omitempty"`
+	DNSCNAME []string `bun:"dns_cname,type:jsonb,nullzero" json:"dns_cname,omitempty"`
+
+	// The DNS record types beyond addresses and the CNAME chain, resolved by
+	// `vigolium dns`. Stored on the host's port-0 row: they describe the name,
+	// not an endpoint.
+	DNSMX  []string `bun:"dns_mx,type:jsonb,nullzero" json:"dns_mx,omitempty"`
+	DNSNS  []string `bun:"dns_ns,type:jsonb,nullzero" json:"dns_ns,omitempty"`
+	DNSTXT []string `bun:"dns_txt,type:jsonb,nullzero" json:"dns_txt,omitempty"`
+	DNSSOA []string `bun:"dns_soa,type:jsonb,nullzero" json:"dns_soa,omitempty"`
+	DNSCAA []string `bun:"dns_caa,type:jsonb,nullzero" json:"dns_caa,omitempty"`
+
+	// TLS is the handshake and leaf certificate, absent when the endpoint was not
+	// handshaked (no --tls-probe, or a plaintext endpoint).
+	TLS *tlsprobe.Info `bun:"tls,type:jsonb,nullzero" json:"tls,omitempty"`
+
+	// Fingerprint is what the fingerprint phase concluded about the origin, and
+	// NotFound its answer to a path no application serves. Absent when the
+	// phase did not run against it.
+	Fingerprint *recon.TechStackReport `bun:"fingerprint,type:jsonb,nullzero" json:"fingerprint,omitempty"`
+	NotFound    *NotFoundBaseline      `bun:"not_found,type:jsonb,nullzero" json:"not_found,omitempty"`
+
+	// Favicon is the origin's icon as the probe phase's --favicon fetched and
+	// hashed it. Absent when the probe did not ask, or the origin serves no
+	// icon. (The fingerprint phase keeps its own copy inside Fingerprint.)
+	Favicon *recon.FaviconInfo `bun:"favicon,type:jsonb,nullzero" json:"favicon,omitempty"`
+
+	// Complete reports that the lookup actually ran to an answer. False marks an
+	// observation the run never finished - a cancelled or budget-limited
+	// prefetch - which is a different fact from a host that genuinely resolves to
+	// nothing, and the two are indistinguishable without it.
+	Complete  bool      `bun:"complete,notnull" json:"complete"`
+	CreatedAt time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
 }
 
 // EmbeddedParam represents a parameter stored as JSON within HTTPRecord
@@ -245,7 +485,17 @@ type EmbeddedParam struct {
 	NameEnd    int    `json:"name_end,omitempty"`
 	ValueStart int    `json:"value_start,omitempty"`
 	ValueEnd   int    `json:"value_end,omitempty"`
-	Metadata   string `json:"metadata,omitempty"`
+	// Metadata is a JSON body value's key path: object keys joined with
+	// ".", array elements sharing their array's path ("items.id" for every
+	// id in {"items":[{"id":1},{"id":2}]}). Empty for other locations, and
+	// on a JSON parameter stored before paths were recorded.
+	Metadata string `json:"metadata,omitempty"`
+	// JSONType is a JSON body value's type: string, number, boolean or null
+	// (empty when the token is none of them, or for other locations).
+	JSONType string `json:"json_type,omitempty"`
+	// Hidden marks a parameter no observed request carried: the param-mining
+	// phase found the endpoint acting on it (see pkg/parammine).
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 // Finding represents a vulnerability finding (no FK, soft UUID reference)
@@ -271,6 +521,8 @@ type Finding struct {
 	ModuleName    string   `bun:"module_name,notnull" json:"module_name"`
 	ModuleType    string   `bun:"module_type,nullzero" json:"module_type,omitempty"`
 	FindingSource string   `bun:"finding_source,nullzero" json:"finding_source,omitempty"`
+	RecordKind    string   `bun:"record_kind,notnull,default:'finding'" json:"record_kind,omitempty"`
+	EvidenceGrade string   `bun:"evidence_grade,nullzero" json:"evidence_grade,omitempty"`
 	ModuleShort   string   `bun:"module_short,nullzero" json:"module_short,omitempty"`
 	Description   string   `bun:"description,nullzero" json:"description,omitempty"`
 	Severity      string   `bun:"severity,notnull" json:"severity"`
@@ -278,12 +530,26 @@ type Finding struct {
 	Tags          []string `bun:"tags,type:jsonb,nullzero" json:"tags,omitempty"`
 
 	// Finding lifecycle
-	Status      string `bun:"status,nullzero,default:'triaged'" json:"status,omitempty"` // draft, triaged, false_positive, accepted_risk, fixed
+	Status      string `bun:"status,nullzero,default:'triaged'" json:"status,omitempty"` // one of FindingStatuses
 	Remediation string `bun:"remediation,nullzero" json:"remediation,omitempty"`
+	// Provenance of the current status: why, by whom, when. The full history is
+	// finding_status_events.
+	StatusNote      string     `bun:"status_note,nullzero" json:"status_note,omitempty"`
+	StatusActor     string     `bun:"status_actor,nullzero" json:"status_actor,omitempty"`
+	StatusUpdatedAt *time.Time `bun:"status_updated_at,nullzero" json:"status_updated_at,omitempty"`
 
 	// Classification
 	CWEID     string  `bun:"cwe_id,nullzero" json:"cwe_id,omitempty"`
 	CVSSScore float64 `bun:"cvss_score,default:0" json:"cvss_score"`
+	// VulnClass is the reported vulnerability class (pkg/vulnclass): the
+	// result's own class, else the module's declared one. NULL on a row
+	// written before the column, and on a finding with no declared class
+	// (a known-issue template, an import).
+	VulnClass string `bun:"vuln_class,nullzero" json:"vuln_class,omitempty"`
+	// ClaimedSeverity is the severity the module asked for when the emit-time
+	// rule filed it lower (a Tentative finding caps at suspect); NULL when the
+	// stored severity is the module's own.
+	ClaimedSeverity string `bun:"claimed_severity,nullzero" json:"claimed_severity,omitempty"`
 
 	// Source info (for audit findings)
 	SourceFile string `bun:"source_file,nullzero" json:"source_file,omitempty"`
@@ -293,12 +559,100 @@ type Finding struct {
 	ExtractedResults   []string `bun:"extracted_results,type:jsonb,nullzero" json:"extracted_results,omitempty"`
 	AdditionalEvidence []string `bun:"additional_evidence,type:jsonb,nullzero" json:"additional_evidence,omitempty"`
 
-	Request     string `bun:"request,nullzero" json:"request,omitempty"`
-	Response    string `bun:"response,nullzero" json:"response,omitempty"`
+	Request  string `bun:"request,nullzero" json:"request,omitempty"`
+	Response string `bun:"response,nullzero" json:"response,omitempty"`
+
+	// Replay context, for re-verifying the finding: the baseline record the
+	// module scanned (as opposed to the evidence records in HTTPRecordUUIDs),
+	// the insertion point it mutated and the payload it sent. Empty on findings
+	// written before schema v3 or by producers that do not know them.
+	OriginRecordUUID string                 `bun:"origin_record_uuid,nullzero" json:"origin_record_uuid,omitempty"`
+	InsertionPoint   *FindingInsertionPoint `bun:"insertion_point,type:jsonb,nullzero" json:"insertion_point,omitempty"`
+	Payload          string                 `bun:"payload,nullzero" json:"payload,omitempty"`
+
+	// Verification is the latest re-verification result, separate from Status.
+	// VerifiedAt duplicates its timestamp as a column for sorting and filtering.
+	Verification *FindingVerification `bun:"verification,type:jsonb,nullzero" json:"verification,omitempty"`
+	VerifiedAt   *time.Time           `bun:"verified_at,nullzero" json:"verified_at,omitempty"`
+
 	FindingHash string `bun:"finding_hash,notnull" json:"finding_hash"`
 
 	FoundAt   time.Time `bun:"found_at,notnull,default:current_timestamp" json:"found_at"`
 	CreatedAt time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+	// LastSeenAt is when a scan last detected the finding (schema v6). NULL on
+	// rows no v6 binary has re-detected; FoundAt is then the best answer.
+	LastSeenAt *time.Time `bun:"last_seen_at,nullzero" json:"last_seen_at,omitempty"`
+}
+
+// FindingInsertionPoint names the insertion point a module mutated, e.g.
+// {type: "URL_PARAM", name: "id"}. Type uses the httpmsg insertion-point type
+// names.
+type FindingInsertionPoint struct {
+	Type string `json:"type"`
+	Name string `json:"name,omitempty"`
+}
+
+// Verification verdicts recorded in FindingVerification.Verdict.
+const (
+	VerdictConfirmed     = "confirmed"
+	VerdictNotReproduced = "not_reproduced"
+	VerdictInconclusive  = "inconclusive"
+	VerdictUnsupported   = "unsupported"
+)
+
+// FindingVerification is the result of re-running a finding's module against
+// its target (`finding verify`).
+type FindingVerification struct {
+	Verdict       string    `json:"verdict"`
+	At            time.Time `json:"at"`
+	ModuleVersion string    `json:"module_version,omitempty"`
+	ScanUUID      string    `json:"scan_uuid,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+}
+
+// FindingObservation records that a scan observed a finding. One row per
+// (finding, scan); see the finding_observations DDL for why findings.scan_uuid
+// alone cannot answer it.
+type FindingObservation struct {
+	bun.BaseModel `bun:"table:finding_observations,alias:fo" json:"-"`
+
+	ProjectUUID string    `bun:"project_uuid,notnull" json:"project_uuid"`
+	FindingID   int64     `bun:"finding_id,pk" json:"finding_id"`
+	FindingHash string    `bun:"finding_hash,notnull" json:"finding_hash"`
+	ScanUUID    string    `bun:"scan_uuid,pk" json:"scan_uuid"`
+	ObservedAt  time.Time `bun:"observed_at,notnull,default:current_timestamp" json:"observed_at"`
+}
+
+// FindingStatusEvent is one entry of a finding's append-only status history.
+type FindingStatusEvent struct {
+	bun.BaseModel `bun:"table:finding_status_events,alias:fse" json:"-"`
+
+	ID          int64     `bun:"id,pk,autoincrement" json:"id"`
+	FindingID   int64     `bun:"finding_id,notnull" json:"finding_id"`
+	ProjectUUID string    `bun:"project_uuid,notnull" json:"project_uuid"`
+	FromStatus  string    `bun:"from_status,nullzero" json:"from_status,omitempty"`
+	ToStatus    string    `bun:"to_status,notnull" json:"to_status"`
+	Note        string    `bun:"note,nullzero" json:"note,omitempty"`
+	Actor       string    `bun:"actor,nullzero" json:"actor,omitempty"`
+	CreatedAt   time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+}
+
+// OASTPayload is the context of one planted OAST payload, keyed by the nonce
+// embedded in its callback host or path, so an interaction that arrives out of
+// band can be attributed after the planting process is gone.
+type OASTPayload struct {
+	bun.BaseModel `bun:"table:oast_payloads,alias:op" json:"-"`
+
+	Nonce       string    `bun:"nonce,pk" json:"nonce"`
+	ProjectUUID string    `bun:"project_uuid,notnull" json:"project_uuid"`
+	ScanUUID    string    `bun:"scan_uuid,nullzero" json:"scan_uuid,omitempty"`
+	Class       string    `bun:"class,nullzero" json:"class,omitempty"`
+	ModuleID    string    `bun:"module_id,nullzero" json:"module_id,omitempty"`
+	TargetURL   string    `bun:"target_url,nullzero" json:"target_url,omitempty"`
+	Param       string    `bun:"param,nullzero" json:"param,omitempty"`
+	RequestHash string    `bun:"request_hash,nullzero" json:"request_hash,omitempty"`
+	Payload     string    `bun:"payload,nullzero" json:"payload,omitempty"`
+	CreatedAt   time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
 }
 
 // AuthenticationHostname persists per-hostname session auth configs in the DB.
@@ -449,6 +803,78 @@ type AgenticScan struct {
 	CreatedAt   time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
 }
 
+// AgentSection represents one bounded operator section within a durable
+// autopilot run (an engine Reset() + reconstructed-brief cycle). Rows are only
+// written when agent.olium.autopilot_mode != legacy; legacy runs never touch
+// this table. Cascade-deleted with the parent agentic scan.
+type AgentSection struct {
+	bun.BaseModel `bun:"table:agent_sections,alias:asec" json:"-"`
+
+	ID              int64  `bun:"id,pk,autoincrement" json:"id"`
+	UUID            string `bun:"uuid,notnull,unique" json:"uuid"`
+	AgenticScanUUID string `bun:"agentic_scan_uuid,nullzero" json:"agentic_scan_uuid,omitempty"`
+	ProjectUUID     string `bun:"project_uuid,nullzero" json:"project_uuid,omitempty"`
+
+	Seq            int    `bun:"seq,notnull,default:0" json:"seq"`
+	Kind           string `bun:"kind,nullzero" json:"kind,omitempty"`
+	Status         string `bun:"status,notnull,default:'running'" json:"status"` // running | completed | interrupted
+	Task           string `bun:"task,nullzero" json:"task,omitempty"`
+	ClosingSummary string `bun:"closing_summary,nullzero" json:"closing_summary,omitempty"`
+	RotationReason string `bun:"rotation_reason,nullzero" json:"rotation_reason,omitempty"`
+	TurnCount      int    `bun:"turn_count,notnull,default:0" json:"turn_count"`
+	InputTokens    int64  `bun:"input_tokens,notnull,default:0" json:"input_tokens"`
+	OutputTokens   int64  `bun:"output_tokens,notnull,default:0" json:"output_tokens"`
+	ErrorMessage   string `bun:"error_message,nullzero" json:"error_message,omitempty"`
+
+	StartedAt time.Time `bun:"started_at,nullzero" json:"started_at,omitempty"`
+	EndedAt   time.Time `bun:"ended_at,nullzero" json:"ended_at,omitempty"`
+	CreatedAt time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+}
+
+// AgentFindingCandidate is a proposed finding awaiting fresh-context
+// verification in the durable-autopilot verify-before-promote pipeline. The
+// operator's propose_candidate tool writes rows here (status=proposed); a
+// skeptic verifier grades them, and confirmed ones are promoted into a real
+// Finding (promoted_finding_id set, status=confirmed). Rows are only written
+// when agent.olium.autopilot_mode != legacy. Cascade-deleted with the parent
+// agentic scan.
+type AgentFindingCandidate struct {
+	bun.BaseModel `bun:"table:agent_finding_candidates,alias:acand" json:"-"`
+
+	ID              int64  `bun:"id,pk,autoincrement" json:"id"`
+	UUID            string `bun:"uuid,notnull,unique" json:"uuid"`
+	AgenticScanUUID string `bun:"agentic_scan_uuid,nullzero" json:"agentic_scan_uuid,omitempty"`
+	ProjectUUID     string `bun:"project_uuid,nullzero" json:"project_uuid,omitempty"`
+	SectionUUID     string `bun:"section_uuid,nullzero" json:"section_uuid,omitempty"`
+
+	Title       string `bun:"title,nullzero" json:"title,omitempty"`
+	Severity    string `bun:"severity,nullzero" json:"severity,omitempty"`
+	Description string `bun:"description,nullzero" json:"description,omitempty"`
+	Remediation string `bun:"remediation,nullzero" json:"remediation,omitempty"`
+	CWEID       string `bun:"cwe_id,nullzero" json:"cwe_id,omitempty"`
+	SourceFile  string `bun:"source_file,nullzero" json:"source_file,omitempty"`
+	URL         string `bun:"url,nullzero" json:"url,omitempty"`
+	Hostname    string `bun:"hostname,nullzero" json:"hostname,omitempty"`
+	Confidence  string `bun:"confidence,nullzero" json:"confidence,omitempty"`
+	Class       string `bun:"class,nullzero" json:"class,omitempty"` // idor | xss | sqli | ssrf | rce | auth | other
+
+	Status        string `bun:"status,notnull,default:'proposed'" json:"status"` // proposed | verifying | confirmed | rejected | needs_evidence
+	VerdictReason string `bun:"verdict_reason,nullzero" json:"verdict_reason,omitempty"`
+	EvidenceGrade string `bun:"evidence_grade,nullzero" json:"evidence_grade,omitempty"`
+
+	RecordUUIDs []string `bun:"record_uuids,type:jsonb,nullzero" json:"record_uuids,omitempty"`
+	OASTIDs     []string `bun:"oast_ids,type:jsonb,nullzero" json:"oast_ids,omitempty"`
+	Request     string   `bun:"request,nullzero" json:"request,omitempty"`
+	Response    string   `bun:"response,nullzero" json:"response,omitempty"`
+
+	DedupHash         string   `bun:"dedup_hash,notnull,default:''" json:"dedup_hash"`
+	PromotedFindingID int64    `bun:"promoted_finding_id,notnull,default:0" json:"promoted_finding_id"`
+	Tags              []string `bun:"tags,type:jsonb,nullzero" json:"tags,omitempty"`
+
+	CreatedAt  time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+	VerifiedAt time.Time `bun:"verified_at,nullzero" json:"verified_at,omitempty"`
+}
+
 // Scope defines URL/request scope rules (firewall-style: first match wins)
 type Scope struct {
 	bun.BaseModel `bun:"table:scopes,alias:s" json:"-"`
@@ -474,4 +900,35 @@ type Scope struct {
 
 	CreatedAt time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt time.Time `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// ModuleStat is one module's line in scans.module_stats.
+type ModuleStat struct {
+	Invocations int64 `json:"invocations,omitempty"`
+	Requests    int64 `json:"requests,omitempty"`
+	Findings    int64 `json:"findings,omitempty"`
+	Errors      int64 `json:"errors,omitempty"`
+	// Skips counts the module calls not made, by reason. Reasons (stable,
+	// add-only): tech_filter, cannot_process, param_already_found, ip_type,
+	// quarantined, timeout, method_policy, header_gated, inconclusive_throttled.
+	Skips map[string]int64 `json:"skips,omitempty"`
+}
+
+// Module skip reasons recorded in ModuleStat.Skips.
+const (
+	SkipTechFilter            = "tech_filter"
+	SkipCannotProcess         = "cannot_process"
+	SkipParamAlreadyFound     = "param_already_found"
+	SkipIPType                = "ip_type"
+	SkipQuarantined           = "quarantined"
+	SkipTimeout               = "timeout"
+	SkipMethodPolicy          = "method_policy"
+	SkipHeaderGated           = "header_gated"
+	SkipInconclusiveThrottled = "inconclusive_throttled"
+)
+
+// ModuleSkipReasons lists every skip reason once.
+var ModuleSkipReasons = []string{
+	SkipTechFilter, SkipCannotProcess, SkipParamAlreadyFound, SkipIPType, SkipQuarantined,
+	SkipTimeout, SkipMethodPolicy, SkipHeaderGated, SkipInconclusiveThrottled,
 }

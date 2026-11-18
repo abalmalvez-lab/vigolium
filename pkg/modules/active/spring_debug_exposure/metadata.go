@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Spring Boot debug endpoints and verbose error page configurations.
-Detects Whitelabel error pages with stack traces, Spring Boot DevTools remote
-endpoints, and debug parameter behaviors that reveal internal application details
-including package names, class paths, library versions, and configuration.
+	ModuleDesc = `**What it means:** A Spring Boot application exposes debug surface that should not be reachable in production: the Whitelabel error page, full stack traces returned with a trace parameter, the DevTools remote restart endpoint, or actuator diagnostic endpoints (startup, conditions, caches).
 
-## Notes
-- Runs once per host
-- Checks Whitelabel error page with trace parameter
-- Probes Spring Boot DevTools remote restart endpoint
-- Tests for debug parameter behaviors
-- Fingerprints 404 responses to reduce false positives
+**How it's exploited:** Stack traces and actuator output reveal package names, library versions, and bean wiring, letting an attacker fingerprint dependencies for version-specific exploits. An exposed DevTools restart endpoint can reconfigure the app and has enabled code execution.
 
-## References
-- https://docs.spring.io/spring-boot/docs/current/reference/html/web.html#web.servlet.spring-mvc.error-handling
-- https://docs.spring.io/spring-boot/docs/current/reference/html/using.html#using.devtools`
+**Fix:** Disable DevTools in production, restrict actuator endpoints to authenticated access, and turn off the Whitelabel error page and stack-trace attributes.`
 
 	ModuleConfirmation = "Confirmed when debug endpoints or verbose error pages reveal internal application details"
 	ModuleSeverity     = severity.Medium

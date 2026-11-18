@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.26-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# bun is required by `make build` (compiles embedded archon + jsscan binaries).
+# bun is required by `make build` (compiles embedded archon + jstangle binaries).
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
@@ -42,7 +42,7 @@ RUN set -e; \
     else \
         echo "prebuilt $audit_blob not found; make build will rebuild vigolium-audit"; \
     fi; \
-    make ensure-jsscan \
+    make ensure-jstangle \
     && make build \
     && mkdir -p /out \
     && cp bin/vigolium /out/vigolium
@@ -62,5 +62,10 @@ COPY --from=builder /out/vigolium /usr/local/bin/vigolium
 
 USER vigolium
 WORKDIR /home/vigolium
+
+# `vigolium server` binds 127.0.0.1 by default, which a published port cannot
+# reach inside a container; bind the API to all interfaces here. The ingest
+# proxy keeps its own --ingest-proxy-host (and needs --proxy-token off loopback).
+ENV VIGOLIUM_SERVER_HOST=0.0.0.0
 
 ENTRYPOINT ["vigolium"]

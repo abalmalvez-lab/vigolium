@@ -9,21 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects server-side prototype pollution vulnerabilities by injecting __proto__ and
-constructor.prototype properties in JSON parameters and analyzing response changes.
+	ModuleDesc = `**What it means:** The server handles __proto__ or constructor.prototype keys in a way that may mutate shared prototype state. Same-request behavior is a candidate; repeated effects in benign follow-ups, absent for a normal-property control, form a finding.
 
-## Notes
-- Tests JSON body parameters for prototype pollution vectors
-- Injects __proto__, constructor.prototype, and __proto__[status] payloads
-- Analyzes response status code and body changes after pollution
-- Targets Node.js/Express applications
+**How it's exploited:** An attacker pollutes inherited properties so later requests inherit attacker-controlled security or application values.
 
-## References
-- https://portswigger.net/web-security/prototype-pollution
-- https://portswigger.net/research/server-side-prototype-pollution`
+**Fix:** Reject __proto__ and constructor keys, and never recursively merge untrusted objects.`
 
-	ModuleConfirmation = "Confirmed when __proto__ or constructor.prototype injection causes observable changes in response status, headers, or body"
+	ModuleConfirmation = "Candidate for same-request special-key behavior; confirmed only when two benign follow-up requests retain an effect that a normal-property control did not"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"prototype-pollution", "injection", "javascript", "moderate"}

@@ -2,10 +2,12 @@ package anomaly_ranking
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 
 	"go.uber.org/zap"
+	"golang.org/x/net/html"
 
 	"github.com/vigolium/vigolium/pkg/anomaly"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
@@ -81,7 +83,14 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	body := ctx.Response().BodyToString()
 	headers := headersToMap(ctx.Response().Headers())
 
-	attrs, err := anomaly.ExtractAttributesFromRaw(statusCode, body, headers)
+	// Reuse the response's shared parsed HTML document instead of parsing the
+	// body again; only for a declared HTML response, so a JSON or
+	// JS body is never parsed as HTML just to be ignored.
+	var doc *html.Node
+	if strings.Contains(strings.ToLower(ctx.Response().Header("Content-Type")), "html") {
+		doc, _ = ctx.Response().HTMLDocument()
+	}
+	attrs, err := anomaly.ExtractAttributesFromRawDoc(statusCode, body, headers, doc)
 	if err != nil {
 		return nil, nil // silently skip extraction failures
 	}
@@ -154,10 +163,14 @@ func (m *Module) rankAndUpdate(batch []bufferedEntry, scanCtx *modkit.ScanContex
 		return
 	}
 
-	batchSize := len(records)
-	scores := make(map[string]int, batchSize)
+	scores := make(map[string]int, len(records))
+	raw := make([]int, len(records))
+	for i, rec := range records {
+		raw[i] = rec.Score
+	}
+	percentiles := lowerSharePercentiles(raw)
 
-	for rank, rec := range records {
+	for i, rec := range records {
 		reqHash, ok := rec.Metadata.(string)
 		if !ok {
 			continue
@@ -166,10 +179,7 @@ func (m *Module) rankAndUpdate(batch []bufferedEntry, scanCtx *modkit.ScanContex
 		if uuid == "" {
 			continue
 		}
-
-		// Percentile: rank 0 (highest anomaly) gets ~100, last gets ~0
-		percentile := min((batchSize-rank)*100/batchSize, 100)
-		scores[uuid] = percentile
+		scores[uuid] = percentiles[i]
 	}
 
 	if len(scores) == 0 {
@@ -189,4 +199,23 @@ func headersToMap(headers []httpmsg.HttpHeader) map[string][]string {
 		m[key] = append(m[key], h.Value)
 	}
 	return m
+}
+
+// lowerSharePercentiles maps each anomaly score to the percentage of the batch
+// with a strictly lower score. Ties share one value: fifty identical responses
+// all score 0 instead of a position-ordered 100, 98, ... 2, which ranked
+// interchangeable records as if they differed.
+func lowerSharePercentiles(scores []int) []int {
+	n := len(scores)
+	out := make([]int, n)
+	if n == 0 {
+		return out
+	}
+	sorted := append([]int(nil), scores...)
+	sort.Ints(sorted)
+	for i, s := range scores {
+		lower := sort.SearchInts(sorted, s) // count of values < s
+		out[i] = lower * 100 / n
+	}
+	return out
 }

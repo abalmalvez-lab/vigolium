@@ -16,13 +16,13 @@ A turn-based, tool-using LLM agent written in Go. Components:
 | Layer | Lives in | Responsibility |
 |---|---|---|
 | **Engine** | `pkg/olium/engine/` | Multi-turn loop: provider stream → tool dispatch → history append → repeat |
-| **Provider** | `pkg/olium/provider/` | LLM backend — five drivers (openai-codex-oauth, anthropic-api-key, anthropic-oauth, openai-api-key, anthropic-cli) |
-| **Tools** | `pkg/olium/tool/` | The eight built-in primitives the model can call (bash, file ops, search, web fetch) |
+| **Provider** | `pkg/olium/provider/` | LLM backends for OpenAI, Anthropic, Vertex, local, and compatible APIs |
+| **Tools** | `pkg/olium/tool/` | Nine built-in primitives (shell, file operations, search, HTTP, and browser probing) |
 | **Skills** | `pkg/olium/skill/` | SKILL.md workflow files (agentskills.io format) discovered from project, user, and embedded scopes |
 | **TUI** | `pkg/olium/tui/` | Bubble Tea front-end (inline scrollback, slash commands, live tool cards) |
 | **Headless** | `pkg/olium/headless.go` | Non-interactive single-prompt runner for scripts and smoke tests |
 | **Autopilot** | `pkg/olium/autopilot/` | Long-running autonomous scan loop on top of the engine, with budgets, halt signal, and `report_finding` |
-| **Vigolium tools** | `pkg/olium/vigtool/` | Scanner-aware extensions: `run_scan`, `run_extension`, `list_sessions`, `list_findings`, `auth_session_lookup`, etc. |
+| **Vigolium tools** | `pkg/olium/vigtool/` | Scanner-aware extensions: `run_native_scan`, `run_extension`, `list_sessions`, `list_findings`, `auth_session_lookup`, etc. |
 | **Auth** | `pkg/olium/auth/` | Codex OAuth credential loading and refresh (handles `~/.codex/auth.json`) |
 
 Entry points:
@@ -96,19 +96,25 @@ Prints assistant text to **stdout**; thinking deltas, tool start/end cards, and 
 
 ## Providers
 
-Five drivers in `pkg/olium/provider/`. The provider name spells out the auth mechanism so it's obvious which credential field applies:
+The provider name identifies both the wire protocol and credential type:
 
-| Provider | Auth | Default model | Source of credential |
-|---|---|---|---|
-| `openai-codex-oauth` *(default)* | OAuth credential file | `gpt-5.5` | `--oauth-cred` → `agent.olium.oauth_cred_path` → `~/.codex/auth.json` (produced by `codex login`) |
-| `anthropic-api-key` | `x-api-key` header | `claude-opus-4-7` | `--llm-api-key` → `agent.olium.llm_api_key` → `$ANTHROPIC_API_KEY` |
-| `anthropic-oauth` | Bearer token (Claude Code OAuth) | `claude-opus-4-7` | `--oauth-token` → `agent.olium.oauth_token` → `$ANTHROPIC_API_KEY` (produced by `claude setup-token`) |
-| `openai-api-key` | `x-api-key` header | `gpt-5.5` | `--llm-api-key` → `agent.olium.llm_api_key` → `$OPENAI_API_KEY` |
-| `anthropic-cli` | (none — subprocess) | `claude-opus-4-7` | `--claude-bin` (default `claude` on `$PATH`) |
+| Provider | Authentication / endpoint |
+|---|---|
+| `openai-compatible` *(shipped default)* | Custom Chat Completions endpoint; defaults to local Ollama at `http://localhost:11434/v1` with `gemma4:latest` |
+| `openai-codex-oauth` | `--oauth-cred` → YAML → `~/.codex/auth.json` from `codex login` |
+| `openai-api-key` | Bearer `--llm-api-key` → YAML → `$OPENAI_API_KEY` |
+| `openai-responses` | Public OpenAI `/v1/responses`, using the same API-key resolution |
+| `anthropic-api-key` | Anthropic API key via `--llm-api-key` → YAML → `$ANTHROPIC_API_KEY` |
+| `anthropic-oauth` | Bearer token from `claude setup-token` |
+| `anthropic-cli` | Local `claude` binary |
+| `anthropic-claude-sdk-bridge` | Claude Code Agent SDK through the embedded audit bridge |
+| `anthropic-vertex` | Claude on Vertex AI with Google credentials |
+| `google-vertex` | Gemini on Vertex AI with Google credentials |
+| `anthropic-compatible` | Custom Anthropic Messages-compatible endpoint |
 
-Selection logic lives in `pkg/olium/runner.go:resolveProvider()` and `pkg/olium/select.go`. With no `--provider` flag and no YAML override, vigolium auto-detects to **`openai-codex-oauth`** (`select.go:78`). The `anthropic-oauth` provider also prepends a Claude Code preamble to the system prompt and adds the `oauth-2025-04-20` beta header so it's accepted on the same endpoint as `anthropic-api-key`.
-
-Codex auth refreshes itself: `pkg/olium/auth/codex.go` parses the JWT, checks expiry with a 60 s skew, and posts to `/oauth/token` with the stored refresh token, rewriting `~/.codex/auth.json` (`0o600`).
+The effective order is CLI override, `agent.olium` YAML, then the shipped
+default. Codex OAuth refreshes expiring credentials and rewrites
+`~/.codex/auth.json` with owner-only permissions.
 
 > **Note:** the REST API does **not** mirror these per-invocation flags. The server resolves the provider once from `agent.olium.*` in `vigolium-configs.yaml` and reuses it across requests so warm caches stay stable. To switch providers server-side, edit the YAML and reload.
 
@@ -116,7 +122,7 @@ Codex auth refreshes itself: `pkg/olium/auth/codex.go` parses the JWT, checks ex
 
 ## Tools
 
-Built-in tool registry (`pkg/olium/tool/builtin.go:6` — eight tools, registered in this order):
+The built-in registry currently contains nine tools:
 
 | Name | Read-only? | What it does |
 |---|---|---|
@@ -127,7 +133,10 @@ Built-in tool registry (`pkg/olium/tool/builtin.go:6` — eight tools, registere
 | `ls` | yes | List a directory. |
 | `grep` | yes | Regex search — uses ripgrep when available, else native Go regex. Params: `pattern`, `path`, `glob`, `max_matches` (200), `ignore_case`. |
 | `glob` | yes | Glob pattern → paths. |
-| `web_fetch` | yes | Fetch a URL. Two modes: `http` (default, fast) and `browser` (delegates to `agent-browser` for SPA / JS-heavy pages). Params: `url`, `method`, `headers`, `body`, `max_bytes`, `mode`, `wait_selector`, `wait_ms`. |
+| `web_fetch` | no | Fetch a URL. Two modes: `http` (default, fast) and `browser` (renders in headless Chromium via the in-process browser engine for SPA / JS-heavy pages). Params: `url`, `method`, `headers`, `body`, `max_bytes`, `mode`, `wait_selector`, `wait_ms`. It accepts state-changing methods and runs page script, so it is never read-only. `RegisterReadOnlyBuiltins` (used by the candidate verifier) registers a restricted variant instead: GET/HEAD only, no browser mode, nothing persisted, refused calls return an error naming the restriction — that variant is read-only. |
+| `browser_probe` | no | Probe a page with the browser integration and capture browser-visible behavior. |
+
+There is no web-search builtin: `web_fetch` retrieves a URL it is given, and the agent has no way to query a public search engine.
 
 The `IsReadOnly()` flag is what the engine uses to decide whether to fan out a turn's tool calls in parallel. `bash` runs **without an approval prompt** (yolo mode) — only the catastrophic-pattern guard prevents disasters. The `ApprovalFn` parameter on `RegisterBuiltins` is wired but unused today; it's there for future plugin-installed tools.
 
@@ -138,7 +147,7 @@ When the engine runs under `vigolium agent autopilot`, the registry also gets:
 - `halt_scan` — model-driven exit. Sets a halt signal; the run loop exits after the current turn.
 - `report_finding` — persists a finding to the database (title, severity, description, remediation, CWE, evidence, confidence, status). Soft-warns at 50 calls, hard-caps at 200.
 - `load_skill` — fetch a skill body by name (registered whenever the skill registry is non-empty).
-- **Vigtool** — `run_scan`, `run_extension`, `list_sessions`, `get_session`, `list_findings`, `list_auth_sessions`, `auth_session_lookup` (registered when `Repo` is non-nil).
+- **Vigtool** — `run_native_scan`, `run_extension`, `list_sessions`, `get_session`, `list_findings`, `list_auth_sessions`, `auth_session_lookup` (registered when `Repo` is non-nil).
 
 ---
 
@@ -164,13 +173,15 @@ Instructional prose the model reads after calling load_skill.
 
 `Load()` (`pkg/olium/skill/registry.go:77`) walks four scopes — first-found-by-name wins:
 
-1. **Project** — `.agent/skills/` and `.claude/skills/` in the working directory and every ancestor, closest first.
+1. **Project** — `.agents/skills/` and `.claude/skills/` in the working directory and every ancestor, closest first.
 2. **User** — `~/.vigolium/skills/` (only when `IncludeUserSkills=true`).
-3. **Embedded** — shipped in the binary under `public/presets/skills/` via `go:embed`.
+3. **Embedded** — generated into `internal/resources/olium/skills/` and shipped in the binary via `go:embed`.
 
 Two on-disk layouts are accepted: `<root>/<name>/SKILL.md` (directory skill, the agentskills.io standard) or `<root>/<name>.md` (single-file shorthand; frontmatter `name` must match the filename stem).
 
-Generic chat (`vigolium agent olium`, headless) loads scopes 1 + 3 only. Autopilot and swarm load all three so security-specific workflows in `~/.vigolium/skills/` don't pollute casual chat (`pkg/olium/runner.go:25`).
+Interactive olium, autopilot, and swarm include user skills. One-shot olium
+loads project and embedded scopes. Project skills always take precedence on a
+name collision.
 
 ### Use
 
@@ -183,15 +194,18 @@ In the TUI, type `/skill:<name> [args]` to inline-expand a skill body into your 
 ## CLI flags
 
 ```text
---provider          openai-codex-oauth | anthropic-api-key | anthropic-oauth | openai-api-key | anthropic-cli
+--provider          one of the provider names listed above
 --model             provider-specific (empty = provider default)
---oauth-cred        OAuth credential file (openai-codex-oauth; default ~/.codex/auth.json)
+--base-url          openai-compatible endpoint override
+--oauth-cred        OAuth/SA credential file (Codex OAuth or Vertex)
 --oauth-token       Claude Code OAuth bearer token (anthropic-oauth)
---llm-api-key       API key for anthropic-api-key / openai-api-key
+--llm-api-key       API key for Anthropic/OpenAI key providers
 --claude-bin        Path to the `claude` binary (anthropic-cli)
+--bridge-bin        Path to the audit binary used by the Claude SDK bridge
+--gcp-project       GCP project for Vertex providers
+--gcp-location      GCP region for Vertex providers
 --system            Override the built-in system prompt
---headless          One-shot non-interactive — print to stdout, exit
--p, --prompt        Initial prompt (alternative to a positional arg)
+-p, --prompt        Run one prompt non-interactively and stream to stdout
 --stdin             Force reading the prompt from stdin
 ```
 
@@ -206,8 +220,8 @@ The full `agent.olium` block (defined in `internal/config/agent.go:38`):
 ```yaml
 agent:
   olium:
-    provider: openai-codex-oauth          # openai-codex-oauth | anthropic-api-key | anthropic-oauth | openai-api-key | anthropic-cli
-    model: gpt-5.5                 # empty = provider default
+    provider: openai-compatible
+    model: ""                       # empty = provider/custom-provider default
     oauth_cred_path: ~/.codex/auth.json
     oauth_token: ""                # anthropic-oauth; supports ${ENV_VAR}; falls back to $ANTHROPIC_API_KEY
     llm_api_key: ""                # supports ${ENV_VAR}; falls back to $ANTHROPIC_API_KEY / $OPENAI_API_KEY
@@ -217,8 +231,11 @@ agent:
     temperature: 0.0
     max_turns: 32
     cache_size: 1024               # LRU; 0 disables
-    max_concurrent: 4              # global cap on simultaneous provider calls; 0 = unbounded
+    max_concurrent: 4              # global cap on simultaneous provider calls; default 4 (0/unset), negative = unbounded
     call_timeout_sec: 600          # per-call deadline; negative = no timeout (parent ctx only)
+    custom_provider:
+      base_url: http://localhost:11434/v1
+      model_id: gemma4:latest
 ```
 
 `DefaultOliumConfig()` (agent.go:291) ships these exact defaults so `vigolium config ls olium` shows every knob without requiring user yaml.
@@ -226,14 +243,17 @@ agent:
 Adjacent config blocks worth knowing:
 
 - `agent.sessions_dir` — where per-run session directories go. Default `~/.vigolium/agent-sessions/`.
-- `agent.browser` — toggles `agent-browser` integration (the binary `web_fetch` shells out to in `mode: browser`).
+- `agent.browser` — toggles the `agent-browser` integration: the prompt's browser section and the typed `browser_auth` tool (`enable: false` removes the tool; `binary_path` picks the binary, else `agent-browser` on `PATH`). `browser_auth` checks `agent-browser --version` once and refuses a release outside the supported range (currently `>=0.26.0 <1.0.0`) instead of emitting argv it was not verified against. `web_fetch mode: browser` does not use it — it renders in-process.
 - `agent.audit` — controls the optional vigolium-audit prep step that autopilot/swarm can stack ahead of the olium loop.
 
 ---
 
 ## Sessions and on-disk state
 
-Every agent run gets a session directory under `agent.sessions_dir` (default `~/.vigolium/agent-sessions/<run-uuid>/`). Bare `vigolium agent olium` chat doesn't write a session — it's only autopilot/swarm/query that materialise one.
+Every agent run, including interactive and one-shot olium, gets a session
+directory under `agent.sessions_dir` (default
+`~/.vigolium/agent-sessions/<run-uuid>/`). Olium engine runs write a
+Pi-compatible `transcript.jsonl` there.
 
 Inside a session dir you may find:
 
@@ -242,7 +262,8 @@ Inside a session dir you may find:
 - `session-config.json` — run metadata (project / scan UUIDs, options).
 - `swarm-plan.json`, `master-output.md`, `audit-stream.jsonl`, `checkpoint.json` — produced by the higher-level modes that wrap olium (swarm, audit, autopilot).
 
-Browse past runs with `vigolium agent session list` / `--full` / `--tail`.
+Browse past runs with `vigolium agent session`, or inspect one UUID with
+`--full` / `--tail`.
 
 ---
 

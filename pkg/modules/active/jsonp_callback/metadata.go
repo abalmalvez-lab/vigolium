@@ -9,22 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects JSONP (JSON with Padding) endpoints that wrap responses in callback
-functions, enabling cross-origin data theft. First checks for existing JSONP
-patterns in responses, then actively injects callback parameters.
+	ModuleDesc = `**What it means:** The endpoint returns a valid JSON object or array inside a JavaScript callback. Two fresh callback names distinguish dynamic JSONP support from a fixed function call or generic reflection.
 
-## Notes
-- Two-phase detection: passive check for existing JSONP, then active callback injection
-- Severity upgraded from Medium to High if response contains sensitive data
-- Tests multiple common callback parameter names
-- Deduplicates by host + path
+**How it's exploited:** Public JSONP is often intentional. Sensitive values become a candidate only in a browser-executable response. A finding additionally requires a known cross-site session cookie and repeated credential-free controls that cannot retrieve the same sensitive fields.
 
-## References
-- https://owasp.org/www-community/attacks/Cross_Site_Script_Inclusion
-- https://www.benhayak.com/2015/06/same-origin-method-execution-some.html`
+**Fix:** Do not serve sensitive data as JSONP; return plain JSON with a controlled CORS policy and reject untrusted callbacks.`
 
-	ModuleConfirmation = "Confirmed when injecting a callback parameter causes the response to be wrapped in the specified function call"
+	ModuleConfirmation = "Requires exact fresh callback wrappers around valid JSON twice; credentialed findings also require executable MIME behavior, a cross-site session cookie, and two anonymous negative controls"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"xss", "info-disclosure", "moderate"}

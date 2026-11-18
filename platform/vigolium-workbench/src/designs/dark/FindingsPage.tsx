@@ -3,11 +3,12 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import type { ColDef, RowClickedEvent, SelectionChangedEvent } from 'ag-grid-community';
-import { Shield, Globe, Box, Search, RefreshCw, List, Layers, ChevronRight, ChevronDown } from 'lucide-react';
+import { Shield, Globe, Box, Search, RefreshCw, List, Layers, ChevronRight, ChevronDown, X } from 'lucide-react';
 import { useFindings, useDeleteFinding } from '@/api/hooks';
 import { withDemoKey } from '@/api/client';
 import { useToast } from '@/contexts/ToastContext';
 import type { Finding, FindingsQueryParams } from '@/api/types';
+import { FINDING_STATUSES } from '@/api/types';
 
 import { registerAgGrid } from '@/lib/ag-grid-register';
 import { formatDate } from '@/lib/formatters';
@@ -297,6 +298,18 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
 
   const resetOffset = () => setParams((p) => ({ ...p, offset: 0 }));
 
+  const hasActiveFilters = !!(severityFilter || domainFilter || moduleFilter || moduleTypeFilter || findingSourceFilter || statusFilter || searchInput);
+  const clearFilters = () => {
+    setSeverityFilter('');
+    setDomainFilter('');
+    setModuleFilter('');
+    setModuleTypeFilter('');
+    setFindingSourceFilter('');
+    setStatusFilter('');
+    setSearchInput('');
+    resetOffset();
+  };
+
   const selectedFindingIdRef = useRef(selectedFindingId);
   selectedFindingIdRef.current = selectedFindingId;
 
@@ -364,6 +377,19 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
               </div>
             </div>
             <div className="flex items-center gap-2 text-xs flex-wrap">
+              <button
+                onClick={clearFilters}
+                disabled={!hasActiveFilters}
+                title="Clear all filters"
+                className={`flex items-center gap-1 border text-xs px-2 py-0.5 transition-colors ${
+                  hasActiveFilters
+                    ? 'border-[#ef2f27]/50 text-[#ef2f27] bg-[#1c1b19] hover:bg-[#ef2f27]/10'
+                    : 'border-[#2e2b26] text-[#918175] bg-[#1c1b19] opacity-40 cursor-default'
+                }`}
+              >
+                <X className="w-3 h-3" />
+                clear
+              </button>
               <Dropdown
                 value={severityFilter}
                 icon={<Shield className="w-3 h-3" />}
@@ -411,11 +437,7 @@ export default function FindingsPage({ initialId }: { initialId?: number | null 
                 value={statusFilter}
                 options={[
                   { value: '', label: 'status:all' },
-                  { value: 'draft', label: 'draft' },
-                  { value: 'triaged', label: 'triaged' },
-                  { value: 'false_positive', label: 'false_positive' },
-                  { value: 'accepted_risk', label: 'accepted_risk' },
-                  { value: 'fixed', label: 'fixed' },
+                  ...FINDING_STATUSES.map((s) => ({ value: s, label: s })),
                 ]}
                 onChange={(v) => { setStatusFilter(v); resetOffset(); }}
               />

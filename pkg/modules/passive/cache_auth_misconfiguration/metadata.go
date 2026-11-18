@@ -9,26 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects responses that are publicly cacheable (Cache-Control: public or s-maxage) but
-contain user-specific indicators (Set-Cookie, Authorization) without proper Vary headers.
-This can lead to one user's authenticated response being served from cache to another
-user, causing data leakage or session confusion.
+	ModuleDesc = `**What it means:** A public cache hit coincides with a live session or authorization credential but lacks the corresponding Vary token. This is a candidate because caches may segregate responses through other configuration and the body may not be personalized.
 
-## Notes
-- Passive only — does not send any HTTP requests
-- Skips static assets (JS, CSS, images, fonts)
-- Checks for Cache-Control: public or s-maxage without no-store/private
-- Reports missing Vary: Cookie when Set-Cookie is present
-- Reports missing Vary: Authorization when Authorization header was in request
-- Deduplicates by host+path
+**How it's exploited:** A shared cache may replay one user's personalized response to another user. Confirmation requires cross-user replay.
 
-## References
-- https://portswigger.net/web-security/web-cache-poisoning
-- https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Vary`
+**Fix:** Mark per-user responses private or no-store, or key the cache by Cookie and Authorization.`
 
-	ModuleConfirmation = "Confirmed when a cacheable response has user-specific headers but missing corresponding Vary header"
-	ModuleSeverity     = severity.Medium
-	ModuleConfidence   = severity.Firm
+	ModuleConfirmation = "Candidate only after an actual cache HIT plus live credential/session evidence and missing Vary token; cross-user replay is required for a finding"
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"misconfiguration", "cache-poisoning", "session", "light"}
 )

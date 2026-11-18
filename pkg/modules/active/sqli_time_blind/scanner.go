@@ -1,6 +1,7 @@
 package sqli_time_blind
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/pkg/errors"
@@ -14,10 +15,14 @@ import (
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
-// sleepThreshold is the minimum response time differential to consider
-// a timing-based injection confirmed. Set high (8s) to avoid false positives
-// from slow servers or network jitter.
-const sleepThreshold = 8 * time.Second
+const (
+	// The baseline sampling and threshold formula live in
+	// modkit.TimingThreshold, shared with the other time-based module.
+	// maxThreshold caps the derived threshold: if a host is so slow/jittery that
+	// the threshold would exceed this, the (10s) sleep payloads can't clear it,
+	// so we skip rather than risk a false positive on an unstable target.
+	maxThreshold = 9 * time.Second
+)
 
 // Module implements the time-based blind SQL injection active scanner.
 type Module struct {
@@ -45,6 +50,13 @@ func New() *Module {
 	return m
 }
 
+// VulnClass enables cross-module (param, class) dedup: once any SQLi module
+// reports a parameter, the others in the class skip it.
+func (m *Module) VulnClass() string { return modkit.VulnClassSQLi }
+
+// ClassPriority orders this module within its vuln class (lower runs first).
+func (m *Module) ClassPriority() int { return modkit.ClassCostTiming }
+
 // ScanPerRequest tests all insertion points for time-based blind SQL injection.
 func (m *Module) ScanPerRequest(
 	ctx *httpmsg.HttpRequestResponse,
@@ -67,6 +79,10 @@ func (m *Module) ScanPerRequest(
 	if err != nil {
 		return results, errors.Wrap(err, "failed to create insertion points")
 	}
+	// Header points: same class gate the executor applies to per-point
+	// modules — noise headers never, logged/negotiation/routing
+	// headers once per host.
+	points = modkit.FilterPointsFor(scanCtx, m, ctx, points)
 
 	// Filter out already checked insertion points
 	rhm := m.rhm.Get(scanCtx.DedupMgr())
@@ -79,15 +95,33 @@ func (m *Module) ScanPerRequest(
 
 ipScan:
 	for _, ip := range points {
+		// Another module of this vuln class already reported this param here.
+		if scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
+			continue
+		}
 		baseValue := ip.BaseValue()
 
-		payloads := getPayloadsForValue(baseValue)
+		// Model the target's normal latency for this insertion point and derive
+		// a per-target delay threshold, instead of a single fixed cutoff. This
+		// makes detection adaptive: fast targets can be confirmed with a modest
+		// margin, while slow/jittery targets raise the bar (or are skipped).
+		threshold, err := m.deriveThreshold(ctx, httpClient, scanCtx)
+		if err != nil {
+			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
+				return results, nil
+			}
+			// errBaselineBlocked or a sampling error — either way this insertion
+			// point has no reliable timing oracle, so move to the next one.
+			continue
+		}
+		if threshold > maxThreshold {
+			continue // Target too slow/jittery to time-test reliably
+		}
+
+		payloads := prioritizeByDBMS(getPayloadsForValue(baseValue, scanCtx.RiskyPayloadsAllowed()), scanCtx, urlx.Host)
 
 		for _, pair := range payloads {
-			sleepPayload := baseValue + pair.sleepVal
-			noSleepPayload := baseValue + pair.noSleep
-
-			result, err := m.testTimingPair(ctx, httpClient, ip, sleepPayload, noSleepPayload, pair.dbType)
+			result, err := m.confirmTiming(ctx, httpClient, ip, pair, baseValue, threshold)
 			if err != nil {
 				if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 					return results, nil
@@ -106,80 +140,234 @@ ipScan:
 	return results, nil
 }
 
-// testTimingPair implements the triple verification algorithm: sleep → no-sleep → sleep.
-func (m *Module) testTimingPair(
+// errBaselineBlocked signals that the insertion point's unmodified baseline is a
+// WAF/CDN edge block, auth gate, or rate-limit response rather than an
+// application response. Timing such a surface is meaningless (the request never
+// reaches a backend query), so the caller skips the insertion point. It is not a
+// host error — the host is up, it is just denying this request.
+var errBaselineBlocked = errors.New("sqli_time_blind: baseline response is blocked")
+
+// deriveThreshold returns the record's timing threshold through the shared
+// per-record memo (modkit.TimingThreshold): one latency model per record,
+// shared by every insertion point and by the other time-based module, instead
+// of modkit.TimingBaselineSamples unmodified requests per point per module. A
+// blocked baseline (WAF/auth/rate-limit) is errBaselineBlocked.
+func (m *Module) deriveThreshold(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
+) (time.Duration, error) {
+	threshold, err := scanCtx.TimingThreshold(ctx, modkit.UnmodifiedTimingSample(ctx, httpClient))
+	if errors.Is(err, modkit.ErrTimingBaselineBlocked) {
+		return 0, errBaselineBlocked
+	}
+	return threshold, err
+}
+
+const (
+	// sleepHigh / sleepLow are the two requested sleep durations used to prove
+	// the response delay scales with the injected sleep value.
+	sleepHigh = 6
+	sleepLow  = 2
+	// timeRounds is how many independent confirmation rounds must all pass.
+	timeRounds = 2
+
+	// minScaleDenom / maxOvershootFactor tune infra.ScaledDelayConfirmed for this
+	// module: each sleep must add >= its requested duration / minScaleDenom over the
+	// no-sleep control, and the high sleep may overshoot its requested duration by at
+	// most maxOvershootFactor× (see that helper for why delta-over-control scaling is
+	// the decisive false-positive killer).
+	minScaleDenom      = 2
+	maxOvershootFactor = 4
+)
+
+// confirmTiming confirms a time-based blind SQLi across multiple rounds and
+// verifies the observed delay tracks the requested sleep duration. The scaling
+// factor is the decisive false-positive killer: random server slowness or a
+// fixed-timeout/retry sink does not produce a delay that grows linearly with
+// the SLEEP argument.
+//
+// Per round:
+//   - the no-sleep payload must stay under the threshold (else the host is just slow);
+//   - the high-sleep payload must exceed the threshold;
+//   - the low-sleep payload must itself add a partial delay AND the high−low
+//     differential must track the requested (high−low) seconds.
+func (m *Module) confirmTiming(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	ip httpmsg.InsertionPoint,
-	sleepPayload, noSleepPayload, dbType string,
+	pair timePair,
+	baseValue string,
+	threshold time.Duration,
 ) (*output.ResultEvent, error) {
-	// Step 1: Send sleep payload (should be slow)
-	elapsed1, err := m.sendTimedPayload(ctx, httpClient, ip, sleepPayload)
-	if err != nil {
-		return nil, err
-	}
-	if elapsed1 < sleepThreshold {
-		return nil, nil // No delay observed
+	render := func(seconds int) string { return baseValue + pair.render(seconds) }
+
+	// roundTiming records one confirmation round's measured latencies so the
+	// multi-round scaling comparison that proves the finding is preserved as
+	// evidence rather than recomputed and thrown away.
+	type roundTiming struct{ noSleep, low, high time.Duration }
+	var rounds []roundTiming
+	// The no-sleep control (fast) and high-sleep proof (slow) from the final
+	// round, captured with their raw request/response for the finding's evidence.
+	var control, proof timedResult
+
+	for round := 0; round < timeRounds; round++ {
+		// Capture request/response on the final round only — earlier rounds just
+		// gate, so reading their bodies would waste allocations on the hot path.
+		capture := round == timeRounds-1
+
+		noSleep, err := m.sendTimedPayload(ctx, httpClient, ip, render(0), capture)
+		if err != nil {
+			return nil, err
+		}
+		// A WAF/CDN block, auth gate, or rate-limit response is never a reliable
+		// timing oracle: the request never reaches a backend query, and a 429/503
+		// in particular injects its own latency that masquerades as a SQL sleep
+		// (the motivating false positive: a CloudFront 403 on an X-Forwarded-For
+		// payload whose round-trip jitter looked like a scaling delay). If any
+		// probe in the round is blocked, the round proves nothing — drop it.
+		if noSleep.blocked {
+			return nil, nil
+		}
+		if noSleep.elapsed >= threshold {
+			return nil, nil // Host is uniformly slow — not a reliable signal
+		}
+
+		high, err := m.sendTimedPayload(ctx, httpClient, ip, render(sleepHigh), capture)
+		if err != nil {
+			return nil, err
+		}
+		if high.blocked {
+			return nil, nil // The slow response is the edge denying us, not SQL
+		}
+		if high.elapsed < threshold {
+			return nil, nil // No delay from the high sleep payload
+		}
+
+		low, err := m.sendTimedPayload(ctx, httpClient, ip, render(sleepLow), false)
+		if err != nil {
+			return nil, err
+		}
+		if low.blocked {
+			return nil, nil
+		}
+
+		// Credit each sleep only with the delay it added over this round's own no-sleep
+		// control (not the absolute latency), and require the delay to scale with the
+		// requested duration — the decisive false-positive killer for a slow-but-constant
+		// host where the low sleep's absolute latency clears a fixed bar while adding no
+		// real delay. See infra.ScaledDelayConfirmed for the scaling verdict.
+		if !infra.ScaledDelayConfirmed(noSleep.elapsed, low.elapsed, high.elapsed,
+			time.Duration(sleepLow)*time.Second, time.Duration(sleepHigh)*time.Second,
+			minScaleDenom, maxOvershootFactor) {
+			return nil, nil
+		}
+
+		rounds = append(rounds, roundTiming{noSleep.elapsed, low.elapsed, high.elapsed})
+		if capture {
+			control, proof = noSleep, high
+		}
 	}
 
-	// Step 2: Send no-sleep payload (should be fast)
-	elapsedNoSleep, err := m.sendTimedPayload(ctx, httpClient, ip, noSleepPayload)
-	if err != nil {
-		return nil, err
-	}
-	if elapsedNoSleep >= sleepThreshold {
-		return nil, nil // Server is just slow, not injectable
+	// All rounds passed — confirmed time-based blind SQLi. Carry the differential
+	// that proves it: the slow high-sleep probe is the primary pair, with the
+	// unmodified baseline and the fast no-sleep control attached as evidence.
+	// proof/control are always populated here: the final round captures, and the
+	// loop only reaches this point once every round has passed.
+	sleepPayload := render(sleepHigh)
+
+	ev := modkit.NewEvidenceCollector()
+	ev.Add("baseline (unmodified request)", modkit.CtxRequestRaw(ctx), modkit.CtxResponseRaw(ctx))
+	ev.Add("control: no-sleep payload returned fast", control.request, control.response)
+
+	extracted := []string{sleepPayload, render(0), pair.dbType}
+	for i, r := range rounds {
+		extracted = append(extracted, fmt.Sprintf(
+			"Round %d: no-sleep %dms, %ds-sleep %dms, %ds-sleep %dms",
+			i+1, r.noSleep.Milliseconds(), sleepLow, r.low.Milliseconds(), sleepHigh, r.high.Milliseconds()))
 	}
 
-	// Step 3: Send sleep payload again (should be slow again)
-	elapsed2, err := m.sendTimedPayload(ctx, httpClient, ip, sleepPayload)
-	if err != nil {
-		return nil, err
-	}
-	if elapsed2 < sleepThreshold {
-		return nil, nil // Inconsistent — likely false positive
-	}
-
-	// All checks passed — confirmed time-based blind SQLi
-	fuzzedRaw := ip.BuildRequest([]byte(sleepPayload))
+	last := rounds[len(rounds)-1]
 	return &output.ResultEvent{
-		Request:          string(fuzzedRaw),
-		FuzzingParameter: ip.Name(),
-		ExtractedResults: []string{sleepPayload, noSleepPayload, dbType},
+		Request:            proof.request,
+		Response:           proof.response,
+		FuzzingParameter:   ip.Name(),
+		ExtractedResults:   extracted,
+		AdditionalEvidence: ev.Entries(),
 		Info: output.Info{
-			Description: "Time-based blind SQL injection confirmed via triple verification " +
-				"(sleep/no-sleep/sleep). Database type: " + dbType,
-			// Time-based inference is prone to backend-delay false positives —
-			// flag as suspect/tentative rather than the module default.
+			Description: fmt.Sprintf(
+				"Time-based blind SQL injection confirmed over %d rounds; the response delay scales with "+
+					"the injected sleep duration (final round: no-sleep %dms, %ds-sleep %dms, %ds-sleep %dms). "+
+					"Database type: %s",
+				timeRounds, last.noSleep.Milliseconds(), sleepLow, last.low.Milliseconds(),
+				sleepHigh, last.high.Milliseconds(), pair.dbType),
+			// Time-based blind is the least reliable SQLi confirmation: the only
+			// signal is wall-clock latency, which network/edge jitter can forge.
+			// Report it as a lead to verify by hand (Suspect/Tentative), not a
+			// firmly-confirmed High.
 			Severity:   severity.Suspect,
 			Confidence: severity.Tentative,
+		},
+		// Per-round timings live in ExtractedResults (every round) and the
+		// Description (final round); Metadata carries only the scan configuration.
+		Metadata: map[string]any{
+			"threshold_ms":        threshold.Milliseconds(),
+			"confirmation_rounds": timeRounds,
+			"sleep_high_s":        sleepHigh,
+			"sleep_low_s":         sleepLow,
 		},
 	}, nil
 }
 
-// sendTimedPayload sends a payload and returns the elapsed wall-clock duration.
+// timedResult is one timed probe: its wall-clock latency, whether the response
+// was a WAF/CDN/auth/rate-limit block (so timing it proves nothing), plus, when
+// capture is requested, the raw request/response so a confirmed finding can
+// carry the actual proof pair as evidence instead of discarding it.
+type timedResult struct {
+	elapsed  time.Duration
+	blocked  bool
+	request  string
+	response string
+}
+
+// sendTimedPayload sends a payload and returns its elapsed wall-clock duration.
+// When capture is true it also records the raw request and full response so the
+// caller can attach them to a finding (callers that only need the timing pass
+// false to avoid reading the body on the hot path).
 func (m *Module) sendTimedPayload(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	ip httpmsg.InsertionPoint,
 	payload string,
-) (time.Duration, error) {
+	capture bool,
+) (timedResult, error) {
 	fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
+	// BuildRequest produces well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
+
+	// SendTimed forces NoClustering and times the send itself, not
+	// the rate/slot queue in front of it. NoClustering: this is a timing oracle. The baseline loop sends the original
+	// (no-sleep) value several times back-to-back to model latency/jitter, and the
+	// confirmation re-sends the same payload. The 500ms request-cluster cache keys on
+	// raw request bytes, so a clustered re-send returns the first response's cached
+	// copy in ~0ms — collapsing the jitter estimate and letting a jittery host clear
+	// the threshold (a false positive). Every send must be a genuine round-trip.
+	resp, elapsed, err := modkit.SendTimed(httpClient, fuzzedReq, http.Options{})
 	if err != nil {
-		return 0, err
+		return timedResult{}, err
 	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
 
-	start := time.Now()
-	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
-	elapsed := time.Since(start)
-
-	if err != nil {
-		return 0, err
+	// Classify the response while it is still open: a 401/403/429/503 or a
+	// WAF/CDN challenge means the request was denied, not processed by a backend
+	// query, so its latency must never be read as a SQL sleep.
+	res := timedResult{elapsed: elapsed, blocked: infra.IsBlockedResponse(resp)}
+	if capture {
+		res.request = string(fuzzedRaw)
+		res.response = resp.FullResponseString()
 	}
 	resp.Close()
 
-	return elapsed, nil
+	return res, nil
 }

@@ -9,11 +9,12 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects subdomain takeover vulnerabilities caused by dangling DNS records (CNAME or A) pointing to
-deprovisioned cloud services. When a service is removed but its DNS record remains, an attacker can
-claim the same service identifier and serve malicious content under the target's domain.`
-	ModuleConfirmation = "Confirmed when an HTTP response from the host matches known fingerprints of unclaimed/deprovisioned cloud service pages"
+	ModuleDesc = `**What it means:** A credential-free GET repeatedly matches a provider deprovisioning page. A strong candidate additionally requires the hostname's CNAME to end at that provider and an explicit unclaimed-resource fingerprint.
+
+**How it's exploited:** If the provider namespace is actually claimable, an attacker may register it and serve content on the trusted subdomain. DNS errors and ambiguous unavailable-site pages remain observations; the scanner never registers the resource.
+
+**Fix:** Remove the stale DNS record, or reclaim the service identifier so the subdomain no longer resolves to an unclaimed slot.`
+	ModuleConfirmation = "Candidate requires provider-bound CNAME plus a strong deprovisioning fingerprint reproduced twice; claimability is not confirmed without registration"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"cloud", "misconfiguration", "moderate"}

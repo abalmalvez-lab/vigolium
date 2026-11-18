@@ -11,6 +11,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
+	"github.com/vigolium/vigolium/pkg/output"
 )
 
 // TestScanPerHost_DetectsPublicSensitivePath drives the real scan method against a
@@ -37,6 +38,55 @@ func TestScanPerHost_DetectsPublicSensitivePath(t *testing.T) {
 	res, err := New().ScanPerHost(rr, client, &modkit.ScanContext{})
 	require.NoError(t, err)
 	require.NotEmpty(t, res, "expected a public-read finding when sensitive paths return real content")
+	assert.Equal(t, output.RecordKindCandidate, res[0].RecordKind)
+}
+
+func TestScanPerHost_PublicMediaListingIsObservation(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/") {
+			_, _ = w.Write([]byte(`<pre>photo-001.jpg\nphoto-002.jpg\nphoto-003.jpg</pre>`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	res, err := New().ScanPerHost(modtest.Response(modtest.Request(t, srv.URL+"/"), "text/html", "index"), modtest.Requester(t), &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.NotEmpty(t, res)
+	assert.Equal(t, output.RecordKindObservation, res[0].RecordKind)
+}
+
+func TestScanPerHost_GenericPageAtSensitivePathIsIgnored(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "vigolium-wp") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`<html><body>Welcome to our public downloads and documentation portal.</body></html>`))
+	}))
+	defer srv.Close()
+	res, err := New().ScanPerHost(modtest.Response(modtest.Request(t, srv.URL+"/"), "text/html", "index"), modtest.Requester(t), &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res)
+}
+
+func TestScanPerHost_SensitiveContentIsFinding(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "vigolium-wp") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("-----BEGIN PRIVATE KEY-----\n" + strings.Repeat("a1B2c3D4", 12) + "\n-----END PRIVATE KEY-----"))
+	}))
+	defer srv.Close()
+	res, err := New().ScanPerHost(modtest.Response(modtest.Request(t, srv.URL+"/"), "text/html", "index"), modtest.Requester(t), &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.NotEmpty(t, res)
+	assert.Equal(t, output.RecordKindFinding, res[0].RecordKind)
+	assert.Equal(t, output.EvidenceGradeImpact, res[0].EvidenceGrade)
 }
 
 // TestScanPerHost_NoFalsePositive ensures a host returning S3-style error bodies
@@ -73,6 +123,27 @@ func TestScanPerHost_ShortBodyNoFinding(t *testing.T) {
 	res, err := New().ScanPerHost(rr, client, &modkit.ScanContext{})
 	require.NoError(t, err)
 	assert.Empty(t, res, "a body under the minimum length must not yield a finding")
+}
+
+// TestScanPerHost_WildcardHostNoFalsePositive reproduces the catch-all false
+// positive: a host that returns the same 200 shell for EVERY path (including the
+// random wildcard probe). Without the soft-404 guard every sensitive path would
+// be reported; ConfirmNotSoft404 must recognize the wildcard shell and stay silent.
+func TestScanPerHost_WildcardHostNoFalsePositive(t *testing.T) {
+	t.Parallel()
+	const shell = "<html><body>Generic catch-all landing page for this bucket — no listing available here, move along.</body></html>"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(shell))
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(modtest.Request(t, srv.URL+"/"), "text/html", shell)
+
+	res, err := New().ScanPerHost(rr, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "a catch-all host that 200s every path must not be reported as public-read")
 }
 
 // TestCanProcess_OnlyCloudStorageHosts verifies the module gates on cloud-storage

@@ -1,6 +1,7 @@
 package modules
 
 import (
+	"github.com/vigolium/vigolium/pkg/modules/passive/aem_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/anomaly_ranking"
 	"github.com/vigolium/vigolium/pkg/modules/passive/api_pagination_leak"
 	"github.com/vigolium/vigolium/pkg/modules/passive/api_spec_detect"
@@ -8,24 +9,33 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/passive/aspnet_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/aspnet_viewstate_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/auth_headers_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/baas_endpoint_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/base64_data_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/build_misconfig_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cache_auth_misconfiguration"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cache_data_leak"
-	"github.com/vigolium/vigolium/pkg/modules/passive/cacheable_https_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/clickjacking_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/client_auth_guard"
+	"github.com/vigolium/vigolium/pkg/modules/passive/client_path_taint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cloud_signed_url_leak"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cloud_storage_error_info"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cloud_storage_fingerprint"
+	"github.com/vigolium/vigolium/pkg/modules/passive/cloud_storage_url_harvest"
 	"github.com/vigolium/vigolium/pkg/modules/passive/content_type_mismatch"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cookie_security_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cors_headers_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/cors_vary_origin_missing"
+	"github.com/vigolium/vigolium/pkg/modules/passive/cross_origin_isolation_audit"
 	"github.com/vigolium/vigolium/pkg/modules/passive/crypto_weakness_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/csp_weakness_audit"
 	"github.com/vigolium/vigolium/pkg/modules/passive/csrf_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/css_injection_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/csv_formula_injection"
+	"github.com/vigolium/vigolium/pkg/modules/passive/dashboard_fingerprint"
+	"github.com/vigolium/vigolium/pkg/modules/passive/dependency_confusion"
 	"github.com/vigolium/vigolium/pkg/modules/passive/directory_listing_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/django_fingerprint"
+	"github.com/vigolium/vigolium/pkg/modules/passive/dom_clobbering"
 	"github.com/vigolium/vigolium/pkg/modules/passive/dom_xss_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/dom_xss_taint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/drupal_api_detect"
@@ -52,10 +62,13 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/passive/javascript_uri_sink"
 	"github.com/vigolium/vigolium/pkg/modules/passive/joomla_api_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/joomla_fingerprint"
+	"github.com/vigolium/vigolium/pkg/modules/passive/js_beautify"
 	"github.com/vigolium/vigolium/pkg/modules/passive/js_framework_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/jwt_claims_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/jwt_weak_secret"
 	"github.com/vigolium/vigolium/pkg/modules/passive/laravel_fingerprint"
+	"github.com/vigolium/vigolium/pkg/modules/passive/llm_endpoint_fingerprint"
+	"github.com/vigolium/vigolium/pkg/modules/passive/mcp_dangerous_tool_exposure"
 	"github.com/vigolium/vigolium/pkg/modules/passive/mcp_description_injection"
 	"github.com/vigolium/vigolium/pkg/modules/passive/mcp_endpoint_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/metaframework_fingerprint"
@@ -67,15 +80,20 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/passive/oauth_facebook_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/openredirect_params"
 	"github.com/vigolium/vigolium/pkg/modules/passive/password_autocomplete_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/payment_integration_audit"
 	"github.com/vigolium/vigolium/pkg/modules/passive/permissions_policy_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/php2shell_version"
 	"github.com/vigolium/vigolium/pkg/modules/passive/php_generic_fingerprint"
+	"github.com/vigolium/vigolium/pkg/modules/passive/postmessage_handler_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/powerpages_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/python_debug_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/rails_action_cable_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/rails_active_storage_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/rails_debug_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/rails_fingerprint"
-	"github.com/vigolium/vigolium/pkg/modules/passive/referrer_policy_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/remix_loader_exposure"
+	"github.com/vigolium/vigolium/pkg/modules/passive/reverse_tabnabbing_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/salesforce_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/secret_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/security_headers_missing"
 	"github.com/vigolium/vigolium/pkg/modules/passive/sensitive_api_fields_detect"
@@ -86,13 +104,16 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/passive/server_action_bind_audit"
 	"github.com/vigolium/vigolium/pkg/modules/passive/server_action_input_audit"
 	"github.com/vigolium/vigolium/pkg/modules/passive/server_only_boundary_audit"
+	"github.com/vigolium/vigolium/pkg/modules/passive/servicenow_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/software_version_header"
 	"github.com/vigolium/vigolium/pkg/modules/passive/sourcemap_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/spring_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/sql_syntax_detect"
 	"github.com/vigolium/vigolium/pkg/modules/passive/ssr_data_exposure"
 	"github.com/vigolium/vigolium/pkg/modules/passive/ssr_hydration_xss"
+	"github.com/vigolium/vigolium/pkg/modules/passive/subdomain_harvest"
 	"github.com/vigolium/vigolium/pkg/modules/passive/subresource_integrity_detect"
+	"github.com/vigolium/vigolium/pkg/modules/passive/surface_scoring"
 	"github.com/vigolium/vigolium/pkg/modules/passive/symfony_fingerprint"
 	"github.com/vigolium/vigolium/pkg/modules/passive/unsafe_html_sink"
 	"github.com/vigolium/vigolium/pkg/modules/passive/verbose_error_stacktrace"
@@ -106,35 +127,44 @@ import (
 func registerPassiveModules(r *Registry) {
 	// Passive modules
 	r.RegisterPassive(dom_xss_detect.New())
+	r.RegisterPassive(dom_clobbering.New())
 	r.RegisterPassive(dom_xss_taint.New())
+	r.RegisterPassive(client_path_taint.New())
 	r.RegisterPassive(auth_headers_detect.New())
 	r.RegisterPassive(openredirect_params.New())
 	r.RegisterPassive(oauth_facebook_detect.New())
 	r.RegisterPassive(anomaly_ranking.New())
+	r.RegisterPassive(surface_scoring.New())
 	r.RegisterPassive(secret_detect.New())
 	r.RegisterPassive(sourcemap_detect.New())
 	r.RegisterPassive(security_headers_missing.New())
+	r.RegisterPassive(clickjacking_detect.New())
 	r.RegisterPassive(info_disclosure_detect.New())
 	r.RegisterPassive(directory_listing_detect.New())
 	r.RegisterPassive(cookie_security_detect.New())
 	r.RegisterPassive(mixed_content_detect.New())
 	r.RegisterPassive(sensitive_url_params.New())
 	r.RegisterPassive(cors_headers_detect.New())
+	r.RegisterPassive(cross_origin_isolation_audit.New())
+	r.RegisterPassive(reverse_tabnabbing_detect.New())
 	r.RegisterPassive(jwt_weak_secret.New())
 	r.RegisterPassive(jwt_claims_detect.New())
 	r.RegisterPassive(serialized_object_detect.New())
 	r.RegisterPassive(sql_syntax_detect.New())
 	r.RegisterPassive(content_type_mismatch.New())
+	r.RegisterPassive(csv_formula_injection.New())
 	r.RegisterPassive(csrf_detect.New())
+	r.RegisterPassive(css_injection_detect.New())
 	r.RegisterPassive(idor_params_detect.New())
 	r.RegisterPassive(crypto_weakness_detect.New())
 	r.RegisterPassive(error_message_detect.New())
 	r.RegisterPassive(base64_data_detect.New())
 	r.RegisterPassive(password_autocomplete_detect.New())
-	r.RegisterPassive(cacheable_https_detect.New())
+	r.RegisterPassive(payment_integration_audit.New())
 	r.RegisterPassive(input_reflection_detect.New())
 	r.RegisterPassive(graphql_introspection_detect.New())
 	// Passive modules - JS Framework Security
+	r.RegisterPassive(js_beautify.New())
 	r.RegisterPassive(js_framework_fingerprint.New())
 	r.RegisterPassive(ssr_data_exposure.New())
 	r.RegisterPassive(cache_auth_misconfiguration.New())
@@ -156,10 +186,11 @@ func registerPassiveModules(r *Registry) {
 	r.RegisterPassive(insecure_token_storage.New())
 	r.RegisterPassive(env_secret_exposure.New())
 	r.RegisterPassive(build_misconfig_detect.New())
+	r.RegisterPassive(dependency_confusion.New())
+	r.RegisterPassive(postmessage_handler_detect.New())
 	// Security Headers Audit
 	r.RegisterPassive(csp_weakness_audit.New())
 	r.RegisterPassive(hsts_preload_audit.New())
-	r.RegisterPassive(referrer_policy_detect.New())
 	r.RegisterPassive(permissions_policy_detect.New())
 	r.RegisterPassive(subresource_integrity_detect.New())
 	// Protocol & Technology Detection
@@ -177,18 +208,28 @@ func registerPassiveModules(r *Registry) {
 	// Joomla Security - Passive
 	r.RegisterPassive(joomla_fingerprint.New())
 	r.RegisterPassive(joomla_api_detect.New())
+	// Adobe Experience Manager - Passive
+	r.RegisterPassive(aem_fingerprint.New())
 	// Firebase Security - Passive
 	r.RegisterPassive(firebase_fingerprint.New())
 	// Cloud Storage Security - Passive
 	r.RegisterPassive(cloud_storage_fingerprint.New())
+	r.RegisterPassive(cloud_storage_url_harvest.New())
 	r.RegisterPassive(cloud_signed_url_leak.New())
 	r.RegisterPassive(cloud_storage_error_info.New())
+	// Recon Harvest - Passive (INFO): org subdomains + third-party backend services
+	r.RegisterPassive(subdomain_harvest.New())
+	r.RegisterPassive(baas_endpoint_fingerprint.New())
+	// Third-party dashboards / consoles / self-hosted apps - Passive (INFO)
+	r.RegisterPassive(dashboard_fingerprint.New())
 	// Laravel Security - Passive
 	r.RegisterPassive(laravel_fingerprint.New())
+	r.RegisterPassive(llm_endpoint_fingerprint.New())
 	// Symfony - Passive
 	r.RegisterPassive(symfony_fingerprint.New())
 	// PHP (generic) - Passive
 	r.RegisterPassive(php_generic_fingerprint.New())
+	r.RegisterPassive(php2shell_version.New())
 	// ASP.NET Security - Passive
 	r.RegisterPassive(aspnet_fingerprint.New())
 	r.RegisterPassive(aspnet_viewstate_detect.New())
@@ -227,6 +268,11 @@ func registerPassiveModules(r *Registry) {
 	// MCP Security - Passive
 	r.RegisterPassive(mcp_endpoint_detect.New())
 	r.RegisterPassive(mcp_description_injection.New())
+	r.RegisterPassive(mcp_dangerous_tool_exposure.New())
 	// Sensitive Data in Headers - Passive
 	r.RegisterPassive(sensitive_header_leak.New())
+	// SaaS Platform Fingerprinting - Passive
+	r.RegisterPassive(salesforce_fingerprint.New())
+	r.RegisterPassive(servicenow_fingerprint.New())
+	r.RegisterPassive(powerpages_fingerprint.New())
 }

@@ -2,14 +2,15 @@ package ssrf_blind
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/vigolium/vigolium/pkg/core/hosterrors"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/utils"
 )
@@ -92,26 +93,25 @@ func (m *Module) ScanPerInsertionPoint(
 	}
 
 	// Only test parameters that look like they might accept URLs
-	if !looksLikeURLParam(ip.Name(), ip.BaseValue()) {
+	if !looksLikeURLParam(ip.Type(), ip.Name(), ip.BaseValue()) {
 		return nil, nil
 	}
 
 	requestHash := ctx.Request().ID()
 
 	for _, p := range payloads {
-		oastURL := oast.GenerateURL(urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
+		oastURL := modkit.OASTURLFor(oast, oastclass.SSRF, urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
 		if oastURL == "" {
 			continue
 		}
 
 		payload := fmt.Sprintf(p.tmpl, oastURL)
+		oast.RecordPayload(oastURL, payload)
 		fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-		if err != nil {
-			continue
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
+		// BuildRequest produces well-formed raw, so wrap directly instead
+		// of re-parsing on this hot path.
+		fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 		if err != nil {
@@ -127,21 +127,11 @@ func (m *Module) ScanPerInsertionPoint(
 	return nil, nil
 }
 
-// looksLikeURLParam checks if a parameter name or value suggests URL input.
-func looksLikeURLParam(name, value string) bool {
-	nameLower := strings.ToLower(name)
-	urlParamNames := []string{
-		"url", "uri", "link", "src", "href", "dest", "redirect",
-		"path", "file", "page", "target", "callback", "endpoint",
-		"resource", "fetch", "load", "proxy", "request",
-	}
-	for _, n := range urlParamNames {
-		if strings.Contains(nameLower, n) {
-			return true
-		}
-	}
-	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "//") {
-		return true
-	}
-	return false
+// looksLikeURLParam reports whether a parameter looks like a URL sink. It delegates
+// to the shared infra helper so the standard-request-header exclusion (Referer /
+// Origin / Upgrade-Insecure-Requests / … are never fetch sinks) stays consistent
+// across the SSRF family — this local copy previously mis-scoped OAST probes onto
+// those standard headers.
+func looksLikeURLParam(typ httpmsg.InsertionPointType, name, value string) bool {
+	return infra.LooksLikeURLParamAt(typ, name, value)
 }

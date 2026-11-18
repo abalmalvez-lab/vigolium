@@ -96,4 +96,11 @@ curl -H "Authorization: Bearer vgl_abc123..." http://localhost:9002/api/info
 
 ## Disabling Authentication
 
-Set `no_auth: true` in `vigolium-configs.yaml` or pass the `--no-auth` flag to the server command to disable authentication entirely. This is not recommended for production use.
+Pass `-A` / `--no-auth` to `vigolium server` to disable authentication for
+that process. There is no persistent `server.no_auth` config key. This mode is
+not recommended for production use.
+
+`--no-auth` is refused (exit 2) when the API would listen on a non-loopback
+address (`--host 0.0.0.0`, or `$VIGOLIUM_SERVER_HOST`, which the Docker images
+set), the same rule the ingest proxy follows. Pass
+`--allow-unauthenticated-bind` to expose an unauthenticated API on purpose.

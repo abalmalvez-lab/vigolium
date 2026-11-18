@@ -15,6 +15,14 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
+// decoyRounds is how many same-directory negative-control probes the catch-all
+// disproof issues per candidate. A universal catch-all / echo host that answers
+// EVERY path with the same 200 shell (often reflecting the request URI, and —
+// under a gzip + bogus Content-Length: 0 transport quirk — captured as only a
+// truncated TAIL fragment) trips at least one round and the candidate is dropped.
+// Two rounds tolerate a single WAF/CDN flake without over-probing.
+const decoyRounds = 2
+
 type probe struct {
 	path        string
 	name        string
@@ -25,12 +33,26 @@ type probe struct {
 	refs        []string
 }
 
+// accepts reports whether body satisfies this probe's marker requirement (any
+// single marker hit). Centralized so the primary match and the catch-all decoy
+// disproof apply the EXACT same predicate — the decoy sibling must be judged by
+// the same rule the candidate was, so a truncated-tail echo / catch-all server
+// that serves the marker for every path is disproved.
+func (p probe) accepts(body string) (matched []string, ok bool) {
+	for _, marker := range p.markers {
+		if strings.Contains(body, marker) {
+			matched = append(matched, marker)
+		}
+	}
+	return matched, len(matched) > 0
+}
+
 var probes = []probe{
 	// Web Tinker - interactive PHP console
 	{
 		path:    "/tinker",
 		name:    "Laravel Web Tinker",
-		markers: []string{"tinker", "Tinker", "REPL", "Execute", "spatie"},
+		markers: []string{"tinker", "Tinker", "web-tinker", "spatie"},
 		sev:     severity.Critical,
 		desc:    "Laravel Web Tinker (interactive PHP console) is publicly accessible, allowing arbitrary code execution",
 		refs:    []string{"https://github.com/spatie/laravel-web-tinker"},
@@ -38,7 +60,7 @@ var probes = []probe{
 	{
 		path:    "/web-tinker",
 		name:    "Laravel Web Tinker (alt)",
-		markers: []string{"tinker", "Tinker", "REPL", "Execute", "spatie"},
+		markers: []string{"tinker", "Tinker", "web-tinker", "spatie"},
 		sev:     severity.Critical,
 		desc:    "Laravel Web Tinker (interactive PHP console) is publicly accessible at alternate path",
 		refs:    []string{"https://github.com/spatie/laravel-web-tinker"},
@@ -47,7 +69,7 @@ var probes = []probe{
 	{
 		path:        "/__clockwork/latest",
 		name:        "Clockwork Profiling (latest)",
-		markers:     []string{"clockwork", "databaseQueries", "timelineData", "controller", "middleware"},
+		markers:     []string{"clockwork", "databaseQueries", "timelineData"},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.High,
 		desc:        "Clockwork profiling endpoint exposed, leaking database queries, routes, timings, and request data",
@@ -65,7 +87,7 @@ var probes = []probe{
 	{
 		path:        "/_clockwork/latest",
 		name:        "Clockwork Profiling (underscore)",
-		markers:     []string{"clockwork", "databaseQueries", "timelineData", "controller", "middleware"},
+		markers:     []string{"clockwork", "databaseQueries", "timelineData"},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.High,
 		desc:        "Clockwork profiling endpoint exposed at /_clockwork path",
@@ -84,7 +106,7 @@ var probes = []probe{
 	{
 		path:        "/pulse",
 		name:        "Laravel Pulse",
-		markers:     []string{"pulse", "Pulse", "laravel", "livewire"},
+		markers:     []string{"Laravel Pulse", "pulse-dashboard"},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.Medium,
 		desc:        "Laravel Pulse monitoring dashboard is publicly accessible, revealing application performance data and server metrics",
@@ -103,7 +125,7 @@ var probes = []probe{
 	{
 		path:        "/log-viewer/api/logs",
 		name:        "Laravel Log Viewer API",
-		markers:     []string{"logs", "file", "level_counts", "laravel"},
+		markers:     []string{"level_counts", "log-viewer", "\"folders\":"},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.High,
 		desc:        "Laravel Log Viewer API is publicly accessible, allowing programmatic access to application logs",
@@ -162,10 +184,7 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -195,11 +214,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -237,11 +254,9 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -281,6 +296,12 @@ func (m *Module) probeFile(
 		}
 	}
 
+	// Catch-all / SPA shell guard: a themed app that returns the same shell for
+	// any path is a false positive even when a weak marker appears in that shell.
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
 			return nil
@@ -291,15 +312,36 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
+	// Strip the reflected probe path (and any echoed request body) before matching:
+	// the /tinker and /web-tinker markers ("tinker", "web-tinker") are the path slug
+	// itself, so a page echoing the requested path (a <form action>, an href, a
+	// JSON route name) — the truncated-tail echo server — would forge a Critical RCE
+	// finding. After the strip a marker only counts when it comes from the
+	// endpoint's own content. The original body is kept for stored evidence.
+	matchBody := modkit.StripReflectedProbePath(body, p.path)
+	if reqBody := ctx.Request().BodyToString(); reqBody != "" {
+		matchBody = modkit.StripReflected(matchBody, reqBody)
 	}
-	if !matched {
+
+	matchedMarkers, ok := p.accepts(matchBody)
+	if !ok {
+		return nil
+	}
+
+	// Multi-round catch-all disproof (truncation-proof): the reflected-path strip
+	// above kills an echoed-slug marker, but a universal catch-all shell that
+	// carries a weak tool name as a CONSTANT word for every path (a "clockwork" /
+	// "log-viewer" reference in a bundle name, surviving in the truncated tail)
+	// slips past it. Probe guaranteed-nonexistent siblings sharing this path's
+	// directory: if a random same-shape path returns the same status and ALSO
+	// satisfies this probe's predicate, the host serves this content for ANY path,
+	// so the match proves nothing. A genuinely exposed dev tool has no such sibling
+	// (the decoy 404s), so this costs no true positives, and it is robust to the
+	// body-truncation quirk because the decoy is run through the same predicate.
+	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+		_, sibOK := p.accepts(b)
+		return sibOK
+	}) {
 		return nil
 	}
 

@@ -32,12 +32,25 @@ type DetectedInput struct {
 	Label       string // text from associated <label> element
 	Accept      string // accept attribute (for file inputs: MIME types or extensions)
 
+	// Response-derived value hints (Go extension). Populated from the rendered
+	// page so the filler can prefer a value the app itself suggests over a
+	// synthetic one. DefaultValue is the input's pre-filled value; DatalistOptions
+	// are the suggested values of an associated <datalist>.
+	DefaultValue    string   // value the page pre-filled into the field
+	DatalistOptions []string // suggested values from a linked <datalist>
+
 	// Hidden file input detection (Go extension)
 	Hidden       bool   // Whether input is visually hidden (display:none, hidden attr, etc.)
 	TriggerXPath string // XPath of trigger element (button/label) for hidden file inputs
 
 	// Orphan input detection (Go extension — pilot mode)
 	SubmitXPath string // XPath of nearest submit-like element for inputs outside <form> tags
+
+	// FormKey names the form that owns the control (its index among
+	// document.forms plus its id and action attributes; the form= attribute is
+	// honored), "" for a control outside any form. Stable within one detection
+	// pass, so an action's fill can be limited to the action's own form.
+	FormKey string
 
 	// Value rotation state (Go extension)
 	mu         sync.Mutex

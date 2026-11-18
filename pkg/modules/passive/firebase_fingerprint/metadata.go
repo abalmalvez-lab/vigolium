@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Firebase usage from HTML/JS responses, extracts project
-configuration, and detects leaked Firebase-specific secrets and tokens.
+	ModuleDesc = `**What it means:** This passive check confirms Firebase usage from SDK references and the firebaseConfig object, reporting exposed identifiers (projectId, apiKey, databaseURL) and sensitive items: leaked FCM server keys, App Check debug tokens, RTDB auth tokens, and Storage tokens.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects Firebase via SDK references, initializeApp calls, and config objects
-- Extracts projectId, apiKey, databaseURL, storageBucket from config
-- Flags leaked FCM server keys, App Check debug tokens, RTDB auth tokens
-- Flags leaked Firebase Storage download tokens in URLs
-- Detects staging/dev project indicators in projectId
-- Deduplicates by host to avoid redundant processing
+**How it's exploited:** The disclosed config lets an attacker probe Firestore/RTDB rules and Storage buckets with the client SDK. A leaked FCM key pushes notifications to all users, auth tokens grant backend access, and Storage tokens expose files.
 
-## References
-- https://firebase.google.com/docs/web/setup
-- https://firebase.google.com/docs/projects/api-keys`
+**Fix:** Treat config as public but enforce strict Firebase rules and App Check, and keep server keys and tokens out of client code.`
 
 	ModuleConfirmation = "Confirmed when Firebase SDK references, configuration objects, or leaked Firebase secrets are detected in the response"
 	ModuleSeverity     = severity.Info

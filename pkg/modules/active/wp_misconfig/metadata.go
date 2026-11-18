@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for WordPress-specific files and endpoints that should not be publicly
-accessible: configuration backups, debug logs, installer/repair endpoints,
-informational files, directory listings, and the externally triggerable cron.
+	ModuleDesc = `**What it means:** A WordPress site exposes files and endpoints that should never be publicly reachable. Impact ranges from version disclosure to database credential exposure, so each finding carries its own severity (Info up to Critical).
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to avoid false positives from WAF block pages
-- Checks backup variants of wp-config.php (~, .old, .save, .swp, .txt)
-- Detects exposed debug.log with PHP error/warning markers
-- Checks directory listing on /wp-content/uploads/ and /wp-content/plugins/
+**How it's exploited:** The worst cases are a readable wp-config.php (or backups like wp-config.php~, .old, .bak) and SQL dumps, handing an attacker DB credentials, auth salts, and the user table. Lesser findings are stepping stones: installer endpoints can reset the site and debug.log leaks paths.
 
-## References
-- https://developer.wordpress.org/advanced-administration/wordpress/wp-config/
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/`
+**Fix:** Block web access to wp-config.php, backups, debug logs, SQL dumps, and installer/repair endpoints, and disable directory listing.`
 
 	ModuleConfirmation = "Confirmed when probed WordPress files return 200 with expected content markers (PHP constants, log entries, directory index HTML)"
 	ModuleSeverity     = severity.High

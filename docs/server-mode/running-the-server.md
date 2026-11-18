@@ -11,9 +11,9 @@ Vigolium can run as a persistent REST API server, accepting traffic ingestion, s
 export VIGOLIUM_API_KEY=my-secret-key
 vigolium server
 
-# Custom host and port
+# Expose the API beyond this machine, on a custom port
 export VIGOLIUM_API_KEY=my-secret-key
-vigolium server --host 127.0.0.1 --service-port 9002
+vigolium server --host 0.0.0.0 --service-port 9002
 
 # With an upstream proxy for outgoing scanner traffic
 export VIGOLIUM_API_KEY=my-secret-key
@@ -23,11 +23,100 @@ vigolium server --proxy http://corporate-proxy:8080
 vigolium server -A
 ```
 
-The server listens on `0.0.0.0:9002` by default.
+The server listens on `127.0.0.1:9002` by default. Pass `--host 0.0.0.0` (or set
+`VIGOLIUM_SERVER_HOST=0.0.0.0`, as the Docker images do) to accept remote
+connections; the ingest proxy keeps its own `--ingest-proxy-host` (also
+loopback by default).
+
+Useful server controls:
+
+```bash
+# Mirror every persisted record/finding to a live filesystem tree
+vigolium server --mirror-fs ./live-export
+
+# Read-only API/UI, or the narrower public demo allowlist
+vigolium server --view-only
+vigolium server --demo-only
+
+# Disable agent endpoints or Swagger
+vigolium server --no-agent --no-swagger
+```
+
+`--full-native-scan-on-receive` expands `--scan-on-receive` from the
+dynamic-assessment path to the full native pipeline; `--passive-only` prevents
+active requests.
+
+## Live Burp Traffic
+
+When the Vigolium Burp extension's Bridge listener is enabled, the server can
+include live Burp Proxy history in the ordinary HTTP-records API:
+
+```bash
+vigolium server --burp-bridge-url http://127.0.0.1:9009
+```
+
+`--caido-bridge-url` is an alias for the same flag: the Burp extension and the
+Caido plugin expose one protocol on one loopback port, so which one is listening
+is discovered from the reply rather than declared on the command line.
+
+`GET /api/http-records` then returns one globally sorted and paginated result
+containing both persisted database records and current proxy traffic. Live rows
+have `"source": "burp"` or `"source": "caido"` — taken from the `implementation`
+the listener reports on every reply — and temporary UUIDs beginning with `burp:`
+regardless of vendor, since that prefix is a routing token rather than a
+provenance label. The normal detail route, `GET /api/http-records/:uuid`, also
+resolves those live UUIDs. Existing filters such as `domain`, `method`, `path`,
+`status_code`, `search`, sorting, and `source=caido` apply without a separate
+bridge API workflow.
+
+A listener too old to report an implementation is read as Burp, which is what
+every bridge record was labelled as before vendor detection existed.
+
+The bridge is optional. If the proxy is closed or its listener is unavailable,
+the server continues returning database records and sets
+`X-Vigolium-Burp-Bridge: unavailable` on the response; on a successful merge it
+sets `X-Vigolium-Bridge-Source` to the vendor that answered. The URL must be an
+HTTP loopback address with an explicit port. It can also be supplied through
+`VIGOLIUM_BURP_BRIDGE_URL`.
+
+The server flag is a live, read-only view. To persist Proxy history into the
+database, use either import workflow:
+
+```bash
+# Import all traffic visible through the Bridge listener
+vigolium import --burp-bridge-url http://127.0.0.1:9009
+
+# Import only the traffic page selected by filters; add --all for all matches
+vigolium traffic --burp-bridge-url http://127.0.0.1:9009 \
+  --host example.com --save-to-vigolium-db
+```
+
+Imports are idempotent: new requests are inserted, changed responses refresh
+their existing record, and unchanged requests are left alone. Persisted rows
+retain the vendor they came from (`source=burp` or `source=caido`) and remain
+available after the proxy or the bridge stops.
+
+The bridge also supports the reverse direction into Burp's Target Site map:
+
+```bash
+# Copy the selected database page into Burp without replaying the requests
+vigolium traffic --burp-bridge-url http://127.0.0.1:9009 \
+  --host example.com --save-to-burp
+
+# Replay a request, then save the mutated request and fresh response to Burp
+vigolium replay --record-uuid <uuid> --save-to-burp \
+  --burp-bridge-url http://127.0.0.1:9009
+```
+
+`traffic --save-to-burp` reads only persisted database records and honors its
+active filters, offset, and limit; add `--all` for every match. It calls
+Montoya's Site map insertion API and does not issue target network requests.
+Individual requests or responses larger than 8 MiB are skipped and reported.
 
 ## Authentication
 
-All API requests (except `/health`) require a Bearer token:
+Protected API routes require a Bearer token. Health/metrics, login, Swagger,
+and static UI routes are public:
 
 ```
 Authorization: Bearer my-secret-key
@@ -69,8 +158,9 @@ All queries (findings, HTTP records, stats, scans) return data scoped to the pro
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/` | App info (no auth required) |
+| GET | `/` | Dashboard UI (no auth required) |
 | GET | `/health` | Health check (no auth required) |
+| GET | `/ready` | Readiness check (no auth required) |
 | GET | `/metrics` | Prometheus metrics (no auth required) |
 | GET | `/swagger/*` | Swagger UI and OpenAPI spec (no auth required) |
 | GET | `/server-info` | Server status, queue depth, record/finding counts |
@@ -89,8 +179,7 @@ All queries (findings, HTTP records, stats, scans) return data scoped to the pro
 | POST | `/api/agent/run/query` | Single-shot agent prompt execution |
 | POST | `/api/agent/run/autopilot` | Autonomous AI-driven scanning session |
 | POST | `/api/agent/run/swarm` | AI-guided multi-phase vulnerability swarm |
-| POST | `/api/agent/run/audit` | Foreground vigolium-audit code review (Claude / Codex) |
-| POST | `/api/agent/run/audit` | Foreground piolium audit code review (Pi runtime) |
+| POST | `/api/agent/run/audit` | Unified audit dispatcher (`auto`, `both`, `audit`, or `piolium`) |
 | GET | `/api/agent/status/list` | List agent runs |
 | GET | `/api/agent/status/:id` | Get agent run status (includes full result when completed) |
 | GET | `/api/agent/sessions` | Paginated session history |
@@ -105,25 +194,26 @@ After ingesting HTTP records, trigger a vulnerability scan via the API.
 ### Trigger a Scan
 
 ```bash
-curl -s -X POST http://localhost:9002/api/scan \
+curl -s -X POST http://localhost:9002/api/scans/run \
   -H "Authorization: Bearer my-secret-key" \
   -H "Content-Type: application/json" \
-  -d '{}' | jq .
+  -d '{"targets":["https://example.com"]}' | jq .
 ```
 
 Force re-scan with specific modules:
 
 ```bash
-curl -s -X POST http://localhost:9002/api/scan \
+curl -s -X POST http://localhost:9002/api/scans/run \
   -H "Authorization: Bearer my-secret-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "force": true,
-    "enable_modules": ["xss-scanner", "sqli-error-based"]
+    "targets": ["https://example.com"],
+    "modules": ["xss-scanner", "sqli-error-based"]
   }' | jq .
 ```
 
-Returns `202 Accepted` on success, `409 Conflict` if a scan is already running.
+Returns `202 Accepted` on success. Use `POST /api/scan-all-records` instead when
+the intended inputs are HTTP records already stored in the database.
 
 ### Check Scan Status
 
@@ -143,6 +233,9 @@ See the [API Reference](../api-references/scan.md) for full request/response det
 
 ## Running AI Agents via API
 
-The server exposes agent endpoints that mirror the `vigolium agent` CLI subcommands (query, autopilot, pipeline). Only one agent run can be active at a time (returns `409 Conflict` if busy). Set `"stream": true` for real-time SSE output.
+The server exposes query, autopilot, swarm, and unified audit endpoints. Agent
+runs use separate light/heavy concurrency pools; when a pool remains saturated
+past the queue timeout the server returns `429 Too Many Requests`. Set
+`"stream": true` for real-time SSE output.
 
-For full details on agent modes, prompt templates, and API request/response schemas, see the [Agent Mode](../agents/agent-mode.md) documentation and the [Agent API Reference](../api-references/agent.md).
+For full details on agent modes, prompt templates, and API request/response schemas, see the [Agent Mode](../agentic-scan/agent-mode.md) documentation and the [Agent API Reference](../api-references/agent.md).

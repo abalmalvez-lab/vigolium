@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
 
@@ -53,12 +54,12 @@ Each example is emitted inside a fenced code block with its suggested
 filename so it can be copied directly into ~/.vigolium/extensions/ — or
 referenced by another agent as an authoring template.`,
 	Args: cobra.MaximumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		filter := ""
 		if len(args) > 0 {
 			filter = args[0]
 		}
-		printExtensionExamples(filter)
+		return printExtensionExamples(cmd, filter)
 	},
 }
 
@@ -74,7 +75,27 @@ func init() {
 		"Restrict to one language: javascript (js), yaml, or json")
 }
 
-func printExtensionExamples(filter string) {
+// extExampleView is one catalog entry under -j. Code is omitted under --list,
+// which asks for the index only.
+type extExampleView struct {
+	Key      string `json:"key"`
+	Lang     string `json:"lang"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Filename string `json:"filename"`
+	// SaveAs is the suggested destination ("Save as:" in the text view).
+	SaveAs string `json:"save_as"`
+	Code   string `json:"code,omitempty"`
+}
+
+// extExampleExtras are the top-level keys of `extensions example -j`.
+type extExampleExtras struct {
+	Filter   string `json:"filter,omitempty"`
+	Lang     string `json:"lang,omitempty"`
+	ListOnly bool   `json:"list_only,omitempty"`
+}
+
+func printExtensionExamples(cmd *cobra.Command, filter string) error {
 	catalog := extensionExampleCatalog()
 
 	langFilter := strings.ToLower(strings.TrimSpace(exampleLang))
@@ -83,6 +104,9 @@ func printExtensionExamples(filter string) {
 		langFilter = "javascript"
 	case "yml":
 		langFilter = "yaml"
+	case "", "javascript", "yaml", "json":
+	default:
+		return usageErrorf("invalid --lang %q; valid values: javascript (js), yaml (yml), json", exampleLang)
 	}
 
 	var matched []extExample
@@ -97,14 +121,30 @@ func printExtensionExamples(filter string) {
 	}
 
 	if len(matched) == 0 {
-		fmt.Printf("%s No examples matching %q\n", terminal.WarningSymbol(), filter)
-		fmt.Printf("  Try: %s, %s, %s, %s\n",
-			terminal.Gray("ext example js"),
-			terminal.Gray("ext example yaml"),
-			terminal.Gray("ext example pre_hook"),
-			terminal.Gray("ext example --list"))
-		fmt.Println()
-		return
+		return codedErrorf(apicontract.CodeNotFound, "no examples matching %q; try: ext example js, ext example yaml, ext example pre_hook, ext example --list", filter)
+	}
+
+	if globalJSON {
+		views := make([]extExampleView, 0, len(matched))
+		for _, ex := range matched {
+			v := extExampleView{Key: ex.Key, Lang: ex.Lang, Type: ex.Type, Title: ex.Title,
+				Filename: ex.Filename, SaveAs: ex.destPath()}
+			if !exampleListOnly {
+				v.Code = strings.TrimRight(ex.Code, "\n")
+			}
+			views = append(views, v)
+		}
+		var opts []envOpt
+		if filter != "" {
+			opts = append(opts, withExtra("filter", filter))
+		}
+		if langFilter != "" {
+			opts = append(opts, withExtra("lang", langFilter))
+		}
+		if exampleListOnly {
+			opts = append(opts, withExtra("list_only", true))
+		}
+		return emitRead(cmd, "examples", views, int64(len(views)), 0, len(views), opts...)
 	}
 
 	if exampleListOnly {
@@ -125,7 +165,7 @@ func printExtensionExamples(filter string) {
 			terminal.InfoSymbol(),
 			terminal.Gray("vigolium ext example <key>"))
 		fmt.Println()
-		return
+		return nil
 	}
 
 	fmt.Printf("\n  %s\n",
@@ -157,11 +197,12 @@ func printExtensionExamples(filter string) {
 	fmt.Printf("%s API reference: %s   Validate: %s\n",
 		terminal.InfoSymbol(),
 		terminal.Gray("vigolium ext docs --example"),
-		terminal.Gray("vigolium ext lint <file>"))
+		terminal.Gray(strings.Join(exampleValidateCommands(matched), " / ")))
 	fmt.Printf("%s Install bundled presets: %s\n",
 		terminal.InfoSymbol(),
 		terminal.Gray("vigolium ext preset"))
 	fmt.Println()
+	return nil
 }
 
 func exampleMatchesFilter(ex extExample, filter string) bool {
@@ -226,7 +267,7 @@ func extensionExampleCatalog() []extExample {
 
   scanPerInsertionPoint: function(ctx, insertion) {
     // Generate a unique canary
-    var canary = "VGNM" + vigolium.utils.randomString(8);
+    var canary = "VIGOLIUM" + vigolium.utils.randomString(8);
 
     // Build and send a request with the canary injected
     var req = insertion.buildRequest(canary);
@@ -620,23 +661,37 @@ sessions:
           pattern: 'token="([^"]+)"'
           apply_as: "Authorization: Bearer {value}"
 
-  # Multi-step: fetch a CSRF token (into var:csrf), then submit the login
-  - name: csrf_app_user
+  # Multi-step: authenticate with an identity provider, then exchange its
+  # intermediate token for the application's final credentials
+  - name: token_exchange_user
     role: compare
     login:
       steps:
-        - url: "https://app.com/login"
-          method: GET
-          extract:
-            - source: regex
-              pattern: 'name="csrf_token" value="([^"]+)"'
-              apply_as: "var:csrf"
-        - url: "https://app.com/login"
+        - url: "https://identity.example.com/passwords/discovery/authenticate"
           method: POST
-          content_type: "application/x-www-form-urlencoded"
-          body: "username=user1&password=pass123&csrf_token={csrf}"
+          content_type: "application/json"
+          body: '{"email_address":"${TEST_EMAIL}","password":"${TEST_PASSWORD}"}'
+          expect:
+            status: [200]
+            body_contains: "intermediate_session_token"
           extract:
-            - source: cookie
+            - source: json
+              path: "$.intermediate_session_token"
+              apply_as: "var:intermediate_session_token"
+        - url: "https://api.example.com/auth/stytch/exchange"
+          method: POST
+          content_type: "application/json"
+          body: '{"intermediate_session_token":"{intermediate_session_token}"}'
+          expect:
+            status: [200]
+            body_contains: "token"
+          extract:
+            - source: json
+              path: "$.token"
+              apply_as: "Authorization: Bearer {value}"
+            - source: json
+              path: "$.token"
+              apply_as: "Cookie: token={value}"
 
   # Static token, no login request needed
   - name: api_key_user
@@ -718,14 +773,36 @@ sessions:
     # Replay primary requests with compare sessions for IDOR/BOLA
     compare_enabled: true
 
-    # Re-run login flows on this Go-duration interval ("" = login once)
+    # Default check.interval for sessions (proactive logged-in probe, e.g. "2m")
     reauth_interval: ""
 
-    # Reactively re-authenticate when these status codes are seen
-    reauth_on_status: [401, 403]
+    # Default check.logged_out.status for sessions (e.g. [401, 440])
+    reauth_on_status: []
 
-    # GET this URL after login to verify credentials (2xx expected; "" = off)
-    validate_url: "/api/me"`,
+    # Default check.url for sessions; 'vigolium auth check' probes it
+    validate_url: ""`,
 		},
 	}
+}
+
+// exampleValidateCommands names the linter for the shown examples: a session
+// bundle is an auth file, which `auth lint` checks; everything else is an
+// extension, which `ext lint` checks.
+func exampleValidateCommands(shown []extExample) []string {
+	var session, ext bool
+	for _, ex := range shown {
+		if ex.Type == "session" {
+			session = true
+		} else {
+			ext = true
+		}
+	}
+	var out []string
+	if ext || !session {
+		out = append(out, "vigolium ext lint <file>")
+	}
+	if session {
+		out = append(out, "vigolium auth lint <file>")
+	}
+	return out
 }

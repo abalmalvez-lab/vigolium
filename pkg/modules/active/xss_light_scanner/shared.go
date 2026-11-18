@@ -1,6 +1,7 @@
 package xss_light_scanner
 
 import (
+	"bytes"
 	"strings"
 
 	httpUtils "github.com/projectdiscovery/utils/http"
@@ -31,12 +32,9 @@ func sendRawPayload(
 	httpClient *http.Requester,
 ) (*httpUtils.ResponseChain, error) {
 	fuzzedRaw := ip.BuildRequest([]byte(payloadStr))
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return nil, err
-	}
-
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest produces well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
 		return nil, err
@@ -44,6 +42,14 @@ func sendRawPayload(
 
 	return resp, nil
 }
+
+// isRedirect reports whether code is a 3xx redirect. A navigating browser follows
+// a redirect without ever rendering its body, so a reflection there can't execute —
+// the one status class both the detection send and the confirmation send skip.
+// 4xx/5xx pages, by contrast, ARE rendered and their scripts run, so they are not
+// skipped. Shared by sendAndValidateRawPayload (detection) and sendExec (confirm) so
+// the two can't drift.
+func isRedirect(code int) bool { return code >= 300 && code < 400 }
 
 // sendAndValidateRawPayload sends a literal payload string and validates the
 // response. Returns nil body if the response should be skipped (redirect,
@@ -63,9 +69,8 @@ func sendAndValidateRawPayload(
 	}
 	defer resp.Close()
 
-	// Skip 3xx redirects
-	statusCode := resp.Response().StatusCode
-	if statusCode >= 300 && statusCode < 400 {
+	// Skip 3xx redirects (body not rendered by a browser).
+	if isRedirect(resp.Response().StatusCode) {
 		return nil, nil
 	}
 
@@ -80,7 +85,9 @@ func sendAndValidateRawPayload(
 		return nil, nil
 	}
 
-	return body, nil
+	// The body aliases a pooled buffer that resp.Close() hands back for the
+	// next request; the caller keeps analysing it, so return a copy.
+	return bytes.Clone(body), nil
 }
 
 // sendAndValidatePayload sends a canary payload and validates the response.

@@ -60,7 +60,14 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 
 	// Dedup by host — only fingerprint once
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if diskSet != nil && diskSet.Contains(host) {
+		return nil, nil
+	}
+
+	// Static assets (JS/CSS bundles) routinely embed admin links and asset paths;
+	// Joomla fingerprinting only makes sense on the served HTML page, not on a
+	// minified bundle that happens to reference "/administrator/".
+	if modkit.IsStaticAssetContentType(ctx.Response().Header("Content-Type")) {
 		return nil, nil
 	}
 
@@ -69,6 +76,8 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	isJoomla := false
 	generation := ""
 	var signals []string
+
+	// Strong, Joomla-specific signals — any one is enough to attribute Joomla.
 
 	// Generator meta tag
 	if strings.Contains(body, `content="Joomla`) || strings.Contains(body, `content="Joomla!`) {
@@ -80,12 +89,6 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	if strings.Contains(body, "/media/system/js/") {
 		isJoomla = true
 		signals = append(signals, "/media/system/js/ asset path")
-	}
-
-	// Administrator link
-	if strings.Contains(body, "/administrator/") {
-		isJoomla = true
-		signals = append(signals, "/administrator/ reference")
 	}
 
 	// com_* component references
@@ -101,13 +104,19 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		signals = append(signals, "Joomla 4+ JavaScript API")
 	}
 
-	// /api/index.php reference (Joomla 4+)
-	if strings.Contains(body, "/api/index.php") {
-		isJoomla = true
-		if generation == "" {
-			generation = "4+"
+	// Weak, generic signals: "/administrator/" and "/api/index.php" appear on
+	// many non-Joomla sites and inside route tables, so they only enrich a
+	// finding already established by a strong signal — they never trigger one.
+	if isJoomla {
+		if strings.Contains(body, "/administrator/") {
+			signals = append(signals, "/administrator/ reference")
 		}
-		signals = append(signals, "/api/index.php reference (Joomla 4+)")
+		if strings.Contains(body, "/api/index.php") {
+			if generation == "" {
+				generation = "4+"
+			}
+			signals = append(signals, "/api/index.php reference (Joomla 4+)")
+		}
 	}
 
 	if !isJoomla {
@@ -163,6 +172,11 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 	scanCtx.MarkTech(host, "joomla")
 	scanCtx.MarkTech(host, "php")
 
+	// Claim the host only now that it matched: a host whose
+	// first response showed nothing stays open for later responses.
+	if diskSet != nil && !diskSet.ClaimOnMatch(host) {
+		return nil, nil
+	}
 	return []*output.ResultEvent{
 		{
 			ModuleID:         ModuleID,

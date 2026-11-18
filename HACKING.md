@@ -32,7 +32,7 @@ It scans for reflected XSS, SQL injection, SSTI, LFI, CRLF injection, open redir
 │                  Runner (multi-phase pipeline)                       │
 │                                                                      │
 │  ingestion          ─── Continuous input ingestion                  │
-│  external-harvest   ─── Wayback, CommonCrawl, OTX, …                │
+│  external-harvest   ─── Wayback, CommonCrawl, OTX, Arquivo + mining │
 │  discovery          ─── Deparos (adaptive content discovery)        │
 │  spidering          ─── Spitolas (Chromium via CDP, SPA aware)      │
 │  dynamic-assessment ─── Executor + active/passive scanner modules   │
@@ -70,7 +70,7 @@ Phases accept aliases: `deparos`/`discover` → `discovery`, `spitolas` → `spi
 
 | Area | Technology | Package |
 |------|-----------|---------|
-| Language | Go 1.26+ | `CGO_ENABLED=0`, pure Go (SQLite via `modernc.org/sqlite`) |
+| Language | Go 1.27+ | `CGO_ENABLED=0`, pure Go (SQLite via `modernc.org/sqlite`) |
 | CLI framework | Cobra | `github.com/spf13/cobra` |
 | REST API server | Fiber v3 | `github.com/gofiber/fiber/v3` |
 | Database ORM | Bun | `github.com/uptrace/bun` (SQLite + PostgreSQL dialects) |
@@ -96,11 +96,11 @@ internal/
   runner/               Multi-phase scan orchestrator (route probing, batch ingestion)
   ingestor/             `vigolium ingest` traffic-forwarding client internals
   logger/               Zap logger setup
-  resources/            Embedded binaries (jsscan, Chromium), wordlists, templates
+  resources/            Embedded binaries (jstangle, Chromium), wordlists, templates
 pkg/
   cli/                  All Cobra commands (scan, server, ingest, db, agent_*, project, ...)
   core/                 Executor, worker pool, rate limiter, services DI container
-  modules/              Module interfaces, registry, 154 active + 97 passive scanners (251 total)
+  modules/              Module interfaces, registry, 218 active + 119 passive scanners (337 total)
     modkit/             Base types, default implementations (BaseActiveModule, etc.)
     active/             Active scanner implementations (XSS, SQLi, SSTI, LFI, framework, CMS, cloud, ...)
     passive/            Passive analyzers (DOM XSS, secrets, headers, cookies, ...)
@@ -114,7 +114,7 @@ pkg/
     tool/               Tool registry + builtins (bash, read_file, write_file, edit_file, ls, grep, glob, web_fetch)
     skill/              SKILL.md parsing and registry, system-prompt injection
     autopilot/          Autonomous agentic loop entry point
-    vigtool/            Vigolium-integration tools (run_scan, run_extension, sessions, auth_session)
+    vigtool/            Vigolium-integration tools (run_native_scan, run_extension, sessions, auth_session)
     tui/                Bubble Tea interactive TUI
     stream/             SSE / event streaming
     headless.go         Headless one-shot helper
@@ -211,7 +211,7 @@ The output type for findings. Defined in `pkg/output/output.go`. Carries module 
 
 ### Prerequisites
 
-- **Go 1.26+** (the project compiles with `CGO_ENABLED=0`)
+- **Go 1.27+** (the project compiles with `CGO_ENABLED=0`)
 - **git** and **make**
 - **Docker** (only for E2E/canary tests)
 - **golangci-lint** (only for linting)
@@ -223,7 +223,7 @@ No system-level C libraries required. See [docs/development/building.md](docs/de
 ```bash
 git clone https://github.com/vigolium/vigolium.git
 cd vigolium
-make deps           # download Go modules + jsscan binaries
+make deps           # download Go modules + jstangle binaries
 make deps-chrome    # download Chromium archives (needed for spider)
 make build          # build and install to $GOPATH/bin
 vigolium version    # verify
@@ -245,22 +245,22 @@ Run a single test:
 go test -v -run TestFunctionName ./pkg/path/to/package/...
 ```
 
-**`make test-unit` is the canonical unit-test command.** It runs `ensure-jsscan`
-first, which builds the embedded jsscan binaries that several packages pull in
+**`make test-unit` is the canonical unit-test command.** It runs `ensure-jstangle`
+first, which builds the embedded jstangle binaries that several packages pull in
 via `//go:embed`. A plain `go test ./...` on a fresh checkout fails with
-`pattern jsscan/jsscan-<os>-<arch>: no matching files found` because those
+`pattern jstangle/jstangle-<os>-<arch>: no matching files found` because those
 binaries are generated (and git-ignored), not committed.
 
-If you want to run Go tooling directly without building the ~100 MB jsscan
-binaries (e.g. quick `go test`/`go vet` in an editor), use the `jsscan_stub`
+If you want to run Go tooling directly without building the ~100 MB jstangle
+binaries (e.g. quick `go test`/`go vet` in an editor), use the `jstangle_stub`
 build tag, which swaps the embed for an empty stub:
 
 ```bash
-go test -tags=jsscan_stub -short ./...
-go vet  -tags=jsscan_stub ./...
+go test -tags=jstangle_stub -short ./...
+go vet  -tags=jstangle_stub ./...
 ```
 
-Code paths that launch jsscan treat the stub as "jsscan unavailable" — the same
+Code paths that launch jstangle treat the stub as "jstangle unavailable" — the same
 fallback used on platforms without a prebuilt binary — so unit tests that don't
 exercise the spider's JS analysis run unchanged.
 
@@ -302,7 +302,7 @@ The agent system has two cooperating layers, plus three foreground source-audit 
   - `provider/` — provider drivers (`anthropic.go`, `codex.go`, `openai.go`, `claudecode.go`, `vertex.go` for `google-vertex` with Anthropic-on-Vertex + Gemini-native routing)
   - `engine/` — turn-based loop (`Engine.Run`, `Engine.Fork` for prompt-cache reuse)
   - `tool/` — tool registry and built-ins (`bash`, `read_file`, `write_file`, `edit_file`, `ls`, `grep`, `glob`, `web_fetch`)
-  - `vigtool/` — vigolium-specific tools (`run_scan`, `run_extension`, session management, auth sessions)
+  - `vigtool/` — vigolium-specific tools (`run_native_scan`, `run_extension`, session management, auth sessions)
   - `skill/` — SKILL.md parsing, registry, system-prompt injection (project-agent / project-claude / user-vigolium / embedded scopes)
   - `autopilot/` — autonomous agentic loop (`Run`, halt conditions, `report_finding` tool, system prompt builder)
   - `tui/` — Bubble Tea interactive TUI; `headless.go` for one-shot non-TUI execution

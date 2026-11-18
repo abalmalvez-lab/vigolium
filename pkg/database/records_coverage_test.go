@@ -3,8 +3,12 @@ package database
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 )
 
@@ -40,6 +44,89 @@ func TestSaveRecordBatchAndGetByUUIDs(t *testing.T) {
 	}
 	if g, err := repo.GetRecordsByUUIDs(ctx, nil); err != nil || g != nil {
 		t.Errorf("GetRecordsByUUIDs(nil) = %v, %v", g, err)
+	}
+}
+
+// TestGetScanRecordsByUUIDsProjection verifies the column-projected scan fetch
+// still carries every field recordToHttpRequestResponse needs to reconstruct a
+// request — including the has_response/raw_response gate — for records with and
+// without a stored response.
+func TestGetScanRecordsByUUIDsProjection(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	withResp, err := httpmsg.ParseRawRequest("GET /with-resp HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	if err != nil {
+		t.Fatalf("parse withResp: %v", err)
+	}
+	withResp = withResp.WithResponse(httpmsg.NewHttpResponse([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello")))
+
+	noResp, err := httpmsg.ParseRawRequest("GET /no-resp HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	if err != nil {
+		t.Fatalf("parse noResp: %v", err)
+	}
+
+	uWith, err := repo.SaveRecord(ctx, withResp, "scan", DefaultProjectUUID)
+	if err != nil {
+		t.Fatalf("SaveRecord withResp: %v", err)
+	}
+	uNo, err := repo.SaveRecord(ctx, noResp, "scan", DefaultProjectUUID)
+	if err != nil {
+		t.Fatalf("SaveRecord noResp: %v", err)
+	}
+
+	got, err := repo.GetScanRecordsByUUIDs(ctx, []string{uWith, uNo})
+	if err != nil {
+		t.Fatalf("GetScanRecordsByUUIDs: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("GetScanRecordsByUUIDs = %d records, want 2", len(got))
+	}
+
+	byUUID := make(map[string]*HTTPRecord, len(got))
+	for _, r := range got {
+		byUUID[r.UUID] = r
+	}
+
+	rWith := byUUID[uWith]
+	if rWith == nil {
+		t.Fatal("missing with-response record")
+	}
+	if rWith.UUID == "" || rWith.URL == "" || len(rWith.RawRequest) == 0 {
+		t.Errorf("projected record missing core columns: uuid=%q url=%q reqLen=%d",
+			rWith.UUID, rWith.URL, len(rWith.RawRequest))
+	}
+	if !rWith.HasResponse || len(rWith.RawResponse) == 0 {
+		t.Errorf("projection dropped response columns: has_response=%v rawRespLen=%d",
+			rWith.HasResponse, len(rWith.RawResponse))
+	}
+	rrWith, err := recordToHttpRequestResponse(rWith)
+	if err != nil {
+		t.Fatalf("recordToHttpRequestResponse(withResp): %v", err)
+	}
+	if rrWith.Response() == nil {
+		t.Error("projected with-response record lost its response after conversion")
+	}
+
+	rNo := byUUID[uNo]
+	if rNo == nil {
+		t.Fatal("missing no-response record")
+	}
+	if rNo.HasResponse {
+		t.Error("no-response record unexpectedly has_response=true")
+	}
+	rrNo, err := recordToHttpRequestResponse(rNo)
+	if err != nil {
+		t.Fatalf("recordToHttpRequestResponse(noResp): %v", err)
+	}
+	if rrNo.Response() != nil {
+		t.Error("no-response record gained a response after conversion")
+	}
+
+	// Empty input is a no-op, matching GetRecordsByUUIDs.
+	if g, err := repo.GetScanRecordsByUUIDs(ctx, nil); err != nil || g != nil {
+		t.Errorf("GetScanRecordsByUUIDs(nil) = %v, %v", g, err)
 	}
 }
 
@@ -173,6 +260,26 @@ func TestUpdateRecordAnnotationsAndRemarks(t *testing.T) {
 	if err := repo.AppendRemarks(ctx, nil); err != nil {
 		t.Errorf("AppendRemarks(nil): %v", err)
 	}
+
+	// Batch path: multiple records in one call, plus a missing UUID that must be
+	// skipped without failing the rest.
+	u2 := insertRecord(t, repo, "GET", "remarks.example.com", "/second", 200)
+	if err := repo.AppendRemarks(ctx, map[string][]string{
+		u:              {"new-remark", "third"}, // "new-remark" already present → dedup
+		u2:             {"only-on-second"},
+		"missing-uuid": {"ignored"},
+		"":             {"empty-key-ignored"},
+	}); err != nil {
+		t.Fatalf("AppendRemarks(batch): %v", err)
+	}
+	rec, _ = repo.GetRecordByUUID(ctx, u)
+	if len(rec.Remarks) != 3 {
+		t.Errorf("u remarks after batch = %v, want 3 unique", rec.Remarks)
+	}
+	rec2, _ := repo.GetRecordByUUID(ctx, u2)
+	if len(rec2.Remarks) != 1 || rec2.Remarks[0] != "only-on-second" {
+		t.Errorf("u2 remarks = %v, want [only-on-second]", rec2.Remarks)
+	}
 }
 
 func TestGetRecordsWithResponseBody(t *testing.T) {
@@ -199,6 +306,32 @@ func TestGetRecordsWithResponseBody(t *testing.T) {
 	}
 	if len(page) != 2 {
 		t.Errorf("cursor page = %d, want 2", len(page))
+	}
+
+	// Origin filter: only records on the in-scope host are returned, so bodies left in
+	// the project by prior scans of other hosts don't leak into a scoped scan.
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "other.example.com", "/x", 200)
+	scoped, err := repo.GetRecordsWithResponseBody(ctx, DefaultProjectUUID, "", 10, HostTarget{Hostname: "body.example.com"})
+	if err != nil {
+		t.Fatalf("GetRecordsWithResponseBody (hosts): %v", err)
+	}
+	if len(scoped) != 3 {
+		t.Errorf("GetRecordsWithResponseBody(hosts) = %d, want 3", len(scoped))
+	}
+	for _, rec := range scoped {
+		if rec.Hostname != "body.example.com" {
+			t.Errorf("scoped record host = %q, want body.example.com", rec.Hostname)
+		}
+	}
+
+	// Full-origin filter: same hostname, different port is excluded.
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "body.example.com:8080", "/y", 200)
+	byOrigin, err := repo.GetRecordsWithResponseBody(ctx, DefaultProjectUUID, "", 10, HostTarget{Scheme: "https", Hostname: "body.example.com", Port: 443})
+	if err != nil {
+		t.Fatalf("GetRecordsWithResponseBody (origin): %v", err)
+	}
+	if len(byOrigin) != 3 {
+		t.Errorf("GetRecordsWithResponseBody(origin :443) = %d, want 3 (port 8080 excluded)", len(byOrigin))
 	}
 }
 
@@ -240,6 +373,110 @@ func TestGetDistinctHostsAndPaths(t *testing.T) {
 	if len(paths) != 3 {
 		t.Errorf("GetDistinctPaths = %d, want 3", len(paths))
 	}
+
+	// Origin filter restricts paths to the given in-scope hosts, so KnownIssueScan
+	// won't build targets for hosts left in the project by prior scans.
+	scopedPaths, err := repo.GetDistinctPaths(ctx, DefaultProjectUUID, HostTarget{Hostname: "h1.example.com"})
+	if err != nil {
+		t.Fatalf("GetDistinctPaths(hosts): %v", err)
+	}
+	if len(scopedPaths) != 2 {
+		t.Errorf("GetDistinctPaths(hosts) = %d, want 2", len(scopedPaths))
+	}
+	for _, p := range scopedPaths {
+		if p.Hostname != "h1.example.com" {
+			t.Errorf("scoped path host = %q, want h1.example.com", p.Hostname)
+		}
+	}
+}
+
+func TestInScopeHosts(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "app.uniquekw.com", "/a", 200)
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "other.example.org", "/b", 200)
+
+	// Default (relaxed) scope keeps only hosts matching the target's keyword, and the
+	// origin must match the target's scheme+port (https:443 here).
+	got := repo.InScopeHosts(ctx, config.ScopeConfig{}, []string{"https://uniquekw.com/"}, DefaultProjectUUID, "")
+	if len(got) != 1 || got[0].Hostname != "app.uniquekw.com" {
+		t.Errorf("InScopeHosts = %v, want one origin on app.uniquekw.com", got)
+	}
+
+	// No targets → nil (no filter, project-wide pass).
+	if got := repo.InScopeHosts(ctx, config.ScopeConfig{}, nil, DefaultProjectUUID, ""); got != nil {
+		t.Errorf("InScopeHosts(no targets) = %v, want nil", got)
+	}
+}
+
+// TestInScopeHostsPortDiscrimination is the core localhost case: same hostname on a
+// different port (left by a prior scan, no scan provenance) must NOT be in scope.
+func TestInScopeHostsPortDiscrimination(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "localhost:3000", "/a", 200)
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "localhost:8080", "/b", 200)
+
+	got := repo.InScopeHosts(ctx, config.ScopeConfig{}, []string{"https://localhost:3000/"}, DefaultProjectUUID, "")
+	if len(got) != 1 {
+		t.Fatalf("InScopeHosts = %v, want exactly one origin (localhost:3000)", got)
+	}
+	if got[0].Hostname != "localhost" || got[0].Port != 3000 {
+		t.Errorf("InScopeHosts = %+v, want localhost:3000 (8080 excluded)", got[0])
+	}
+}
+
+// TestInScopeHostsCurrentScanProvenance verifies the provenance carve-out: a different
+// port discovered DURING this scan (records created at/after the scan start) is in scope,
+// while a different-port host left by a PRIOR scan (created before this scan) stays out.
+func TestInScopeHostsCurrentScanProvenance(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	scanUUID := uuid.New().String()
+	if err := repo.CreateScan(ctx, &Scan{UUID: scanUUID, ProjectUUID: DefaultProjectUUID, Status: "running"}); err != nil {
+		t.Fatalf("CreateScan: %v", err)
+	}
+	scan, err := repo.GetScanByUUID(ctx, scanUUID)
+	if err != nil {
+		t.Fatalf("GetScanByUUID: %v", err)
+	}
+
+	// Prior-scan leftover on a different port: backdate it to before this scan started.
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "localhost:9999", "/old", 200)
+	if _, err := repo.DB().NewUpdate().Model((*HTTPRecord)(nil)).
+		Set("created_at = ?", scan.StartedAt.Add(-time.Hour)).
+		Where("hostname = ? AND port = ?", "localhost", 9999).
+		Exec(ctx); err != nil {
+		t.Fatalf("backdate leftover: %v", err)
+	}
+
+	// This scan's own discovery on a different port than the target (e.g. port sweep):
+	// created now, i.e. at/after the scan start.
+	insertRecordP(t, repo, DefaultProjectUUID, "GET", "localhost:8080", "/new", 200)
+
+	got := repo.InScopeHosts(ctx, config.ScopeConfig{}, []string{"https://localhost:3000/"}, DefaultProjectUUID, scanUUID)
+
+	var has8080, has9999 bool
+	for _, h := range got {
+		switch h.Port {
+		case 8080:
+			has8080 = true
+		case 9999:
+			has9999 = true
+		}
+	}
+	if !has8080 {
+		t.Errorf("InScopeHosts should include localhost:8080 discovered during this scan, got %v", got)
+	}
+	if has9999 {
+		t.Errorf("InScopeHosts should exclude prior-scan leftover localhost:9999, got %v", got)
+	}
 }
 
 func TestUpdateRecordResponse(t *testing.T) {
@@ -275,6 +512,57 @@ func TestUpdateRecordResponse(t *testing.T) {
 	// Missing record errors.
 	if err := repo.UpdateRecordResponse(ctx, "no-such", update); err == nil {
 		t.Error("UpdateRecordResponse on missing record should error")
+	}
+}
+
+func TestBackfillRecordResponse(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	// Insert a request-only stub (no response), as discovery does for endpoints
+	// synthesized from a parsed API spec.
+	stub, _ := httpmsg.ParseRawRequest("GET /api/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+	u, err := repo.SaveRecord(ctx, stub, "api-spec", DefaultProjectUUID)
+	if err != nil {
+		t.Fatalf("SaveRecord: %v", err)
+	}
+	if rec, _ := repo.GetRecordByUUID(ctx, u); rec.HasResponse || rec.StatusCode != 0 {
+		t.Fatalf("precondition: stub should have no response, got status=%d hasResp=%v", rec.StatusCode, rec.HasResponse)
+	}
+
+	// Backfill with a freshly fetched baseline (401 auth wall).
+	withResp := stub.WithResponse(httpmsg.NewHttpResponse(
+		[]byte("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{\"error\":\"unauthorized\"}")))
+	if err := repo.BackfillRecordResponse(ctx, u, withResp); err != nil {
+		t.Fatalf("BackfillRecordResponse: %v", err)
+	}
+
+	rec, _ := repo.GetRecordByUUID(ctx, u)
+	if !rec.HasResponse || rec.StatusCode != 401 {
+		t.Errorf("backfill did not apply: status=%d hasResp=%v", rec.StatusCode, rec.HasResponse)
+	}
+	if !strings.Contains(rec.ResponseContentType, "application/json") {
+		t.Errorf("content-type not backfilled: %q", rec.ResponseContentType)
+	}
+	if len(rec.RawResponse) == 0 {
+		t.Error("raw response not backfilled")
+	}
+
+	// Idempotent: a second backfill must NOT clobber an already-probed record
+	// (guarded on has_response = false), so the original 401 survives.
+	second := stub.WithResponse(httpmsg.NewHttpResponse(
+		[]byte("HTTP/1.1 500 Internal Server Error\r\n\r\nboom")))
+	if err := repo.BackfillRecordResponse(ctx, u, second); err != nil {
+		t.Fatalf("BackfillRecordResponse (second): %v", err)
+	}
+	if rec, _ := repo.GetRecordByUUID(ctx, u); rec.StatusCode != 401 {
+		t.Errorf("second backfill clobbered an existing response: status=%d, want 401", rec.StatusCode)
+	}
+
+	// A request-only rr (no response) is a no-op, not an error.
+	if err := repo.BackfillRecordResponse(ctx, u, stub); err != nil {
+		t.Errorf("BackfillRecordResponse with no response should be a no-op, got %v", err)
 	}
 }
 

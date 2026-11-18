@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies WordPress installations from HTML responses, extracts core
-version information, and builds an inventory of installed plugins and themes by
-parsing asset URLs (/wp-content/plugins/<slug>/, /wp-content/themes/<slug>/).
+	ModuleDesc = `**What it means:** The target runs WordPress and discloses identifying details in its HTML and headers (/wp-content/, the wp-json Link header, X-Pingback, the generator meta tag). The check extracts the core version and a plugin/theme inventory. Informational recon, not a vulnerability.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects WordPress via /wp-content/, /wp-includes/, wp-json, X-Pingback header, generator meta tag
-- Extracts version from generator meta tag and RSS feed generator element
-- Enumerates plugin/theme slugs from asset URL paths
-- Deduplicates by host to avoid redundant processing
+**How it's exploited:** An attacker uses the exposed version and plugin/theme names to map the attack surface and look up version-specific CVEs for those components. Outdated plugins are a leading entry point for WordPress compromise.
 
-## References
-- https://developer.wordpress.org/
-- https://codex.wordpress.org/Determining_Plugin_and_Theme_License_Status`
+**Fix:** Keep core, plugins, and themes patched, remove unused components, and suppress the generator meta tag and asset ?ver= version strings.`
 
 	ModuleConfirmation = "Confirmed when WordPress-specific paths, headers, or meta tags are detected in the response"
 	ModuleSeverity     = severity.Info

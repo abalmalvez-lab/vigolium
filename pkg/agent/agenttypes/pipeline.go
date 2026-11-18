@@ -54,16 +54,22 @@ type TriagedFinding struct {
 // The agent reasons about one finding's evidence, optionally re-probes the
 // target, and returns a verdict plus reasoning.
 type TriageConfirmResult struct {
-	Verdict   string `json:"verdict"`   // one of TriageVerdictConfirmed, TriageVerdictFalsePositive
+	Verdict   string `json:"verdict"`   // one of TriageVerdictConfirmed, TriageVerdictFalsePositive, TriageVerdictInconclusive
 	Reasoning string `json:"reasoning"` // free-form explanation of how the verdict was reached
 	Notes     string `json:"notes,omitempty"`
 }
 
 // Triage confirm verdict constants. The parser normalises common aliases
 // ("fp", "true-positive", etc.) to these canonical values.
+//
+// Inconclusive is the honest third outcome: the evidence neither confirms nor
+// refutes the finding (target unreachable, response ambiguous, not enough
+// context). It writes nothing to the finding's status, so a guess is never
+// recorded as a verdict.
 const (
 	TriageVerdictConfirmed     = "confirmed"
 	TriageVerdictFalsePositive = "false_positive"
+	TriageVerdictInconclusive  = "inconclusive"
 )
 
 // TriageConfirmTemplateID is the prompt template the triage CLI loads.
@@ -249,16 +255,21 @@ type Snippet struct {
 // SwarmPlan is the structured output from the master agent in agent swarm mode.
 // The agent analyzes the target request, selects modules, and generates custom extensions.
 type SwarmPlan struct {
-	ModuleTags            []string             `json:"module_tags,omitempty"`
-	ModuleIDs             []string             `json:"module_ids,omitempty"`
-	Extensions            []GeneratedExtension `json:"extensions,omitempty"`
-	QuickChecks           []QuickCheck         `json:"quick_checks,omitempty"`
-	Snippets              []Snippet            `json:"snippets,omitempty"`
-	FocusAreas            []string             `json:"focus_areas,omitempty"`
-	Notes                 string               `json:"notes,omitempty"`
-	NeedsExtensions       bool                 `json:"needs_extensions,omitempty"`
-	NeedsExtensionsReason string               `json:"needs_extensions_reason,omitempty"`
-	ExtensionAgentError   string               `json:"extension_agent_error,omitempty"`
+	ModuleTags  []string             `json:"module_tags,omitempty"`
+	ModuleIDs   []string             `json:"module_ids,omitempty"`
+	Extensions  []GeneratedExtension `json:"extensions,omitempty"`
+	QuickChecks []QuickCheck         `json:"quick_checks,omitempty"`
+	Snippets    []Snippet            `json:"snippets,omitempty"`
+	FocusAreas  []string             `json:"focus_areas,omitempty"`
+	// RecommendedSkills is the planner's context-driven selection of skill
+	// names (from the <available_skills> menu) that the triage phase should
+	// load for confirmation/escalation. Unioned with the always-on set and any
+	// operator override before the triage engine is built.
+	RecommendedSkills     []string `json:"recommended_skills,omitempty"`
+	Notes                 string   `json:"notes,omitempty"`
+	NeedsExtensions       bool     `json:"needs_extensions,omitempty"`
+	NeedsExtensionsReason string   `json:"needs_extensions_reason,omitempty"`
+	ExtensionAgentError   string   `json:"extension_agent_error,omitempty"`
 }
 
 // BatchProvenance tracks which batch contributed each item to a merged plan.
@@ -303,6 +314,10 @@ type SwarmResult struct {
 	BatchProvenance *BatchProvenance         `json:"batch_provenance,omitempty"` // only set when plan was merged from multiple batches
 	Degraded        bool                     `json:"degraded,omitempty"`
 	Warnings        []string                 `json:"warnings,omitempty"`
+	// BudgetStop names the run budget that stopped the swarm ("commands",
+	// "tokens", "cost"), "" when none did. TimedOut: --max-duration fired.
+	BudgetStop string `json:"budget_stop,omitempty"`
+	TimedOut   bool   `json:"timed_out,omitempty"`
 }
 
 // SwarmCheckpoint captures swarm pipeline state for checkpoint/resume.
@@ -337,6 +352,12 @@ type ScanRequest struct {
 	ExtensionDir string   // path to generated JS extensions (empty if none)
 	IsRescan     bool     // true for triage-driven targeted rescans
 	TargetURLs   []string // optional: restrict rescan to these URLs only
+	// ScanUUID is the run-unique native scan_uuid the pipeline owns. Scan
+	// callbacks tag the native scan's findings with it so the pipeline can
+	// attribute them to this run (agentic_scan_uuid) and scope finding counts
+	// to the run instead of the whole project. Empty falls back to the
+	// callback's own configured scan_uuid.
+	ScanUUID string
 }
 
 // ScanFunc is the unified callback signature for running scans.

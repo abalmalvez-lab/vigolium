@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects HTTP response header injection vulnerabilities where user-supplied parameter values
-are copied into response headers (e.g. Set-Cookie, Location). By injecting CRLF sequences,
-an attacker can inject arbitrary HTTP headers or break into the response body.
+	ModuleDesc = `**What it means:** A request parameter is copied into the HTTP response headers without stripping CRLF characters. An injected canary surfaced as a new header line or split the header block into the body, so an attacker controls part of the response.
 
-## Impact
-- HTTP response splitting: inject arbitrary headers or body content
-- Cache poisoning: poison proxy caches with attacker-controlled responses
-- Cross-site scripting: inject JavaScript via crafted response body
-- Session fixation: inject Set-Cookie headers
+**How it's exploited:** A CRLF-laden value injects arbitrary headers (such as a Set-Cookie) or ends the header block early to control the body, enabling response splitting, cache poisoning, and script injection. Behind a pooling proxy it can become Response Queue Poisoning.
 
-## References
-- CWE-113: Improper Neutralization of CRLF Sequences in HTTP Headers
-- CAPEC-34: HTTP Response Splitting
-- https://owasp.org/www-community/attacks/HTTP_Response_Splitting`
+**Fix:** Reject or URL-encode CR and LF in user input before using it in a response header.`
 
 	ModuleConfirmation = "Confirmed when an injected canary value with CRLF sequences appears as a new header line in the HTTP response"
 	ModuleSeverity     = severity.Medium

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,13 +21,7 @@ import (
 // newExportTestDB returns a fresh schema-initialized SQLite DB in a temp dir.
 func newExportTestDB(t *testing.T) *database.DB {
 	t.Helper()
-	cfg := config.DefaultDatabaseConfig()
-	cfg.SQLite.Path = filepath.Join(t.TempDir(), "export.sqlite")
-	db, err := database.NewDB(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	require.NoError(t, db.CreateSchema(context.Background()))
-	return db
+	return newDBAtPath(t, filepath.Join(t.TempDir(), "export.sqlite"))
 }
 
 // seedFindingAndRecord inserts one finding + one http_record under project.
@@ -59,22 +52,6 @@ func seedFindingAndRecord(t *testing.T, db *database.DB, project, suffix string)
 		RequestHash: "rhash-" + suffix,
 	}).Exec(ctx)
 	require.NoError(t, err)
-}
-
-// captureStdout redirects os.Stdout for the duration of fn and returns what was
-// written, so the stdout-streaming export branch can be asserted.
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-	orig := os.Stdout
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	os.Stdout = w
-	defer func() { os.Stdout = orig }()
-	fn()
-	require.NoError(t, w.Close())
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
-	return buf.String()
 }
 
 func countEnvelopeTypes(t *testing.T, data []byte) map[string]int {
@@ -119,20 +96,70 @@ func TestReconcileOutputFormatsDeferredJSONL(t *testing.T) {
 		assert.False(t, opts.DeferredJSONLExport)
 	})
 
-	t.Run("CI output keeps the legacy emitter", func(t *testing.T) {
-		globalJSON, globalCIOutput = false, true
+	t.Run("--silent prints finding lines when stdout is free", func(t *testing.T) {
+		swapGlobal(t, &globalSilent, true)
+		swapGlobal(t, &scanOpts, types.DefaultOptions())
+		cases := []struct {
+			name    string
+			json    bool
+			formats []string
+			output  string
+			events  string
+			want    bool
+		}{
+			{name: "console", formats: []string{"console"}, want: true},
+			{name: "-j owns stdout", json: true, formats: []string{"console"}},
+			{name: "jsonl to stdout", formats: []string{"jsonl"}},
+			{name: "jsonl to a file", formats: []string{"jsonl"}, output: "x.jsonl", want: true},
+			{name: "github to stdout", formats: []string{"github"}},
+			{name: "--events", formats: []string{"console"}, events: "ndjson"},
+		}
+		for _, c := range cases {
+			globalJSON = c.json
+			scanOpts.Output, scanOpts.Events = c.output, c.events
+			opts := &types.Options{OutputFormats: c.formats, Output: c.output}
+			require.NoError(t, reconcileOutputFormats(opts), c.name)
+			assert.Equal(t, c.want, opts.FindingLinesToStdout, c.name)
+		}
+		globalSilent = false
+		globalJSON = false
 		opts := &types.Options{OutputFormats: []string{"console"}}
 		require.NoError(t, reconcileOutputFormats(opts))
-		assert.True(t, opts.CIOutput)
-		assert.False(t, opts.DeferredJSONLExport, "CI output must not route through the envelope export")
+		assert.False(t, opts.FindingLinesToStdout, "only a typed --silent")
 	})
 
-	t.Run("--json maps to jsonl and defers", func(t *testing.T) {
+	t.Run("--json is the scan document, not jsonl", func(t *testing.T) {
 		globalJSON, globalCIOutput = true, false
 		opts := &types.Options{OutputFormats: []string{"console"}}
 		require.NoError(t, reconcileOutputFormats(opts))
-		assert.Equal(t, []string{"jsonl"}, opts.OutputFormats)
-		assert.True(t, opts.DeferredJSONLExport)
+		assert.Equal(t, []string{"console"}, opts.OutputFormats, "--format jsonl only when explicit")
+		assert.False(t, opts.DeferredJSONLExport)
+		assert.True(t, opts.StdoutDocument)
+	})
+}
+
+// The sqlite format normalizes its aliases (sqlite3, db) and is gated to
+// stateless mode (it dumps the per-run temp DB).
+func TestReconcileOutputFormatsSQLite(t *testing.T) {
+	origJSON, origCI, origStateless := globalJSON, globalCIOutput, globalStateless
+	defer func() { globalJSON, globalCIOutput, globalStateless = origJSON, origCI, origStateless }()
+	globalJSON, globalCIOutput = false, false
+
+	t.Run("aliases normalize to sqlite under --stateless", func(t *testing.T) {
+		globalStateless = true
+		for _, alias := range []string{"sqlite", "sqlite3", "db"} {
+			opts := &types.Options{OutputFormats: []string{alias, "html"}}
+			require.NoError(t, reconcileOutputFormats(opts), "alias %q", alias)
+			assert.Equal(t, []string{"sqlite", "html"}, opts.OutputFormats, "alias %q", alias)
+		}
+	})
+
+	t.Run("sqlite without --stateless errors", func(t *testing.T) {
+		globalStateless = false
+		opts := &types.Options{OutputFormats: []string{"sqlite"}}
+		err := reconcileOutputFormats(opts)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--stateless")
 	})
 }
 
@@ -196,7 +223,7 @@ func TestWriteJSONLExportEnvelopeAndProjectScope(t *testing.T) {
 	insertRecord("rec-b", projB, "b.example", "http://b.example/", "rhash-b")
 
 	var buf bytes.Buffer
-	n, err := writeJSONLExport(ctx, db, &buf, false, projA)
+	n, err := writeJSONLExport(ctx, db, &buf, false, projA, "")
 	require.NoError(t, err)
 	require.Positive(t, n)
 
@@ -268,7 +295,7 @@ func TestWriteJSONLExportOmitResponse(t *testing.T) {
 	require.NoError(t, err)
 
 	var buf bytes.Buffer
-	_, err = writeJSONLExport(ctx, db, &buf, true, proj)
+	_, err = writeJSONLExport(ctx, db, &buf, true, proj, "")
 	require.NoError(t, err)
 
 	out := buf.String()
@@ -293,7 +320,7 @@ func TestFinishScanJSONLExport(t *testing.T) {
 			OutputFormats:       []string{"jsonl"},
 			ProjectUUID:         projA,
 		}
-		finishScanJSONLExport(db, opts)
+		require.NoError(t, finishScanJSONLExport(db, opts))
 
 		data, err := os.ReadFile(outPath) // literal path, no .jsonl appended
 		require.NoError(t, err, "single-format export must honor the exact -o path")
@@ -313,7 +340,7 @@ func TestFinishScanJSONLExport(t *testing.T) {
 			OutputFormats:       []string{"jsonl", "console"},
 			ProjectUUID:         projA,
 		}
-		finishScanJSONLExport(db, opts)
+		require.NoError(t, finishScanJSONLExport(db, opts))
 
 		// Multi-format must use the .jsonl-suffixed path so it never clobbers the
 		// console live file (which uses the bare base path).
@@ -335,7 +362,7 @@ func TestFinishScanJSONLExport(t *testing.T) {
 			OutputFormats:       []string{"jsonl"},
 			ProjectUUID:         projA,
 		}
-		finishScanJSONLExport(db, opts)
+		require.NoError(t, finishScanJSONLExport(db, opts))
 		_, err := os.Stat(outPath)
 		assert.True(t, os.IsNotExist(err), "stateless+output is handled by finishStatelessExport, not here")
 	})
@@ -350,7 +377,7 @@ func TestFinishScanJSONLExport(t *testing.T) {
 			OutputFormats:       []string{"jsonl"},
 			ProjectUUID:         projA,
 		}
-		out := captureStdout(t, func() { finishScanJSONLExport(db, opts) })
+		out := captureStdout(t, func() { require.NoError(t, finishScanJSONLExport(db, opts)) })
 		counts := countEnvelopeTypes(t, []byte(out))
 		assert.Equal(t, 1, counts["finding"], "stateless no-o must stream to stdout, not silently drop")
 		assert.Equal(t, 1, counts["http_record"])
@@ -367,12 +394,67 @@ func TestFinishScanJSONLExport(t *testing.T) {
 			OutputFormats:       []string{"jsonl"},
 			ProjectUUID:         "", // → DefaultProjectUUID
 		}
-		finishScanJSONLExport(db, opts)
+		require.NoError(t, finishScanJSONLExport(db, opts))
 
 		data, err := os.ReadFile(outPath)
 		require.NoError(t, err)
 		// Only the default-project finding, not projA's.
 		assert.Equal(t, 1, countEnvelopeTypes(t, data)["finding"])
+	})
+
+	t.Run("persisted run streams only this scan, not the project", func(t *testing.T) {
+		db := newExportTestDB(t)
+		ctx := context.Background()
+		repo := database.NewRepository(db)
+		const scanOld, scanNew = "scan-old", "scan-new"
+		for _, s := range []struct{ scan, suffix string }{{scanOld, "old"}, {scanNew, "new"}} {
+			_, err := db.NewInsert().Model(&database.Scan{
+				UUID: s.scan, ProjectUUID: projA, Status: "completed",
+			}).Exec(ctx)
+			require.NoError(t, err)
+			require.NoError(t, repo.SaveFindingDirect(ctx, &database.Finding{
+				ProjectUUID: projA,
+				ScanUUID:    s.scan,
+				ModuleID:    "mod-" + s.suffix,
+				ModuleName:  "Module " + s.suffix,
+				Severity:    "high",
+				Confidence:  "firm",
+				FindingHash: "hash-" + s.suffix,
+				URL:         "http://" + s.suffix + ".example/",
+				Hostname:    s.suffix + ".example",
+			}))
+			// Each scan stored one exchange (http_records.scan_uuid, A5b).
+			_, err = db.NewInsert().Model(&database.HTTPRecord{
+				UUID: "rec-" + s.suffix, ProjectUUID: projA, ScanUUID: s.scan,
+				Scheme: "http", Hostname: s.suffix + ".example", Port: 80, Method: "GET",
+				Path: "/", URL: "http://" + s.suffix + ".example/", HTTPVersion: "HTTP/1.1",
+				RequestHash: "rhash-" + s.suffix,
+			}).Exec(ctx)
+			require.NoError(t, err)
+		}
+		opts := &types.Options{
+			DeferredJSONLExport: true,
+			OutputFormats:       []string{"jsonl"},
+			ProjectUUID:         projA,
+			ScanUUID:            scanNew,
+		}
+		out := captureStdout(t, func() { require.NoError(t, finishScanJSONLExport(db, opts)) })
+		counts := countEnvelopeTypes(t, []byte(out))
+		assert.Equal(t, 1, counts["finding"], "only this scan's finding")
+		assert.Equal(t, 1, counts["scan"], "only this scan's row")
+		assert.Equal(t, 1, counts["http_record"], "only the record this scan stored")
+		assert.Contains(t, out, `"hash-new"`)
+		assert.Contains(t, out, `"rec-new"`)
+		assert.NotContains(t, out, `"hash-old"`, "an earlier scan's finding must not leak into this scan's stream")
+		assert.NotContains(t, out, `"rec-old"`, "nor an earlier scan's records")
+		assert.NotContains(t, out, `"scan-old"`)
+
+		// `vigolium export` (streamJSONLExport, no scan UUID) stays project-wide.
+		var buf bytes.Buffer
+		all, err := streamJSONLExport(ctx, db, &buf, false, projA)
+		require.NoError(t, err)
+		assert.Equal(t, 2, all.byType["finding"])
+		assert.Equal(t, 2, all.byType["http_record"])
 	})
 
 	t.Run("not deferred is a no-op", func(t *testing.T) {
@@ -385,7 +467,7 @@ func TestFinishScanJSONLExport(t *testing.T) {
 			OutputFormats:       []string{"jsonl"},
 			ProjectUUID:         projA,
 		}
-		finishScanJSONLExport(db, opts)
+		require.NoError(t, finishScanJSONLExport(db, opts))
 		_, err := os.Stat(outPath)
 		assert.True(t, os.IsNotExist(err))
 	})

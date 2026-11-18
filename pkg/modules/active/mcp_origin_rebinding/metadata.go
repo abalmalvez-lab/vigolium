@@ -9,15 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-The MCP transport spec requires servers (especially those bound to localhost
-or private interfaces) to validate the ` + "`Origin`" + ` header to prevent DNS
-rebinding attacks from a victim's browser. This module verifies the policy
-by re-issuing ` + "`initialize`" + ` with ` + "`Origin: https://attacker.example`" + `
-and reports the server when it accepts the handshake unchanged.
+	ModuleDesc = `**What it means:** A Model Context Protocol (MCP) server over streamable HTTP accepted an initialize handshake carrying a foreign Origin header (https://attacker.example) instead of rejecting it. The spec requires Origin validation, especially for localhost-bound servers; missing it makes the server a DNS-rebinding sink.
 
-## References
-- https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#security-warning`
+**How it's exploited:** An attacker lures the victim to a page whose domain rebinds via DNS to the MCP host; the browser then issues cross-origin requests the server answers, letting the attacker invoke its tools and read local data.
+
+**Fix:** Enforce strict Origin allow-listing on MCP HTTP transports and bind local servers to loopback only.`
 
 	ModuleConfirmation = "Confirmed when an initialize request carrying a foreign Origin succeeds (HTTP 2xx + valid JSON-RPC result) without being rejected by the server"
 	ModuleSeverity     = severity.High

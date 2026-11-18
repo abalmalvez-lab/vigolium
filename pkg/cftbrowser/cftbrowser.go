@@ -17,10 +17,59 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/internal/paths"
 	"go.uber.org/zap"
 )
 
-const apiURL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+// apiURL is the Chrome for Testing version index. A variable so tests can point
+// EnsureBrowser at a local server; nothing in production reassigns it.
+var apiURL = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+
+// Progress states, in the order a ProgressFunc sees them: one started, any
+// number of downloading, then exactly one finished or failed.
+const (
+	StateStarted     = "started"
+	StateDownloading = "downloading"
+	StateFinished    = "finished"
+	StateFailed      = "failed"
+)
+
+// ProgressEvent is one step of an EnsureBrowser call, for callers that render
+// provisioning themselves (the scan runner turns it into an ETA line and a
+// scan.setup event).
+type ProgressEvent struct {
+	State   string // StateStarted, StateDownloading, StateFinished or StateFailed
+	Version string // CfT version, once the version index answered
+	Bytes   int64  // archive bytes downloaded so far (finished: the archive size; 0 on a cache hit)
+	Total   int64  // archive size from Content-Length, 0 when unknown
+	Err     error  // set on StateFailed
+}
+
+// ProgressFunc receives EnsureBrowser's progress. Called on the calling
+// goroutine; downloading events arrive at most once per 5% of the archive.
+type ProgressFunc func(ProgressEvent)
+
+// progressOut is where provisioning progress is written. It is STDERR, not
+// stdout.
+//
+// That is a contract, not a preference. This package is reached two ways:
+// interactively from `vigolium doctor`, and silently as the browser fallback
+// during a scan — including a scan run with `--events ndjson`, where stdout
+// carries one JSON object per line and belongs to the machine reader alone.
+// Printing a download progress bar there corrupts the stream on the first byte,
+// and a first-run scan is exactly when that happens. Stderr reaches an
+// interactive terminal identically, so nothing is lost at the human end.
+//
+// A variable rather than os.Stderr inline so tests can capture it. Nothing in
+// production reassigns it, so it needs no guard; if a caller ever wants
+// provisioning redirected or silenced, thread an io.Writer through
+// EnsureBrowser rather than reintroducing a settable global.
+var progressOut io.Writer = os.Stderr
+
+// progressf writes one formatted progress message.
+func progressf(format string, args ...any) {
+	_, _ = fmt.Fprintf(progressOut, format, args...)
+}
 
 // platformInfo maps GOOS_GOARCH to CfT platform key and binary relative path.
 type platformInfo struct {
@@ -184,23 +233,69 @@ func fetchDownloadInfo(ctx context.Context) (version, downloadURL string, err er
 }
 
 // EnsureBrowser downloads and caches Chrome for Testing if not already present.
-// Returns the path to the chrome binary. Progress is printed to stdout so the
-// user can see what is happening during `vigolium doctor`.
-func EnsureBrowser(ctx context.Context) (string, error) {
+// Returns the path to the chrome binary.
+//
+// onProgress may be nil. Without it, progress is printed as text to
+// progressOut (stderr), never stdout — the `vigolium doctor --fix` rendering.
+// With it, the text is suppressed and the caller gets one started event, then
+// downloading events, then exactly one finished or failed event; the caller
+// owns the rendering.
+func EnsureBrowser(ctx context.Context, onProgress ProgressFunc) (string, error) {
 	if !IsSupported() {
 		return "", fmt.Errorf(
 			"chrome for Testing is not available for %s/%s — install Chromium manually (e.g. apt install chromium)",
 			runtime.GOOS, runtime.GOARCH,
 		)
 	}
+	// A stateless (-S) run may use a cached browser but downloads nothing.
+	if paths.Stateless() {
+		if cached, err := FindCachedBrowser(); err == nil {
+			return cached, nil
+		}
+		return "", fmt.Errorf("no Chrome/Chromium available and a stateless (-S) scan does not download one: " +
+			"install with `vigolium doctor --fix --only chrome`, set spidering.browser_path, or skip the crawl with --skip spidering")
+	}
+	p := provisioner{onProgress: onProgress}
+	p.emit(ProgressEvent{State: StateStarted})
+	binPath, err := p.ensure(ctx)
+	if err != nil {
+		p.emit(ProgressEvent{State: StateFailed, Version: p.version, Bytes: p.bytes, Err: err})
+		return "", err
+	}
+	p.emit(ProgressEvent{State: StateFinished, Version: p.version, Bytes: p.bytes})
+	return binPath, nil
+}
 
-	fmt.Print("  Fetching Chrome for Testing version info... ")
+// provisioner carries one EnsureBrowser call's progress sink and what it has
+// learned so far, so the terminal event can report it.
+type provisioner struct {
+	onProgress ProgressFunc
+	version    string
+	bytes      int64
+}
+
+func (p *provisioner) emit(ev ProgressEvent) {
+	if p.onProgress != nil {
+		p.onProgress(ev)
+	}
+}
+
+// say prints a text progress fragment, only when no ProgressFunc renders it.
+func (p *provisioner) say(format string, args ...any) {
+	if p.onProgress == nil {
+		progressf(format, args...)
+	}
+}
+
+func (p *provisioner) ensure(ctx context.Context) (string, error) {
+	p.say("  Fetching Chrome for Testing version info... ")
 	version, downloadURL, err := fetchDownloadInfo(ctx)
 	if err != nil {
-		fmt.Println("failed")
+		p.say("failed\n")
 		return "", fmt.Errorf("failed to get CfT download info: %w", err)
 	}
-	fmt.Printf("v%s\n", version)
+	p.version = version
+	p.say("v%s\n", version)
 
 	// Check cache first.
 	binPath, err := binPathForVersion(version)
@@ -216,7 +311,7 @@ func EnsureBrowser(ctx context.Context) (string, error) {
 	marker := filepath.Join(dir, ".extracted")
 	if data, err := os.ReadFile(marker); err == nil && string(data) == version {
 		if _, err := os.Stat(binPath); err == nil {
-			fmt.Printf("  Chrome for Testing v%s already cached at %s\n", version, binPath)
+			p.say("  Chrome for Testing v%s already cached at %s\n", version, binPath)
 			return binPath, nil
 		}
 	}
@@ -224,33 +319,34 @@ func EnsureBrowser(ctx context.Context) (string, error) {
 	// Binary exists but no marker (previous verify failed, e.g. missing libs).
 	// Re-verify instead of re-downloading.
 	if _, err := os.Stat(binPath); err == nil {
-		fmt.Print("  Chrome for Testing extracted but not verified, retrying... ")
+		p.say("  Chrome for Testing extracted but not verified, retrying... ")
 		if err := verifyBrowser(binPath); err != nil {
-			fmt.Println("failed")
+			p.say("failed\n")
 			return "", err
 		}
-		fmt.Println("ok")
+		p.say("ok\n")
 		if err := os.WriteFile(marker, []byte(version), 0644); err != nil {
 			zap.L().Debug("failed to write chrome version marker", zap.String("marker", marker), zap.Error(err))
 		}
-		fmt.Printf("  Chrome for Testing ready: %s\n", binPath)
+		p.say("  Chrome for Testing ready: %s\n", binPath)
 		return binPath, nil
 	}
 
 	// Download.
-	fmt.Printf("  Downloading Chrome for Testing v%s... ", version)
-	tmpFile, err := downloadToTemp(ctx, downloadURL)
+	p.say("  Downloading Chrome for Testing v%s... ", version)
+	tmpFile, err := p.downloadToTemp(ctx, downloadURL)
 	if err != nil {
-		fmt.Println("failed")
+		p.say("failed\n")
 		return "", fmt.Errorf("download failed: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpFile) }()
 
 	// Print downloaded size.
 	if info, statErr := os.Stat(tmpFile); statErr == nil {
-		fmt.Printf("done (%.1f MB)\n", float64(info.Size())/1024/1024)
+		p.bytes = info.Size()
+		p.say("done (%.1f MB)\n", float64(info.Size())/1024/1024)
 	} else {
-		fmt.Println("done")
+		p.say("done\n")
 	}
 
 	// Clean old version dir and extract.
@@ -261,12 +357,12 @@ func EnsureBrowser(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to create cache dir: %w", err)
 	}
 
-	fmt.Print("  Extracting... ")
+	p.say("  Extracting... ")
 	if err := extractZipFile(tmpFile, dir); err != nil {
-		fmt.Println("failed")
+		p.say("failed\n")
 		return "", fmt.Errorf("extraction failed: %w", err)
 	}
-	fmt.Println("done")
+	p.say("done\n")
 
 	// Make binary executable.
 	if err := os.Chmod(binPath, 0755); err != nil {
@@ -276,19 +372,19 @@ func EnsureBrowser(ctx context.Context) (string, error) {
 	// Verify the binary actually works (catches missing shared libraries).
 	// Done BEFORE writing the marker so a failed verify leaves no marker,
 	// allowing a retry after the user installs the required deps.
-	fmt.Print("  Verifying Chrome binary... ")
+	p.say("  Verifying Chrome binary... ")
 	if err := verifyBrowser(binPath); err != nil {
-		fmt.Println("failed")
+		p.say("failed\n")
 		return "", err
 	}
-	fmt.Println("ok")
+	p.say("ok\n")
 
 	// Write marker only after successful verification.
 	if err := os.WriteFile(marker, []byte(version), 0644); err != nil {
 		return "", fmt.Errorf("failed to write marker: %w", err)
 	}
 
-	fmt.Printf("  Chrome for Testing ready: %s\n", binPath)
+	p.say("  Chrome for Testing ready: %s\n", binPath)
 	zap.L().Info("Chrome for Testing downloaded",
 		zap.String("version", version),
 		zap.String("path", binPath))
@@ -320,18 +416,13 @@ func verifyBrowser(binPath string) error {
 		missing := parseMissingLib(output)
 
 		if runtime.GOOS == "linux" {
-			fmt.Println()
-			fmt.Println()
-			fmt.Println("  Chrome for Testing requires system libraries that are not installed.")
+			progressf("\n\n  Chrome for Testing requires system libraries that are not installed.\n")
 			if missing != "" {
-				fmt.Printf("  Missing: %s\n", missing)
+				progressf("  Missing: %s\n", missing)
 			}
-			fmt.Println()
-			fmt.Println("  Install Chromium with your package manager instead, e.g.:")
-			fmt.Println("    sudo apt install chromium")
-			fmt.Println()
-			fmt.Println("  Vigolium will use the system Chromium automatically once it's installed.")
-			fmt.Println()
+			progressf("\n  Install Chromium with your package manager instead, e.g.:\n" +
+				"    sudo apt install chromium\n\n" +
+				"  Vigolium will use the system Chromium automatically once it's installed.\n\n")
 			return fmt.Errorf("chrome binary missing shared libraries — install chromium with your package manager, e.g.: sudo apt install chromium")
 		}
 
@@ -342,7 +433,7 @@ func verifyBrowser(binPath string) error {
 }
 
 // downloadToTemp downloads a URL to a temporary file, returning its path.
-func downloadToTemp(ctx context.Context, url string) (string, error) {
+func (p *provisioner) downloadToTemp(ctx context.Context, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -367,8 +458,10 @@ func downloadToTemp(ctx context.Context, url string) (string, error) {
 	var reader io.Reader = resp.Body
 	if resp.ContentLength > 0 {
 		reader = &progressReader{
-			reader: resp.Body,
-			total:  resp.ContentLength,
+			reader:  resp.Body,
+			total:   resp.ContentLength,
+			version: p.version,
+			report:  p.onProgress,
 		}
 	}
 
@@ -383,8 +476,8 @@ func downloadToTemp(ctx context.Context, url string) (string, error) {
 	}
 
 	// Clear the progress line.
-	if resp.ContentLength > 0 {
-		fmt.Print("\r\033[K")
+	if resp.ContentLength > 0 && p.onProgress == nil {
+		progressf("\r\033[K")
 	}
 
 	zap.L().Debug("Download complete",
@@ -394,12 +487,15 @@ func downloadToTemp(ctx context.Context, url string) (string, error) {
 	return tmp.Name(), nil
 }
 
-// progressReader wraps an io.Reader and prints download progress to stdout.
+// progressReader wraps an io.Reader and reports download progress every 5%:
+// to report when set, else as a text bar on progressOut (stderr).
 type progressReader struct {
 	reader      io.Reader
 	total       int64
 	read        int64
 	lastPercent int
+	version     string
+	report      ProgressFunc
 }
 
 func (pr *progressReader) Read(p []byte) (int, error) {
@@ -408,7 +504,11 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	percent := int(pr.read * 100 / pr.total)
 	if percent != pr.lastPercent && percent%5 == 0 {
 		pr.lastPercent = percent
-		fmt.Printf("\r  Downloading Chrome for Testing... %d%% (%.1f/%.1f MB)",
+		if pr.report != nil {
+			pr.report(ProgressEvent{State: StateDownloading, Version: pr.version, Bytes: pr.read, Total: pr.total})
+			return n, err
+		}
+		progressf("\r  Downloading Chrome for Testing... %d%% (%.1f/%.1f MB)",
 			percent,
 			float64(pr.read)/1024/1024,
 			float64(pr.total)/1024/1024)

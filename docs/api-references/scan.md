@@ -85,14 +85,17 @@ Starts an asynchronous scan from a base64-encoded raw HTTP request, optionally p
 | `target_url`           | string | No       | Override target URL (scheme://host) for the request                                                   |
 | `modules`              | string | No       | Comma-separated module IDs to run                                                                     |
 | `no_passive`           | bool   | No       | Skip passive modules                                                                                  |
+| `no_scheme_probe`      | bool   | No       | Keep the inferred `https` default instead of probing the target (CLI `--no-scheme-probe`)             |
 
 > \* Exactly one of `http_request_base64` or `raw_request` is required. If both are set, `http_request_base64` wins. The same precedence applies to `http_response_base64` / `raw_response`.
+
+> **Scheme resolution:** without `target_url` the request line carries no scheme, so it is settled the way `vigolium scan-request` settles it: an absolute-form request line, a `Host` on `:80`/`:443`, or a same-origin `Origin`/`Referer` decide; otherwise the target is probed (TCP connect, plus a TLS handshake on an explicit non-standard port) instead of assuming `https`, so a plain-http service on `:8080` is scanned over `http://`. Scope is checked first, so a refused target is never contacted. The response's `target` is the URL that will be sent and `scheme_source` says what decided it (`explicit`, `port`, `origin`, `referer`, `probe` or `default`).
 
 > **Paired response behavior:** When `http_response_base64` is provided, passive modules analyze the supplied response directly (no extra traffic sent). Active modules still send their own probe requests — that's the nature of active scanning — but the supplied response is used for baseline passive analysis. When omitted, the scanner fetches the response itself before scanning.
 
 ```bash
 # Request-only scan (scanner fetches the response)
-REQ_B64=$(echo -n "POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"user\":\"admin\"}" | base64)
+REQ_B64=$(printf 'POST /api/login HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{"user":"admin"}' | base64)
 
 curl -s -X POST http://localhost:9002/api/scan-request \
   -H "Content-Type: application/json" \
@@ -132,7 +135,9 @@ curl -s -X POST http://localhost:9002/api/scan-request \
   "project_uuid": "my-project-uuid",
   "scan_uuid": "661f9511-f3ac-52e5-b827-557766551111",
   "status": "running",
-  "message": "scan-request started for https://example.com/api/login"
+  "message": "scan-request started for https://example.com/api/login",
+  "target": "https://example.com/api/login",
+  "scheme_source": "explicit"
 }
 ```
 
@@ -141,6 +146,8 @@ curl -s -X POST http://localhost:9002/api/scan-request \
 | Code | Condition                                                      |
 |------|----------------------------------------------------------------|
 | 400  | Missing required fields, invalid base64, or unparseable request |
+| 422  | The server's configured scope refuses the target. `details` is `no_targets_in_scope` and `error` names the rule (e.g. `scope.host.include`); no scan row is created and nothing is sent |
+| 503  | Too many concurrent single-request scans; retry shortly          |
 
 Use `GET /api/scan/status` to check the progress of the scan.
 
@@ -253,9 +260,12 @@ curl -s -X POST http://localhost:9002/api/scans/run \
   "status": "running",
   "message": "scan started",
   "targets_count": 1,
-  "scan_mode": "target"
+  "scan_mode": "target",
+  "resolved": {"strategy": "balanced", "concurrency": 25, "rate_limit": 100, "max_per_host": 40}
 }
 ```
+
+`resolved` is the pace the scan will run with. The request goes through the same resolution as `vigolium scan`: profile, then strategy (a `lite` ceiling of concurrency 10, rate limit 20 and max-per-host 10 narrows every value the request left unset), then `scanning_pace`. A positive `concurrency`, `rate_limit` or `max_per_host` in the request is explicit and is never narrowed. Queued and dry-run responses carry it too. An unknown profile, strategy or phase, or an invalid `scanning_pace`, is a `400`.
 
 **Response — queued (202):**
 
@@ -358,11 +368,11 @@ Every scan record has a `scan_mode` field that indicates how the scan was trigge
 
 | Mode          | Origin                                   | Description                                                                                    |
 |---------------|------------------------------------------|------------------------------------------------------------------------------------------------|
-| `full`        | `vigolium scan`, `vigolium run`          | Batch scan over all in-scope HTTP records in the database                                      |
+| `full`        | `vigolium scan`, `vigolium run`          | Native scan; with `--all-records`, a batch scan over all in-scope HTTP records in the database   |
 | `target`      | `POST /api/scans/run`                    | API-initiated scan targeting a specific URL or scope                                           |
 | `incremental` | Server scan-on-receive                   | Continuous scan that processes each HTTP record as it is ingested into the server (proxy, Burp, etc.) |
 | `single`      | `POST /api/scan-url`                     | One-off scan of a single URL with optional method, body, and headers                           |
-| `selective`   | `POST /api/scan/records`                 | Scan a specific set of HTTP records by UUID                                                    |
+| `selective`   | `POST /api/scan-records`                 | Scan a specific set of HTTP records by UUID                                                    |
 
 ---
 
@@ -397,6 +407,25 @@ curl -s 'http://localhost:9002/api/scans?limit=10&offset=0' \
       "uuid": "scan-abc123",
       "name": "api-scan",
       "status": "completed",
+      "completeness": "partial",
+      "stop_reason": "scan_budget",
+      "phase_outcomes": [
+        {
+          "phase": "discovery",
+          "state": "partial",
+          "reasons": ["targets_failed"],
+          "limits": ["target_budget"],
+          "errors": 2,
+          "message": "dial tcp: no such host",
+          "duration_ms": 41233
+        },
+        {
+          "phase": "known-issue-scan",
+          "state": "skipped",
+          "reasons": ["scan_budget"],
+          "duration_ms": 0
+        }
+      ],
       "scan_source": "api",
       "scan_mode": "incremental",
       "source_type": "local",
@@ -414,6 +443,54 @@ curl -s 'http://localhost:9002/api/scans?limit=10&offset=0' \
   "has_more": false
 }
 ```
+
+#### Scan completeness
+
+`status` says whether the scan process reached its end. `completeness` says
+whether the run actually covered the input it was given. They are independent,
+and both are needed: a scan can reach its end having scanned half its records.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `completeness` | string | `complete`, `partial`, or **absent** — absent means *unknown*, which is what a row written by an older binary (or by a caller with no outcome data) honestly is. Never read an absent value as `complete`. |
+| `stop_reason` | string | The single most useful explanation for a partial run: `scan_budget`, `cancelled`, or the first reason the first incomplete phase recorded. Absent on a complete run. |
+| `phase_outcomes` | array | One object per phase that ran, plus one per planned phase that was never launched. |
+
+Each phase outcome carries:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `phase` | string | Canonical phase id, the same vocabulary `--only`/`--skip` use. |
+| `state` | string | `completed`, `partial`, `failed`, or `skipped`. |
+| `reasons` | array | Why coverage was lost. Sorted and deduplicated. |
+| `limits` | array | Configured bounds that were reached. A limit is **designed behaviour** and never downgrades a phase — a per-target time box firing is the scan working as asked. |
+| `errors` | int | How many failures the phase reported. |
+| `message` | string | The first error's text, truncated to 512 bytes. |
+| `unprocessed` | int | Work items a worker dequeued and deliberately did not acknowledge, so a later run re-serves them. |
+| `duration_ms` | int | Wall-clock time in the phase. |
+| `persistence` | object | What became of the writes the phase's writers accepted: `accepted`, `committed`, `failed`, `unknown` (still in flight when the close deadline passed), `timed_out`. |
+
+Reason and limit codes are a compatibility surface: codes are **added, never
+renamed**. The current set is `phase_deadline`, `scan_budget`, `cancelled`,
+`error`, `no_modules`, `drain_stalled`, `workers_abandoned`,
+`deferred_flush_skipped`, `producer_abandoned`, `targets_failed`,
+`targets_skipped`, `persistence_incomplete`, `round_error`,
+`checkpoint_failed`, `input_incomplete`, `auth_unavailable`, `login_budget`,
+and the limit `target_budget`.
+
+`auth_unavailable` means configured authentication never reached the scan, so
+the assessment probed an authenticated application anonymously; it always
+appears alongside the specific cause when there is one (`login_budget` for the
+2-minute total login budget, else `cancelled` or `scan_budget`). A wall of 401s
+on such a scan is attributable rather than a finding about the application.
+
+Record delivery is at-least-once: a curtailed phase leaves its durable cursor
+*behind* the records it did not finish, so a `scan-on-receive` or `--scan-uuid`
+successor re-serves them rather than skipping them. `unprocessed` says how many
+that was; `checkpoint_failed` means the cursor could not be written at all and
+the whole round will be re-served. `completeness` still matters beyond
+reporting — a partial predecessor covered less than its target list, so it is not
+a trustworthy baseline for "everything up to here was scanned".
 
 ---
 
@@ -493,7 +570,7 @@ curl -s -X POST http://localhost:9002/api/scans/scan-abc123/stop \
 
 ### POST /api/scans/:uuid/pause — Pause a Running Scan
 
-Pauses a running scan. Workers finish their current item then block until resumed. The scan status is set to `"paused"` in the database.
+Pauses a running scan. Workers finish dispatching their current item then block until resumed; no new item is fetched or dispatched while paused. Active-module tasks that were already dispatched are not waited for and may still finish (sending their probes, recording findings) after the pause takes effect. The scan status is set to `"paused"` in the database.
 
 ```bash
 curl -s -X POST http://localhost:9002/api/scans/scan-abc123/pause \
@@ -823,7 +900,7 @@ curl -s 'http://localhost:9002/api/scans/scan-abc123/logs?level=info&phase=disco
 | `spidering`          | Browser-based crawling                                            |
 | `discovery`          | Input ingestion + content discovery                               |
 | `seed`               | CLI target seeding (when discovery is skipped)                    |
-| `known-issue-scan`   | Known issue scan (Nuclei + Kingfisher)                            |
+| `known-issue-scan`   | Known issue scan (Nuclei + native secret detection)               |
 | `audit`              | Active/passive module scanning                                    |
 
 **Log levels:**
@@ -976,9 +1053,12 @@ curl -s -X POST http://localhost:9002/api/scan-all-records \
   "status": "running",
   "message": "all-records scan started",
   "records_to_scan": 142,
-  "scan_mode": "full"
+  "scan_mode": "full",
+  "resolved": {"strategy": "balanced", "concurrency": 25, "rate_limit": 100, "max_per_host": 40}
 }
 ```
+
+This route always runs dynamic-assessment only. The strategy (from `intensity` or `default_strategy`) sets the pace ceiling but not the phases. A `scanning_profile` or `intensity` that cannot be loaded is a `400`.
 
 **Response — dry run (200):**
 
@@ -1000,4 +1080,3 @@ curl -s -X POST http://localhost:9002/api/scan-all-records \
 | 400  | No records match filters, or invalid params  |
 | 409  | A scan is already running                    |
 | 503  | Database unavailable                         |
-

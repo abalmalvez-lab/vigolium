@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed Spring Cloud Config Server endpoints that serve application
-configuration for various environments. These endpoints can leak database
-credentials, API keys, encryption keys, and internal service URLs. Also checks
-for exposed encrypt/decrypt endpoints that could be abused for cryptographic
-operations.
+	ModuleDesc = `**What it means:** A Spring Cloud Config Server is reachable without authentication and serves application configuration over HTTP. The scanner confirmed it via config paths (such as /application/default) returning propertySources JSON, which routinely expose database credentials, API keys, and internal service URLs.
 
-## Notes
-- Runs once per host
-- Checks common config patterns: /{app}/{profile} and /{app}/{profile}/{label}
-- Probes encrypt and decrypt endpoints
-- Validates responses using Spring Cloud Config JSON markers
+**How it's exploited:** An attacker fetches the config endpoints for each environment profile and reads the property values, harvesting plaintext secrets and internal hostnames that grant direct access to databases and internal services.
 
-## References
-- https://docs.spring.io/spring-cloud-config/docs/current/reference/html/
-- https://cloud.spring.io/spring-cloud-config/reference/html/#_security`
+**Fix:** Place the Config Server behind authentication, never expose it publicly, and store secrets in an encrypted vault rather than cleartext.`
 
 	ModuleConfirmation = "Confirmed when config server endpoints return application configuration with property sources"
 	ModuleSeverity     = severity.Critical

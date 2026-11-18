@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects exposed Werkzeug interactive debugger in Flask applications. The
-Werkzeug debugger provides an interactive Python console in the browser when
-an unhandled exception occurs. This allows arbitrary code execution on the
-server and is a critical vulnerability when exposed in production.
+	ModuleDesc = `**What it means:** A Flask application runs with Werkzeug debug mode enabled. On an unhandled exception, Werkzeug renders an error page that can include a full interactive Python console (critical) or at least a stack trace exposing source paths.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Sends requests designed to trigger 404 and 500 errors
-- Distinguishes between full interactive debugger (critical/RCE) and stack trace disclosure (high/info disclosure)
-- Interactive debugger confirmed by "Werkzeug Debugger" marker
+**How it's exploited:** If the console is exposed, an attacker types Python into the in-browser debugger to run arbitrary code, read files, and pivot into the host. Even a leaked traceback hands over source paths and code internals.
 
-## References
-- https://flask.palletsprojects.com/en/latest/debugging/
-- https://werkzeug.palletsprojects.com/en/latest/debug/`
+**Fix:** Never run Werkzeug debug mode in production; set debug to false and serve behind a production WSGI server.`
 
 	ModuleConfirmation = "Confirmed when error responses contain Werkzeug debugger markers indicating interactive console access"
 	ModuleSeverity     = severity.Critical

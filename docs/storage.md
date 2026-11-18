@@ -88,7 +88,7 @@ All subcommands operate on the active project. Every subcommand fails with a cle
 vigolium storage ls                              # list all objects in the project
 vigolium storage ls --prefix ugc/                # filter by prefix
 vigolium storage ls --tree                       # render as a directory tree
-vigolium storage ls --json
+vigolium storage ls -j                           # read envelope: items = objects
 
 vigolium storage upload ./bundle.tar.gz                         # → ugc/bundle.tar.gz
 vigolium storage upload ./bundle.tar.gz --key imports/manual.tar.gz
@@ -103,10 +103,10 @@ vigolium storage results <run-uuid>  -o ./run.tar.gz
 
 vigolium storage presign --key ugc/foo.tar.gz                    # default: GET, 1h
 vigolium storage presign --key uploads/incoming.tar.gz --method PUT --expiry 30m
-vigolium storage presign --key ugc/foo.tar.gz --json
+vigolium storage presign --key ugc/foo.tar.gz -j                 # items:[{url,key,method,expiry_seconds}]
 
 vigolium storage rm imports/old.tar.gz                            # prompts for confirmation
-vigolium storage rm imports/a.tar.gz imports/b.tar.gz -F          # batch + force
+vigolium storage rm imports/a.tar.gz imports/b.tar.gz --force     # batch + force
 vigolium storage delete ...                       # alias for rm
 ```
 
@@ -146,11 +146,21 @@ vigolium export --format jsonl    -o gs://{project-uuid}/exports/data-{ts}.jsonl
 vigolium export --format html     -o gs://{project-uuid}/exports/report-{ts}.html
 vigolium export --format pdf      -o gs://{project-uuid}/exports/report-{ts}.pdf
 vigolium export --format markdown -o gs://{project-uuid}/exports/report-{ts}.md
+vigolium export --format sarif    -o gs://{project-uuid}/exports/report-{ts}.sarif
 vigolium export --format bundle   -o gs://{project-uuid}/exports/bundle-{ts}.tar.gz \
                                     --scan-uuid <run-uuid>
 ```
 
 Vigolium writes to a temp file locally, then uploads on success. If the upload fails, the export is reported as failed (the temp file is cleaned up regardless).
+
+Several formats can share one `gs://` base, each uploaded under its own key. `{ts}` is expanded once for the whole run, so the objects group together instead of scattering across timestamps:
+
+```bash
+vigolium export --format html,markdown,bundle -o gs://{project-uuid}/exports/scan-{ts}
+# → gs://<project>/exports/scan-<ts>.html
+#   gs://<project>/exports/scan-<ts>.md
+#   gs://<project>/exports/scan-<ts>.tar.gz
+```
 
 ### Bundle export
 
@@ -205,7 +215,7 @@ Caveat: an imported bundle currently re-creates a new `agentic_scans` row from t
 
 ## Security notes
 
-- **Project isolation.** All keys are validated and prefixed with the project UUID server-side; clients cannot read or write objects outside their project.
+- **Project prefixes.** REST storage endpoints always prefix keys with the request's project UUID. The CLI also validates keys, but an explicit `gs://<different-project>/...` URI intentionally selects that other prefix and logs a notice; access is still governed by the configured bucket credentials.
 - **Path traversal.** Keys containing `..`, `\`, or absolute paths are rejected by `storage.ValidateKey` before any backend call.
 - **Presigned URLs** are bounded by `--expiry` (default 1h). They inherit the project prefix; they cannot be used to reach outside the project.
 - **Credentials live in config.** Use `${ENV_VAR}` interpolation in `vigolium-configs.yaml` rather than committing keys; the loader expands env vars at config-load time.

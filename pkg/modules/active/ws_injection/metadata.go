@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for injection vulnerabilities (XSS, SQLi, command injection, template injection) in HTTP
-parameters that are likely forwarded to WebSocket message processing contexts. The module targets
-parameters with names commonly associated with WebSocket messaging (e.g., message, data, payload,
-cmd) and sends crafted payloads to detect unvalidated input handling.
+	ModuleDesc = `**What it means:** A parameter named for WebSocket message handling (message, msg, data, payload, content, cmd, query) passes attacker input into a sink without validation. The scanner saw an unencoded reflection, a SQL error, command output, or an evaluated template expression.
 
-## Notes
-- Only tests parameters whose names suggest WebSocket message processing involvement.
-- Checks for reflected XSS payloads, SQL error messages, command output patterns, and template
-  expression evaluation in responses.
-- Uses insertion-point-level deduplication to avoid redundant checks.
+**How it's exploited:** Crafted values achieve cross-site scripting, SQL injection, OS command injection, or server-side template injection. Impact depends on the confirmed payload class, from session theft to remote code execution.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/11-Client-side_Testing/10-Testing_WebSockets
-- https://portswigger.net/web-security/websockets`
+**Fix:** Validate and contextually encode parameter input server-side, use parameterized queries, and never pass user input to shell or template evaluators.`
 
 	ModuleConfirmation = "Confirmed when an injected payload is reflected unencoded, triggers a SQL error, produces command output, or evaluates a template expression in the HTTP response"
 	ModuleSeverity     = severity.Medium

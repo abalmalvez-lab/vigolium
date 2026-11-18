@@ -7,11 +7,46 @@ import (
 	"github.com/vigolium/vigolium/pkg/deparos/discovery/payload"
 	"github.com/vigolium/vigolium/pkg/deparos/discovery/tracker"
 	"github.com/vigolium/vigolium/pkg/deparos/http"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/sourcemap"
 	"github.com/vigolium/vigolium/pkg/deparos/reqcache"
 	"github.com/vigolium/vigolium/pkg/deparos/scope"
 	"github.com/vigolium/vigolium/pkg/deparos/waf"
 )
+
+// TaskProvenance distinguishes a URL the application itself published from one
+// discovery guessed. It is the input to every gate whose job is to rein in
+// guessing without suppressing real assets.
+//
+// It is typed state rather than a string label because the two cannot be derived
+// from the task type: JSFetchTask carries both a bundle's referenced .js.map and
+// the JS-bundle sweep's name guesses, so keying the distinction on FoundByName()
+// exempts the guesses too.
+type TaskProvenance uint8
+
+const (
+	// ProvenanceGuessed is the safe default: a task that does not say otherwise is
+	// treated as guessing, so a new task type fails closed (gated) rather than
+	// silently bypassing the breaker.
+	ProvenanceGuessed TaskProvenance = iota
+	// ProvenanceReferenced means the application named this exact URL.
+	ProvenanceReferenced
+)
+
+// referencedTask is implemented by task types that know their own provenance.
+type referencedTask interface {
+	IsReferenced() bool
+}
+
+// TaskIsReferenced reports whether a task's URLs were published by the
+// application. Task types that track it answer directly; the rest fall back to
+// their provenance label.
+func TaskIsReferenced(task Task) bool {
+	if t, ok := task.(referencedTask); ok {
+		return t.IsReferenced()
+	}
+	return isReferencedProvenance(task.FoundByName())
+}
 
 // Task provides configuration and payloads for content discovery.
 // Tasks are immutable configuration objects - execution is handled by PayloadCoordinator.
@@ -64,14 +99,29 @@ type Callbacks struct {
 	// OnDirectoryDiscovered is called when a directory is found.
 	OnDirectoryDiscovered func(url string, depth uint16) error
 
-	// OnFileDiscovered is called when a file is found.
-	OnFileDiscovered func(url string, depth uint16) error
+	// OnFileDiscovered is called when a file is found. confirmExt reports whether
+	// the discovery's provenance is a genuine application reference whose served
+	// extension may bootstrap the "observed" extension-fuzz amplification; a
+	// brute-forced guess (fuzz/wordlist/numeric/…) passes false so a catch-all
+	// 200 cannot confirm an extension the server does not actually run.
+	OnFileDiscovered func(url string, depth uint16, confirmExt bool) error
 
 	// AddObservedName adds a name to observed collection (from JS path extraction).
 	AddObservedName func(name string)
 
 	// AddObservedPath adds a path to observed collection (from JS path extraction).
 	AddObservedPath func(path string)
+
+	// QueueJSFetch enqueues additional JS/JSON URLs for fetching through the same
+	// JSFetch pipeline. Used to fan out from a parsed manifest (e.g. the assets an
+	// Angular ngsw.json enumerates) so the listed files are fetched and recorded.
+	// May be nil.
+	QueueJSFetch func(urls []*url.URL)
+
+	// QueueReferencedURL enqueues one in-scope URL the application itself
+	// pointed at (a redirect Location) as a referenced spider task, so it is
+	// fetched and recorded with its own response. May be nil.
+	QueueReferencedURL func(rawURL string, depth uint16)
 
 	// HTTPClient is the client used for HTTP requests.
 	HTTPClient http.HTTPClient
@@ -105,22 +155,50 @@ type Callbacks struct {
 	// Applied to every request during discovery.
 	CustomHeaders map[string]string
 
-	// JSScan integration for endpoint extraction from JavaScript files.
+	// JSTangle integration for endpoint extraction from JavaScript files.
 
-	// JSScanScanner is the jsscan scanner for JS endpoint extraction.
-	// If nil, jsscan is disabled.
-	JSScanScanner *jsscan.Scanner
-
-	// JSScanSem is a semaphore to limit concurrent jsscan executions.
-	JSScanSem chan struct{}
+	// JSTangleService is the shared broker for JS endpoint extraction.
+	// If nil, jstangle is disabled.
+	JSTangleService *jstangle.Service
+	JSTangleOptions func(profile jstangle.AnalysisProfile, sourceURL string) jstangle.ScanOptions
 
 	// AddExtractedRequest adds an extracted request to the engine's collection.
 	// Returns true if the request was new (not a duplicate).
-	AddExtractedRequest func(req *jsscan.ExtractedRequest) bool
+	AddExtractedRequest func(req *jstangle.ExtractedRequest) bool
 
-	// StoreJSScanRequests persists extracted jsscan requests to database.
-	// Called after jsscan completes. jsURL is the source JavaScript file.
-	StoreJSScanRequests func(jsURL *url.URL, reqs []jsscan.ExtractedRequest)
+	// AddRequestFact retains typed provenance and source-scoped replay policy.
+	AddRequestFact func(sourceURL string, fact jstangle.HTTPRequestFact) bool
+
+	// RequeueReplayTemplate returns a claimed JS-replay template (keyed by its
+	// source URL + template id) to the pending set so a later flush round retries
+	// it when its replay failed to send or was cancelled before dispatch. May be
+	// nil (retry disabled, e.g. for non-engine callers).
+	RequeueReplayTemplate func(sourceURL, id string) bool
+
+	// NoteReplayOutcome records what became of a JS-replay template (keyed by
+	// source URL + template id): found, not found (with the response), out of
+	// scope, deduped, or unresolvable. The integrated source persists every
+	// template from these notes after the crawl. May be nil.
+	NoteReplayOutcome func(sourceURL, templateID string, note ReplayNote)
+
+	// ReplayEvidenceSpent reports that the replay evidence budget is used up,
+	// so a not-found response is noted without copying its body. May be nil.
+	ReplayEvidenceSpent func() bool
+
+	// StoreJSTangleRequests persists extracted jstangle requests to database.
+	// Called after jstangle completes. jsURL is the source JavaScript file.
+	StoreJSTangleRequests       func(jsURL *url.URL, reqs []jstangle.ExtractedRequest)
+	StoreJSTangleFacts          func(jsURL *url.URL, facts []jstangle.HTTPRequestFact)
+	ProcessJSTangleCapabilities func(sourceURL string, result *jstangle.ScanResult)
+
+	ProcessAssetFacts func(ctx context.Context, parentURL string, source []byte, facts []jstangle.AssetReferenceFact)
+	ProcessSourceMap  func(ctx context.Context, mapURL *url.URL, content []byte)
+
+	// ProcessSourceMapCandidates queues the source maps an asset points at, or its
+	// conventional sibling when it points at none. The candidates arrive already
+	// selected and resolved (see sourcemap.CandidatesFor) rather than as raw bytes,
+	// so the body is scanned once per asset instead of once per consumer.
+	ProcessSourceMapCandidates func(ctx context.Context, parentURL string, candidates []sourcemap.Candidate)
 
 	// ScopeChecker validates if URLs are within scan scope.
 	// Used by redirect handler to filter out-of-scope redirect targets.

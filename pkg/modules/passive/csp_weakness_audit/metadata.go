@@ -9,28 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Parses Content-Security-Policy headers and evaluates individual directives for
-unsafe configurations that reduce CSP effectiveness. Detects unsafe-inline,
-unsafe-eval, wildcard sources, missing frame-ancestors, missing base-uri
-restriction, overly permissive script-src, and data: or blob: URI schemes
-in sensitive directives.
+	ModuleDesc = `**What it means:** A Content-Security-Policy header is present but its directives weaken the protection it should provide - unsafe-inline/unsafe-eval, wildcard or data:/blob: script sources, a missing frame-ancestors or base-uri, or an object-src not set to 'none'.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Only processes HTML responses (text/html content type)
-- Parses actual CSP header values, not just presence/absence
-- Each weakness emits a separate finding with the problematic directive
-- Deduplicates by host
-- Complements security_headers_missing which only checks for header presence
+**How it's exploited:** Weak script sources let injected payloads run despite CSP, so an XSS bug stays exploitable. Missing frame-ancestors permits clickjacking, an open base-uri lets a base tag hijack relative URLs, and a loose object-src can load dangerous plugin content.
 
-## References
-- https://cwe.mitre.org/data/definitions/693.html
-- https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP
-- https://csp-evaluator.withgoogle.com/`
+**Fix:** Remove unsafe-inline/unsafe-eval and wildcard/data:/blob: script sources; set frame-ancestors, base-uri, and object-src to 'none' or trusted values.`
 
 	ModuleConfirmation = "Confirmed when CSP header contains directives that significantly weaken its protection"
-	ModuleSeverity     = severity.Medium
+	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"header-security", "misconfiguration", "xss", "light"}
+	ModuleTags         = []string{"header-security", "misconfiguration", "xss", "hygiene", "light"}
 )

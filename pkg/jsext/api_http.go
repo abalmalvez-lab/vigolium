@@ -1,10 +1,11 @@
 package jsext
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/grafana/sobek"
 	"github.com/vigolium/vigolium/pkg/http"
@@ -19,6 +20,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 		{
 			Namespace:   NsHTTP,
 			Name:        "get",
+			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".get(url: string, opts?: {headers})",
 			Returns:     "{status, headers, body, raw}",
@@ -34,6 +36,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 		{
 			Namespace:   NsHTTP,
 			Name:        "post",
+			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".post(url: string, body: string, opts?: {headers})",
 			Returns:     "{status, headers, body, raw}",
@@ -50,6 +53,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 		{
 			Namespace:   NsHTTP,
 			Name:        "request",
+			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".request({method, url, headers, body})",
 			Returns:     "{status, headers, body, raw}",
@@ -76,13 +80,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 						body = v.String()
 					}
 
-					headers := make(map[string]string)
-					if v := o.Get("headers"); v != nil && !sobek.IsUndefined(v) {
-						headersObj := v.ToObject(vm)
-						for _, key := range headersObj.Keys() {
-							headers[key] = headersObj.Get(key).String()
-						}
-					}
+					headers := headersArg(vm, o.Get("headers"))
 
 					return doRequest(vm, opts.HTTPClient, method, urlStr, body, headers)
 				}
@@ -91,6 +89,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 		{
 			Namespace:   NsHTTP,
 			Name:        "send",
+			Effect:      EffectNetwork,
 			Category:    CatHTTP,
 			Signature:   ".send(rawRequest: string)",
 			Returns:     "{status, headers, body, raw}",
@@ -106,6 +105,7 @@ func httpCoreFuncDefs() []JSFuncDef {
 		{
 			Namespace:   NsHTTP,
 			Name:        "buildRequest",
+			Effect:      EffectPure,
 			Category:    CatHTTP,
 			Signature:   ".buildRequest(rawRequest: string, overrides: {method?, path?, headers?, body?, query?})",
 			Returns:     "string",
@@ -126,19 +126,11 @@ func httpCoreFuncDefs() []JSFuncDef {
 }
 
 func doSimpleRequest(vm *sobek.Runtime, httpClient *http.Requester, method, urlStr, body string, optsVal sobek.Value) sobek.Value {
-	headers := make(map[string]string)
-
+	var headersVal sobek.Value
 	if optsVal != nil && !sobek.IsUndefined(optsVal) && !sobek.IsNull(optsVal) {
-		opts := optsVal.ToObject(vm)
-		if v := opts.Get("headers"); v != nil && !sobek.IsUndefined(v) {
-			headersObj := v.ToObject(vm)
-			for _, key := range headersObj.Keys() {
-				headers[key] = headersObj.Get(key).String()
-			}
-		}
+		headersVal = optsVal.ToObject(vm).Get("headers")
 	}
-
-	return doRequest(vm, httpClient, method, urlStr, body, headers)
+	return doRequest(vm, httpClient, method, urlStr, body, headersArg(vm, headersVal))
 }
 
 func doRequest(vm *sobek.Runtime, httpClient *http.Requester, method, urlStr, body string, headers map[string]string) sobek.Value {
@@ -157,7 +149,7 @@ func doRequest(vm *sobek.Runtime, httpClient *http.Requester, method, urlStr, bo
 		fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
 	}
 
-	if body != "" && headers["Content-Length"] == "" {
+	if body != "" && !mapHasHeader(headers, "Content-Length") {
 		fmt.Fprintf(&sb, "Content-Length: %d\r\n", len(body))
 	}
 	sb.WriteString("\r\n")
@@ -165,27 +157,37 @@ func doRequest(vm *sobek.Runtime, httpClient *http.Requester, method, urlStr, bo
 		sb.WriteString(body)
 	}
 
-	return doRawRequest(vm, httpClient, sb.String())
+	return doRawRequestTo(vm, httpClient, sb.String(), urlStr)
 }
 
 func doRawRequest(vm *sobek.Runtime, httpClient *http.Requester, rawReq string) sobek.Value {
+	return doRawRequestTo(vm, httpClient, rawReq, "")
+}
+
+// doRawRequestTo sends rawReq to targetURL's scheme/host/port when known, else
+// to the Host header (https for port 443). It used to connect over plain http
+// whatever the URL said.
+func doRawRequestTo(vm *sobek.Runtime, httpClient *http.Requester, rawReq, targetURL string) sobek.Value {
 	req := httpmsg.NewHttpRequest([]byte(rawReq))
 
-	// Infer service from Host header so the requester knows where to connect
-	if host := req.Header("Host"); host != "" {
-		svc, err := httpmsg.ParseService("http://" + host)
-		if err == nil {
-			req = httpmsg.NewHttpRequestWithService(svc, []byte(rawReq))
-		}
+	if svc := serviceForRequest(targetURL, req.Header("Host")); svc != nil {
+		req = httpmsg.NewHttpRequestWithService(svc, []byte(rawReq))
 	}
 
 	hrr := httpmsg.NewHttpRequestResponse(req, nil)
 
-	start := time.Now()
-	respChain, _, err := httpClient.Execute(hrr, http.Options{})
-	elapsedMs := time.Since(start).Milliseconds()
+	respChain, elapsed, err := httpClient.Execute(hrr, http.Options{})
+	// The requester's own measurement, which starts after rate/host admission —
+	// so elapsed_ms reports the target's latency rather than vigolium's queue.
+	elapsedMs := elapsed.Milliseconds()
 
 	if err != nil {
+		// An offline requester (ext eval without --allow-network) throws, so
+		// the extension and its author see why there is no response instead
+		// of a silent undefined.
+		if errors.Is(err, http.ErrNetworkDisabled) || errors.Is(err, http.ErrHostOutOfScope) {
+			panic(vm.NewGoError(err))
+		}
 		zap.L().Debug("JS HTTP request failed", zap.Error(err))
 		return sobek.Undefined()
 	}
@@ -195,7 +197,7 @@ func doRawRequest(vm *sobek.Runtime, httpClient *http.Requester, rawReq string) 
 	copy(rawResponseCopy, fullResp)
 	respChain.Close()
 
-	httpResp := httpmsg.NewHttpResponse(rawResponseCopy)
+	httpResp := httpmsg.NewHttpResponseWithDuration(rawResponseCopy, elapsed)
 
 	result := vm.NewObject()
 	_ = result.Set("status", httpResp.StatusCode())
@@ -203,12 +205,7 @@ func doRawRequest(vm *sobek.Runtime, httpClient *http.Requester, rawReq string) 
 	_ = result.Set("raw", string(rawResponseCopy))
 	_ = result.Set("elapsed_ms", elapsedMs)
 
-	// Parse response headers into JS object
-	headersObj := vm.NewObject()
-	for _, h := range httpResp.Headers() {
-		_ = headersObj.Set(strings.ToLower(h.Name), h.Value)
-	}
-	_ = result.Set("headers", headersObj)
+	_ = result.Set("headers", newHeadersObject(vm, httpResp.Headers()))
 
 	return result
 }
@@ -328,4 +325,27 @@ func extractHost(rawURL string) string {
 		return rawURL[:slashIdx]
 	}
 	return rawURL
+}
+
+// serviceForRequest is the connection target for an extension request: the
+// URL's scheme, host and port when targetURL is absolute, else the Host
+// header with https for port 443 and http otherwise.
+func serviceForRequest(targetURL, hostHeader string) *httpmsg.Service {
+	if u, err := url.Parse(targetURL); err == nil && u.Scheme != "" && u.Host != "" {
+		if svc, err := httpmsg.ParseService(u.Scheme + "://" + u.Host); err == nil {
+			return svc
+		}
+	}
+	if hostHeader == "" {
+		return nil
+	}
+	scheme := "http"
+	if _, port, err := net.SplitHostPort(hostHeader); err == nil && port == "443" {
+		scheme = "https"
+	}
+	svc, err := httpmsg.ParseService(scheme + "://" + hostHeader)
+	if err != nil {
+		return nil
+	}
+	return svc
 }

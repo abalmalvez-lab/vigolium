@@ -9,24 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Extracts the Next.js version from client-side JavaScript bundles and maps it to
-known security advisories. Checks for critical vulnerabilities including middleware
-auth bypass (CVE-2025-29927), SSRF via Server Actions (CVE-2024-34351), cache
-poisoning (CVE-2024-46982), and Server Actions DoS (CVE-2024-39693).
+	ModuleDesc = `**What it means:** A Next.js-qualified version marker exposed by the site falls inside a branch-specific affected interval from a reviewed advisory. Generic application "version" fields are ignored. Advisories with deployment or feature prerequisites are candidates until those prerequisites are confirmed.
 
-## Notes
-- Active per-host scanner - sends requests to /_next/static/ paths
-- Extracts version from JS bundle patterns (e.g., "Next.js <version>")
-- Falls back to __NEXT_DATA__ build metadata analysis
-- Maps extracted version against a local CVE advisory database
-- Deduplicates by host
+**How it's exploited:** An attacker reads the served bundle to confirm the version, then runs the matching public exploit - bypassing middleware authentication, forcing outbound requests, or taking the app offline.
 
-## References
-- https://github.com/vercel/next.js/security/advisories
-- https://cve.mitre.org/cgi-bin/cvekey.cgi?keyword=next.js`
+**Fix:** Upgrade Next.js to at or above the fixed version for the matched advisory.`
 
-	ModuleConfirmation = "Confirmed when Next.js version is extracted and matches a known vulnerable version range"
+	ModuleConfirmation = "Version match requires an explicitly Next.js-qualified marker and a reviewed branch-specific interval; prerequisite-dependent advisories remain candidates"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"nextjs", "javascript", "fingerprint", "light"}

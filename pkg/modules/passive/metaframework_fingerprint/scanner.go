@@ -175,7 +175,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 
 	// Dedup by host — only fingerprint once
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if diskSet != nil && diskSet.Contains(host) {
 		return nil, nil
 	}
 
@@ -215,7 +215,16 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		scanCtx.MarkTech(host, strings.ToLower(pat.framework))
 		scanCtx.MarkTech(host, "javascript")
 		scanCtx.MarkTech(host, "nodejs")
+		// These meta-frameworks all hydrate into a client-routed app; see the
+		// matching MarkTech in js_framework_fingerprint for why "spa" is a
+		// descriptive tag rather than a techTagCategories gate.
+		scanCtx.MarkTech(host, "spa")
 
+		// Claim the host only now that it matched: a host whose
+		// first response showed nothing stays open for later responses.
+		if diskSet != nil && !diskSet.ClaimOnMatch(host) {
+			return nil, nil
+		}
 		return []*output.ResultEvent{
 			{
 				ModuleID: ModuleID,

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -18,22 +17,38 @@ import (
 	nuclei "github.com/projectdiscovery/nuclei/v3/lib"
 	nucleiOutput "github.com/projectdiscovery/nuclei/v3/pkg/output"
 
+	"github.com/vigolium/vigolium/internal/paths"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/nucleitemplates"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 	"go.uber.org/zap"
 )
 
 // Config holds configuration for a known-issue scan.
+// Unattended defaults for the two pace knobs. Named rather than inline so the
+// value the phase actually opens at, the value documented on --rate-limit, and
+// the value reported in the scan.started event cannot drift apart.
+const (
+	defaultHostConcurrency = 10
+	defaultRateLimit       = 20
+)
+
 type Config struct {
-	Targets      []string      // scheme://host:port URLs to scan
-	Concurrency  int           // nuclei host concurrency (default: 5)
-	RateLimit    int           // requests/sec (default: 150)
-	Tags         []string      // template tags to include (empty = all)
-	ExcludeTags  []string      // template tags to exclude
-	Severities   []string      // filter by severity (empty = all)
-	TemplatesDir string        // custom templates directory
+	Targets      []string // scheme://host:port URLs to scan
+	Concurrency  int      // nuclei host concurrency (default: 5)
+	RateLimit    int      // requests/sec (default: 150)
+	Tags         []string // template tags to include (empty = all)
+	ExcludeTags  []string // template tags to exclude
+	Severities   []string // filter by severity (empty = all)
+	TemplatesDir string   // custom templates directory
+	// Offline forbids downloading missing templates (--offline).
+	Offline bool
+	// TemplatesPin is the nuclei-templates release (and archive digest) a
+	// missing templates directory is installed from.
+	TemplatesPin nucleitemplates.Pin
+	Templates    []string      // when set, the only template sources (see templateSources)
 	Timeout      time.Duration // max known-issue scan duration (default: 30m)
 	// RequestTimeout bounds a single nuclei request (default: 10s). It also caps
 	// how long an in-flight request can keep the abandoned scan goroutine alive
@@ -41,27 +56,63 @@ type Config struct {
 	RequestTimeout time.Duration
 	// Retries is the nuclei per-request retry count (default: 1). Fewer retries
 	// shrink the post-deadline drain tail.
-	Retries     int
-	Headers     []string                  // custom headers
-	ProxyURL    string                    // proxy URL
-	OnResult    func(*output.ResultEvent) // callback per finding
-	Repository  *database.Repository      // for saving findings
-	ScanUUID    string
-	ProjectUUID string
+	Retries int
+	Headers []string // custom headers
+	// SeverityOverrides remaps a finding's severity by nuclei template ID
+	// (matched case-insensitively). Applied to each match before OnResult and
+	// persistence, so output, severity counts, and the stored finding all agree.
+	SeverityOverrides map[string]string
+	ProxyURL          string                    // proxy URL
+	OnResult          func(*output.ResultEvent) // callback per finding
+	Repository        *database.Repository      // for saving findings
+	ScanUUID          string
+	ProjectUUID       string
+	// Edge connects this phase to the scan's shared pacing infrastructure. nuclei
+	// runs its own HTTP stack, so without these hooks known-issue-scan is the one
+	// active phase outside the per-host limiter and the WAF block notice. See
+	// edge.go for what each hook buys and why a transport port is not on offer.
+	Edge Edge
+
+	// PrefixTargets are directory-prefix URLs (scheme://host/dir) beyond the
+	// origins in Targets. They are scanned in a second pass that excludes the
+	// templates whose requests ignore the path (RootOnlyTemplateIDs): those
+	// already ran against the origin, and every prefix of a host would resend
+	// the identical request.
+	PrefixTargets []string
+
+	// Requests, when set, counts every request nuclei sends (via its progress
+	// hooks). The runner registers it with the request budget so nuclei's
+	// traffic counts toward --max-requests (soft enforcement: the scan stops
+	// once the watcher sees the limit passed).
+	Requests *atomic.Int64
+
+	// Duplicate, when set, reports whether a match repeats a finding the
+	// native modules already filed for this scan. Such a match is neither
+	// emitted nor stored; the callback may record the link.
+	Duplicate func(*output.ResultEvent) bool
 }
 
 // Run executes the known-issue scan using the nuclei Go library.
 func Run(ctx context.Context, cfg Config) error {
-	if len(cfg.Targets) == 0 {
+	if len(cfg.Targets) == 0 && len(cfg.PrefixTargets) == 0 {
 		return fmt.Errorf("knownissuescan: no targets provided")
 	}
 
-	// Apply defaults
+	// Apply defaults.
+	//
+	// These are the values that apply when the operator says NOTHING, and they
+	// are the phase's only protection in that case: nuclei does not pace itself,
+	// does not back off, and until the Edge hooks below could not report that it
+	// had been blocked. Opening an unknown target at 100 rps / 50 hosts because
+	// nobody passed a flag is the fail-open direction, so the unattended defaults
+	// are deliberately conservative. An operator who wants the old throughput
+	// asks for it (--rate-limit / --concurrency), which is a decision on the
+	// record rather than an accident of silence.
 	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 50
+		cfg.Concurrency = defaultHostConcurrency
 	}
 	if cfg.RateLimit <= 0 {
-		cfg.RateLimit = 100
+		cfg.RateLimit = defaultRateLimit
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Minute
@@ -74,9 +125,38 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	// Ensure nuclei templates are available before attempting to scan
-	if err := ensureTemplates(cfg.TemplatesDir); err != nil {
+	if err := EnsureTemplates(cfg, nil); err != nil {
 		return err
 	}
+
+	// Edge pre-flight: probe each target host through the SHARED requester before
+	// nuclei opens. Every other phase learns about a filtering edge this way; this
+	// is the seam that gives known-issue-scan the same knowledge. A host that is
+	// already blocking is dropped rather than scanned — pushing template traffic
+	// through a wall of challenge pages produces no findings and arms the rate
+	// limiter further.
+	allTargets := append(append([]string(nil), cfg.Targets...), cfg.PrefixTargets...)
+	if kept, blockedHosts := preflightHosts(ctx, allTargets, cfg.Edge.Probe); len(blockedHosts) > 0 {
+		zap.L().Warn("KnownIssueScan: skipping hosts whose edge is already filtering scan traffic",
+			zap.Strings("blocked_hosts", blockedHosts),
+			zap.Int("targets_before", len(allTargets)),
+			zap.Int("targets_after", len(kept)))
+		keep := make(map[string]struct{}, len(kept))
+		for _, t := range kept {
+			keep[t] = struct{}{}
+		}
+		cfg.Targets = filterKept(cfg.Targets, keep)
+		cfg.PrefixTargets = filterKept(cfg.PrefixTargets, keep)
+		allTargets = kept
+		if len(allTargets) == 0 {
+			return nil
+		}
+	}
+
+	// Narrow nuclei's own knobs to the per-host verdict the limiter has already
+	// reached, so a CDN-fronted host makes this phase open narrow from its first
+	// request instead of bursting the edge into a rate-based block.
+	cfg.Concurrency, cfg.RateLimit = pacedFor(allTargets, cfg.Edge.HostLimit, cfg.Concurrency, cfg.RateLimit)
 
 	// Create a properly initialized logger for nuclei to avoid nil pointer
 	// panics from the bare default logger in nuclei's DefaultOptions().
@@ -88,8 +168,7 @@ func Run(ctx context.Context, cfg Config) error {
 	scanLogger.SetMaxLevel(levels.LevelSilent)
 	gologger.DefaultLogger.SetMaxLevel(levels.LevelSilent)
 
-	// Build engine options
-	opts := buildEngineOptions(ctx, cfg, scanLogger)
+	passes := planPasses(cfg)
 
 	// Log the active severity filter (empty = all) so the narrowing is visible in
 	// both CLI and server logs, not only via the CLI-only console tip.
@@ -99,6 +178,8 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	zap.L().Info("Starting known-issue scan",
 		zap.Int("targets", len(cfg.Targets)),
+		zap.Int("prefix_targets", len(cfg.PrefixTargets)),
+		zap.Int("passes", len(passes)),
 		zap.Int("concurrency", cfg.Concurrency),
 		zap.Int("rate_limit", cfg.RateLimit),
 		zap.Strings("tags", cfg.Tags),
@@ -107,19 +188,16 @@ func Run(ctx context.Context, cfg Config) error {
 		zap.Duration("timeout", cfg.Timeout),
 	)
 
-	// Create nuclei engine with timeout context. NOTE: cancel() is deferred, but
-	// ne.Close() is NOT — its safety depends on the exit path (see below), so it
-	// is invoked explicitly per-path.
+	// One deadline for every pass. NOTE: cancel() is deferred, but ne.Close() is
+	// NOT — its safety depends on the exit path (see runPass), so it is invoked
+	// explicitly per-path.
 	scanCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 
-	ne, err := nuclei.NewNucleiEngineCtx(scanCtx, opts...)
-	if err != nil {
-		return fmt.Errorf("knownissuescan: failed to create nuclei engine: %w", err)
-	}
-
-	// Load targets
-	ne.LoadTargets(cfg.Targets, false)
+	// Normalize severity-override keys to lowercase once so per-finding lookups
+	// are a cheap case-insensitive map hit (nuclei template IDs are lowercase by
+	// convention, but operators may not type them that way in config).
+	severityOverrides := normalizeSeverityOverrides(cfg.SeverityOverrides)
 
 	// done flips once Run has moved past the deadline. The callback checks it (and
 	// scanCtx.Err()) so the abandoned nuclei goroutine stops emitting findings /
@@ -144,6 +222,16 @@ func Run(ctx context.Context, cfg Config) error {
 		result := convertResult(event)
 		result.ModuleType = database.ModuleTypeKnownIssueScan
 		result.FindingSource = database.FindingSourceKnownIssueScan
+		// Apply any operator-configured severity remap before OnResult and
+		// persistence so output, severity counts, and the stored finding agree.
+		if override, ok := severityOverrides[strings.ToLower(result.ModuleID)]; ok {
+			result.Info.Severity = override
+		}
+		// A template that re-finds what a native module already filed (the
+		// same CVE on the host, the same exposed file) is the same issue twice.
+		if cfg.Duplicate != nil && cfg.Duplicate(result) {
+			return
+		}
 		findingCount.Add(1)
 
 		// Invoke user callback
@@ -161,7 +249,7 @@ func Run(ctx context.Context, cfg Config) error {
 					httpmsg.NewHttpRequest([]byte(result.Request)),
 					httpmsg.NewHttpResponse([]byte(result.Response)),
 				)
-				recordUUID, recErr := cfg.Repository.SaveRecord(scanCtx, fuzzedRR, "spa", cfg.ProjectUUID)
+				recordUUID, recErr := cfg.Repository.SaveRecordWithLineage(scanCtx, fuzzedRR, database.RecordSourceFinding, cfg.ProjectUUID, database.RecordLineage{ScanUUID: cfg.ScanUUID})
 				if recErr != nil {
 					zap.L().Debug("KnownIssueScan: failed to save http record", zap.Error(recErr))
 				} else {
@@ -174,45 +262,103 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// nuclei's ExecuteCallbackWithCtx blocks on its internal in-flight drain even
-	// after scanCtx is cancelled (it does <-wait(&wg) on ctx.Done()). Run it in our
-	// own goroutine and enforce cfg.Timeout / parent-cancel as a HARD wall-clock
-	// bound: return at the deadline instead of waiting for the drain.
-	var scanErr error
-	deadlineErr := runScanWithDeadline(scanCtx,
-		func() error { return ne.ExecuteCallbackWithCtx(scanCtx, callback) },
-		// onComplete: scan returned within budget — its goroutine is gone, so
-		// Close() is safe inline here. The scan's own error is captured for
-		// classification below.
-		func(e error) { scanErr = e; ne.Close() },
-		// onAbandon: detached cleanup. Runs only after the abandoned scan goroutine
-		// finally drains, so Close() never races a live scan. May never run if a
-		// no-deadline protocol read hangs (inherent nuclei limit) — but that no
-		// longer blocks the caller.
-		func() { ne.Close() },
-	)
-
-	if deadlineErr != nil {
-		// Deadline (or parent cancel) fired before the scan finished. The phase
-		// caller classifies this as a curtailment via ctx.Err().
-		done.Store(true)
-		zap.L().Warn("Known-issue scan curtailed at deadline; nuclei resource cleanup deferred to background",
-			zap.Int64("findings", findingCount.Load()),
-			zap.Error(deadlineErr))
-		return deadlineErr
-	}
-	if scanErr != nil {
-		// A clean in-budget curtailment (nuclei drained before its own deadline
-		// returned) is a curtailment, not a failure — surface it as the ctx error.
-		if errors.Is(scanErr, context.Canceled) || errors.Is(scanErr, context.DeadlineExceeded) {
-			zap.L().Info("Known-issue scan stopped at deadline", zap.Int64("findings", findingCount.Load()))
-			return scanErr
+	sentinelStarted := false
+	for _, ps := range passes {
+		if scanCtx.Err() != nil {
+			break
 		}
-		return fmt.Errorf("knownissuescan: execution failed: %w", scanErr)
+		ne, err := nuclei.NewNucleiEngineCtx(scanCtx, buildEngineOptions(ctx, cfg, scanLogger, ps.excludeIDs)...)
+		if err != nil {
+			return fmt.Errorf("knownissuescan: failed to create nuclei engine: %w", err)
+		}
+		// Re-probe while the scan runs: a host that starts filtering mid-phase is
+		// the case the pre-flight cannot catch, and the one that silently hollows
+		// out the results. Each probe rides the shared requester, so the operator
+		// notice and the waf.block event fire exactly as they do in every other
+		// phase.
+		//
+		// Started AFTER the first engine exists: NewNucleiEngineCtx can sit behind
+		// a multi-minute first-run template clone, and a sentinel armed before it
+		// would spend that whole window probing a target nuclei has not touched.
+		if !sentinelStarted {
+			sentinelStarted = true
+			defer cfg.Edge.sentinel(scanCtx, allTargets, cancel)()
+		}
+		ne.LoadTargets(ps.targets, false)
+
+		var scanErr error
+		deadlineErr := runScanWithDeadline(scanCtx,
+			func() error { return ne.ExecuteCallbackWithCtx(scanCtx, callback) },
+			// onComplete: scan returned within budget — its goroutine is gone, so
+			// Close() is safe inline here.
+			func(e error) { scanErr = e; ne.Close() },
+			// onAbandon: detached cleanup. Runs only after the abandoned scan
+			// goroutine finally drains, so Close() never races a live scan.
+			func() { ne.Close() },
+		)
+
+		if deadlineErr != nil {
+			// Deadline (or parent cancel) fired before the scan finished. The phase
+			// caller classifies this as a curtailment via ctx.Err().
+			done.Store(true)
+			zap.L().Warn("Known-issue scan curtailed at deadline; nuclei resource cleanup deferred to background",
+				zap.Int64("findings", findingCount.Load()),
+				zap.Error(deadlineErr))
+			return deadlineErr
+		}
+		if scanErr != nil {
+			// A clean in-budget curtailment is a curtailment, not a failure —
+			// surface it as the ctx error.
+			if errors.Is(scanErr, context.Canceled) || errors.Is(scanErr, context.DeadlineExceeded) {
+				zap.L().Info("Known-issue scan stopped at deadline", zap.Int64("findings", findingCount.Load()))
+				return scanErr
+			}
+			return fmt.Errorf("knownissuescan: execution failed: %w", scanErr)
+		}
 	}
 
 	zap.L().Info("Known-issue scan completed", zap.Int64("findings", findingCount.Load()))
 	return nil
+}
+
+// scanPass is one nuclei engine run: a target list and the template IDs it
+// excludes on top of the configured filters.
+type scanPass struct {
+	targets    []string
+	excludeIDs []string
+}
+
+// planPasses splits the run: origins get every template; prefixes get only
+// the templates whose requests depend on the path. When nothing classifies as
+// origin-anchored (custom template list, unreadable dir), one pass over all
+// targets is the same work without a second engine load.
+func planPasses(cfg Config) []scanPass {
+	if len(cfg.PrefixTargets) == 0 {
+		return []scanPass{{targets: cfg.Targets}}
+	}
+	var rootOnly []string
+	if len(cfg.Templates) == 0 {
+		if dir, err := TemplatesDir(cfg.TemplatesDir); err == nil {
+			rootOnly, _ = RootOnlyTemplateIDs(dir)
+		}
+	}
+	if len(rootOnly) == 0 || len(cfg.Targets) == 0 {
+		return []scanPass{{targets: append(append([]string(nil), cfg.Targets...), cfg.PrefixTargets...)}}
+	}
+	return []scanPass{
+		{targets: cfg.Targets},
+		{targets: cfg.PrefixTargets, excludeIDs: rootOnly},
+	}
+}
+
+func filterKept(targets []string, keep map[string]struct{}) []string {
+	out := targets[:0:0]
+	for _, t := range targets {
+		if _, ok := keep[t]; ok {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // runScanWithDeadline runs scan() in a goroutine and returns as soon as either
@@ -229,13 +375,20 @@ func runScanWithDeadline(ctx context.Context, scan func() error, onComplete func
 		onComplete(err)
 		return nil
 	case <-ctx.Done():
-		go func() { <-scanErr; onAbandon() }()
+		go func() {
+			if err := <-scanErr; err != nil {
+				zap.L().Debug("KnownIssueScan: abandoned scan finished", zap.Error(err))
+			}
+			onAbandon()
+		}()
 		return ctx.Err()
 	}
 }
 
-// buildEngineOptions constructs nuclei SDK options from known-issue scan config.
-func buildEngineOptions(ctx context.Context, cfg Config, logger *gologger.Logger) []nuclei.NucleiSDKOptions {
+// buildEngineOptions constructs nuclei SDK options from known-issue scan config,
+// with extra template IDs excluded (the prefix pass drops origin-anchored
+// templates; nil for none).
+func buildEngineOptions(ctx context.Context, cfg Config, logger *gologger.Logger, excludeIDs []string) []nuclei.NucleiSDKOptions {
 	var opts []nuclei.NucleiSDKOptions
 
 	// Template filters
@@ -254,16 +407,17 @@ func buildEngineOptions(ctx context.Context, cfg Config, logger *gologger.Logger
 		// removes the leak at the source and speeds up the phase. http,
 		// headless, dns, ssl, websocket, etc. still run.
 		ExcludeProtocolTypes: "tcp,javascript",
+		ExcludeIDs:           excludeIDs,
 	}
 	if len(cfg.Severities) > 0 {
 		filters.Severity = strings.Join(cfg.Severities, ",")
 	}
 	opts = append(opts, nuclei.WithTemplateFilters(filters))
 
-	// Custom templates directory
-	if cfg.TemplatesDir != "" {
+	// Custom templates directory, or explicit template sources
+	if sources := templateSources(cfg.TemplatesDir, cfg.Templates); len(sources) > 0 {
 		opts = append(opts, nuclei.WithTemplatesOrWorkflows(nuclei.TemplateSources{
-			Templates: []string{cfg.TemplatesDir},
+			Templates: sources,
 		}))
 	}
 
@@ -322,6 +476,11 @@ func buildEngineOptions(ctx context.Context, cfg Config, logger *gologger.Logger
 	// from nuclei's bare default logger.
 	opts = append(opts, nuclei.WithLogger(logger))
 
+	// Count sent requests for the request budget.
+	if cfg.Requests != nil {
+		opts = append(opts, nuclei.UseStatsWriter(requestCounter{n: cfg.Requests}))
+	}
+
 	return opts
 }
 
@@ -366,40 +525,172 @@ func convertResult(nr *nucleiOutput.ResultEvent) *output.ResultEvent {
 	return result
 }
 
-// ensureTemplates checks that nuclei templates are available and attempts to
-// download them if missing. When Vigolium embeds nuclei as a library, the
-// automatic template download that the nuclei CLI performs does not run, so
-// fresh environments (Docker, VPS) may not have templates installed.
-func ensureTemplates(customDir string) error {
-	dir := customDir
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("knownissuescan: cannot determine home directory: %w", err)
+// templateSources resolves what nuclei loads: the explicit templates when
+// any are given (a relative entry that exists under dir is anchored there, so
+// `-t http/cves/x.yaml` works against a pinned templates directory), else the
+// templates directory itself. Empty means nuclei's own default directory.
+func templateSources(dir string, templates []string) []string {
+	if len(templates) == 0 {
+		if dir != "" {
+			return []string{dir}
 		}
-		dir = filepath.Join(home, "nuclei-templates")
+		return nil
+	}
+	out := make([]string, 0, len(templates))
+	for _, t := range templates {
+		if dir != "" && !filepath.IsAbs(t) {
+			if _, err := os.Stat(t); err != nil {
+				if _, err := os.Stat(filepath.Join(dir, t)); err == nil {
+					t = filepath.Join(dir, t)
+				}
+			}
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// Template setup states reported to a TemplatesProgress: started, then exactly
+// one finished or failed. Nothing is reported when the templates are present.
+const (
+	TemplatesStarted  = "started"
+	TemplatesFinished = "finished"
+	TemplatesFailed   = "failed"
+)
+
+// TemplatesProgress receives EnsureTemplates' progress. dir is the clone
+// target; err is set on TemplatesFailed.
+type TemplatesProgress func(state, dir string, err error)
+
+// installTemplates installs nuclei-templates from the (pinned) release archive
+// over HTTPS — no git. A variable so tests can exercise EnsureTemplates
+// without a network fetch.
+var installTemplates = func(ctx context.Context, dir string, pin nucleitemplates.Pin) ([]byte, error) {
+	if _, err := nucleitemplates.Install(ctx, dir, pin); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// TemplatesDir resolves the directory nuclei templates load from: customDir
+// when set, else ~/nuclei-templates.
+func TemplatesDir(customDir string) (string, error) {
+	if customDir != "" {
+		return customDir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("knownissuescan: cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, "nuclei-templates"), nil
+}
+
+// TemplatesPresent reports whether the templates directory exists. No network.
+func TemplatesPresent(customDir string) bool {
+	dir, err := TemplatesDir(customDir)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(dir)
+	return err == nil && info.IsDir()
+}
+
+// EnsureTemplates checks that the nuclei templates in cfg.TemplatesDir (or
+// ~/nuclei-templates) are available and installs cfg.TemplatesPin if missing,
+// unless cfg.Offline. Run calls it as its own guard; it is a no-op when the
+// scan runner already provisioned the templates before the phase. When Vigolium embeds nuclei as a library, the automatic template
+// download that the nuclei CLI performs does not run, so fresh environments
+// (Docker, VPS) may not have templates installed.
+//
+// onProgress may be nil, in which case the clone is announced with text lines
+// on stderr. With it, the caller renders the step (the scan runner turns it
+// into an ETA line and a scan.setup event) and the text is suppressed.
+func EnsureTemplates(cfg Config, onProgress TemplatesProgress) error {
+	dir, err := TemplatesDir(cfg.TemplatesDir)
+	if err != nil {
+		return err
 	}
 
 	if info, err := os.Stat(dir); err == nil && info.IsDir() {
 		return nil
 	}
+	if cfg.Offline {
+		return fmt.Errorf("knownissuescan: nuclei templates not found at %s and --offline forbids downloading them; "+
+			"provision them first (vigolium doctor --fix --only nuclei) or point --known-issue-scan-templates-dir at a copy", dir)
+	}
 
+	// A stateless (-S) scan writes nothing to $HOME, and a template clone is
+	// hundreds of MB of state: fail closed with the way out.
+	if paths.Stateless() {
+		failure := fmt.Errorf("knownissuescan: nuclei templates not installed at %s; a stateless (-S) scan does not download them — "+
+			"install first with `vigolium doctor --fix --only nuclei`, or point --known-issue-scan-templates-dir at a copy", dir)
+		if onProgress != nil {
+			onProgress(TemplatesFailed, dir, failure)
+		}
+		return failure
+	}
+
+	report := func(state string, err error) {
+		if onProgress != nil {
+			onProgress(state, dir, err)
+		}
+	}
+
+	// Announced, not only logged through zap.
+	//
+	// This is a network fetch of a multi-hundred-megabyte git repo into shared
+	// global state OUTSIDE the pinned database, triggered by the first
+	// known-issue-scan a machine ever runs. Logging it at Info level meant it was
+	// invisible without --verbose, so what the operator actually experienced was a
+	// scan that hung for minutes on its first run with no explanation. A clone
+	// that takes that long has to say so while it is happening.
+	if onProgress == nil {
+		fmt.Fprintf(os.Stderr, "%s nuclei templates not found at %s — cloning them now (one-time, several hundred MB; pin a directory with --known-issue-scan-templates-dir to skip)\n",
+			"[known-issue-scan]", dir)
+	}
+	report(TemplatesStarted, nil)
 	zap.L().Info("KnownIssueScan: nuclei templates not found, attempting to download",
 		zap.String("path", dir))
 
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1",
-		"https://github.com/projectdiscovery/nuclei-templates.git", dir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("knownissuescan: nuclei templates not found at %s and auto-download failed: %s\n"+
-			"Install manually: git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git %s",
-			dir, strings.TrimSpace(string(out)), dir)
+	if out, err := installTemplates(ctx, dir, cfg.TemplatesPin); err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		failure := fmt.Errorf("knownissuescan: nuclei templates not found at %s and auto-download failed: %s\n"+
+			"Install with: vigolium doctor --fix --only nuclei (or unpack %s into %s)",
+			dir, detail, nucleitemplates.ArchiveURL(cfg.TemplatesPin.Version), dir)
+		report(TemplatesFailed, failure)
+		return failure
 	}
 
+	if onProgress == nil {
+		fmt.Fprintf(os.Stderr, "%s nuclei templates ready at %s (took %s)\n",
+			"[known-issue-scan]", dir, time.Since(started).Round(time.Second))
+	}
+	report(TemplatesFinished, nil)
 	zap.L().Info("KnownIssueScan: nuclei templates downloaded successfully", zap.String("path", dir))
 	return nil
+}
+
+// normalizeSeverityOverrides parses the operator's template-ID→severity remap
+// once, lowercasing keys for case-insensitive matching and dropping entries whose
+// target severity is unparseable. Returns nil when there is nothing to apply.
+func normalizeSeverityOverrides(in map[string]string) map[string]severity.Severity {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]severity.Severity, len(in))
+	for tmpl, sev := range in {
+		if parsed := parseSeverity(sev); parsed != severity.Undefined {
+			out[strings.ToLower(strings.TrimSpace(tmpl))] = parsed
+		}
+	}
+	return out
 }
 
 // parseSeverity maps a nuclei severity string to vigolium severity.

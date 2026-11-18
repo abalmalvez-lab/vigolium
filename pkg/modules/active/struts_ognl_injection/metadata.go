@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Apache Struts OGNL injection vulnerabilities by injecting OGNL math expressions
-into the Content-Type header (CVE-2017-5638 style) and into request parameters. Uses safe
-arithmetic-based detection to confirm expression evaluation without executing commands.
+	ModuleDesc = `**What it means:** Apache Struts evaluates attacker-supplied OGNL expressions as code instead of inert data - the CVE-2017-5638 / S2-045 class, one of the most damaging bugs a Java web app can have.
 
-## Notes
-- Tests Content-Type header injection for CVE-2017-5638 variants
-- Tests parameter-level OGNL expression injection (${} and %{} syntax)
-- Uses math expressions (multiplication) to confirm evaluation
-- Deduplication via DiskSet (per-request) and RHM (per-insertion-point)
+**How it's exploited:** A benign OGNL math expression injected into the Content-Type header via %{...} syntax appears computed in the response, proving evaluation. An attacker swaps the math for OGNL invoking Java runtime methods, gaining remote command execution.
 
-## References
-- https://nvd.nist.gov/vuln/detail/CVE-2017-5638
-- https://cwiki.apache.org/confluence/display/WW/S2-045
-- https://owasp.org/www-community/vulnerabilities/Expression_Language_Injection`
+**Fix:** Upgrade Struts to a patched release, apply the S2-045 mitigations, and never pass user input into OGNL or the ValueStack.`
 
 	ModuleConfirmation = "Confirmed when injected OGNL math expression is evaluated and the computed result appears in the response body or headers"
 	ModuleSeverity     = severity.Critical

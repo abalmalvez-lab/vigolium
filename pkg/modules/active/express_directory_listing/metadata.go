@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for directory listing exposure in Express.js applications using serve-index
-or similar middleware. Directory listings reveal the full file inventory of static
-directories, potentially exposing sensitive files, backup archives, configuration
-files, and internal assets that should not be publicly accessible.
+	ModuleDesc = `**What it means:** A static directory returns an auto-generated file listing instead of a page or 404. This probes common paths like /public/, /uploads/, and /static/, flagging a 2xx body with listing markers from serve-index, Nginx autoindex, or Apache autoindex, exposing the full file inventory.
 
-## Notes
-- Runs once per host
-- Probes common static/upload directories: /public/, /uploads/, /static/, /assets/, /files/, /media/, /images/, /dist/
-- Detects serve-index, Nginx autoindex, and Apache autoindex markers
-- Fingerprints 404 to avoid false positives on custom error pages
+**How it's exploited:** An attacker browses the listing to enumerate every file, then downloads anything sensitive not meant to be public - backup archives, config files, source code, credentials, or unlinked uploaded content.
 
-## References
-- https://expressjs.com/en/resources/middleware/serve-index.html
-- https://www.npmjs.com/package/serve-index`
+**Fix:** Disable directory listing on static middleware (no serve-index, Nginx autoindex off, Apache Options -Indexes) and serve only intended files.`
 
 	ModuleConfirmation = "Confirmed when a directory path responds with directory listing indicators such as serve-index markers, autoindex output, or file listing HTML"
 	ModuleSeverity     = severity.Low

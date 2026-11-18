@@ -9,22 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests cloud storage endpoints for publicly readable sensitive directories and files.
-Probes common paths like /uploads/, /backups/, /data/, /logs/, /config/ and verifies
-real content is returned (not error pages).
+	ModuleDesc = `**What it means:** A credential-free client reached a non-wildcard cloud-storage path. Listings are observations, sensitive-looking names are candidates, and actual secret, private-key, or database-dump content is a finding.
 
-## Notes
-- Only runs on hosts identified as cloud storage endpoints
-- HEAD then GET common sensitive paths
-- Verifies responses contain real content (body length > 50, not error pages)
-- Runs once per host with deduplication
+**How it's exploited:** An attacker anonymously lists or downloads private objects. Public media buckets and successful status codes alone do not prove exposure.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/
-- https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-overview.html`
+**Fix:** Remove public-read policies and require authentication or signed URLs for non-public objects.`
 
-	ModuleConfirmation = "Confirmed when cloud storage endpoint returns real content for sensitive paths without authentication"
+	ModuleConfirmation = "Observation for anonymous listing, candidate for sensitive-looking names, finding only for credential/private-key/database-dump content"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"cloud", "info-disclosure", "sensitive-file", "moderate"}

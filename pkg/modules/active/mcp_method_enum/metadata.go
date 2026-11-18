@@ -9,27 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Sends a wordlist of plausible undocumented JSON-RPC method names against an
-MCP server (` + "`debug/*`" + `, ` + "`admin/*`" + `, ` + "`_internal/*`" + `, ` + "`system/*`" + `,
-` + "`sampling/*`" + `, ` + "`logging/*`" + `, ` + "`roots/*`" + `, etc.) and reports any that
-return a JSON-RPC ` + "`result`" + ` instead of a "method not found" error.
+	ModuleDesc = `**What it means:** This Model Context Protocol (MCP) server responds to undocumented JSON-RPC methods outside its published interface, such as debug, admin, and system operations that often sit outside the auth controls on documented endpoints.
 
-## Why this matters
-The MCP spec deliberately keeps the method namespace open-ended. Real-world
-servers ship developer/maintenance methods that bypass the documented auth
-gates around ` + "`tools/call`" + ` etc. Enumerating these is high-leverage recon.
+**How it's exploited:** After the initialize handshake, a wordlist of method names (debug/info, admin/users, system/exec) is sent, flagging any returning a result or rejected with an error other than -32601 method-not-found. An attacker uses this to probe for disclosure or privileged actions.
 
-## Detection
-A method is treated as exposed when the response is a JSON-RPC envelope with
-either a non-empty ` + "`result`" + ` or a server-side error code that is not the
-standard -32601 ("method not found").
+**Fix:** Remove or properly authenticate undocumented debug, admin, and internal methods, and return -32601 for any method not meant to be publicly callable.`
 
-## References
-- https://www.jsonrpc.org/specification
-- https://modelcontextprotocol.io/specification/2025-11-25`
-
-	ModuleConfirmation = "Confirmed when the server returns a JSON-RPC result for an undocumented method, or an error other than -32601"
+	ModuleConfirmation = "Candidate when a non-standard method returns a result distinct from a randomized unknown-method control; recognized-but-rejected methods are observations and no privileged impact is inferred"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"mcp", "enumeration", "info-disclosure", "moderate"}

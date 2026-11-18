@@ -5,14 +5,17 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"github.com/vigolium/vigolium/pkg/safety"
 	"math/big"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.uber.org/zap"
 
+	"github.com/vigolium/vigolium/pkg/scanevents"
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/browser"
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/config"
 )
@@ -48,14 +51,50 @@ type CandidateElementExtractor struct {
 	crawlFrames         bool     // Enable recursive frame extraction
 	frameIgnorePatterns []string // Patterns to ignore frames by name/id
 
+	// maxListenerProbeNodes caps the listener-bearing nodes the CDP pass turns
+	// into candidates per state (0 = default, negative = no cap).
+	maxListenerProbeNodes int
+
+	// crawlScope is the operator's URL boundary, consulted on an anchor's href
+	// BEFORE the element is offered as a click candidate. The crawler applies the
+	// same boundary when it decides whether to visit a state, but by then the
+	// browser has already navigated — an explicitly excluded path is a path the
+	// operator asked us not to request, so the anchor is dropped here instead.
+	// nil = no operator boundary (the host-only check below still applies).
+	crawlScope config.CrawlScope
+	// baseURL is what a relative href is resolved against before crawlScope sees
+	// it. Without it only absolute hrefs could be checked, and a root-relative
+	// "/logout" — the single most common thing an operator excludes — would slip
+	// through.
+	baseURL *url.URL
+
 	formHandler FormHandler
 
 	checkedElements ExtractorManager
 
-	// Internal clickOnce tracking (when no ExtractorManager is provided)
+	// Internal clickOnce tracking (when no ExtractorManager is provided).
+	// clickOnceMutex guards clickOnce and currentStateID, which belong to this
+	// extractor; clickOnceSeen is shared with every ForTab copy, so a state's
+	// elements are deduplicated across the crawl's tabs.
 	clickOnce      bool
-	clickOnceSeen  map[string]bool
+	clickOnceSeen  *clickOnceMemory
 	clickOnceMutex sync.RWMutex
+	// denyClick drops click candidates that read as destructive;
+	// nil disables. denyExtra is spidering.deny_click_extra, applied whatever
+	// denyClick is (widen-only). skippedDestructive counts the refusals and
+	// skipped samples them by name; both are shared by ForTab copies.
+	denyClick          *regexp.Regexp
+	denyExtra          *regexp.Regexp
+	skippedDestructive *atomic.Int64
+	skipped            *skippedControlLedger
+	// denyLogout drops logout controls even when the deny pattern is off.
+	denyLogout bool
+
+	// currentStateID namespaces clickOnce dedup by the state being extracted, so
+	// the SAME element location in a DIFFERENT state (a multi-step form / wizard
+	// reusing one "Next" button position across steps) is treated as new rather
+	// than globally suppressed. Set via SetCurrentState before each Extract.
+	currentStateID string
 }
 
 // NewCandidateElementExtractor creates a new CandidateElementExtractor.
@@ -86,8 +125,168 @@ func NewCandidateElementExtractor(cfg *config.Config) *CandidateElementExtractor
 		crawlFrames:         cfg.CrawlFrames,
 		frameIgnorePatterns: cfg.ExcludeFrames,
 		clickOnce:           cfg.ClickOnce,
-		clickOnceSeen:       make(map[string]bool),
+		clickOnceSeen:       newClickOnceMemory(),
+		crawlScope:          cfg.CrawlScope,
+		baseURL:             cfg.URL,
+
+		maxListenerProbeNodes: cfg.MaxListenerProbeNodes,
+		denyClick:             compileDenyClick("spidering.interaction.deny_click_pattern", cfg.DenyClickPattern),
+		denyExtra:             compileDenyClick("spidering.deny_click_extra", cfg.DenyClickExtra),
+		skippedDestructive:    &atomic.Int64{},
+		skipped:               &skippedControlLedger{},
+		// An authenticated crawl never clicks a logout control, whatever
+		// deny_click_pattern says.
+		denyLogout: len(cfg.ExtraHeaders) > 0 || len(cfg.InitialCookies) > 0 || cfg.AuthMonitor != nil,
 	}
+}
+
+// attrNameRe finds each " name=" boundary in the candidate's space-joined,
+// sorted "name=value" attribute string (GetAllAttributes).
+var attrNameRe = regexp.MustCompile(`(?:^| )([A-Za-z_:][-A-Za-z0-9_:.]*)=`)
+
+// denyAttrValues returns the aria-label, title and value attribute values
+// from a GetAllAttributes string; a value runs to the next " name=".
+func denyAttrValues(attrs string) []string {
+	if attrs == "" {
+		return nil
+	}
+	locs := attrNameRe.FindAllStringSubmatchIndex(attrs, -1)
+	var out []string
+	for i, loc := range locs {
+		switch attrs[loc[2]:loc[3]] {
+		case "aria-label", "title", "value":
+		default:
+			continue
+		}
+		end := len(attrs)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		out = append(out, attrs[loc[1]:end])
+	}
+	return out
+}
+
+// compileDenyClick compiles a deny-click pattern (the setting named key)
+// case-insensitively; empty or invalid disables it (an invalid operator
+// pattern is logged; config validation rejects one first).
+func compileDenyClick(key, pattern string) *regexp.Regexp {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return nil
+	}
+	re, err := regexp.Compile("(?i)" + pattern)
+	if err != nil {
+		zap.L().Warn("Invalid "+key+"; that part of the destructive-click guard is disabled",
+			zap.String("pattern", pattern), zap.Error(err))
+		return nil
+	}
+	return re
+}
+
+// DenyClickExtra is spidering.deny_click_extra as the click guard compiled it
+// (case-insensitive), nil when unset or invalid. The crawl's URL primers reuse
+// it, so the clicks and the primers treat one pattern — valid or not — the
+// same way.
+func (e *CandidateElementExtractor) DenyClickExtra() *regexp.Regexp {
+	if e == nil {
+		return nil
+	}
+	return e.denyExtra
+}
+
+// deniedByPattern reports whether a click candidate reads as destructive —
+// its text, href, aria-label, title or value matches the deny pattern, the
+// operator's extra terms, or (authenticated crawl) the logout pattern — and
+// records it: counted always, sampled by name while the sample has room.
+// pageURL is where the candidate was seen (resolved lazily, only for a
+// sampled refusal). Hover candidates only reveal menus and are exempt.
+func (e *CandidateElementExtractor) deniedByPattern(c *CandidateElement, pageURL func() string) bool {
+	if (e.denyClick == nil && e.denyExtra == nil && !e.denyLogout) || c == nil || c.EventType == EventTypeHover {
+		return false
+	}
+	fields := []string{c.Text, c.Href}
+	fields = append(fields, denyAttrValues(c.Attributes)...)
+	for _, f := range fields {
+		if f == "" {
+			continue
+		}
+		var reason, match string
+		if m, ok := firstMatch(e.denyClick, f); ok {
+			reason, match = "deny_click", m
+		} else if m, ok := firstMatch(e.denyExtra, f); ok {
+			reason, match = "deny_click_extra", m
+		} else if m, ok := firstMatch(e.logoutRe(), f); ok {
+			reason, match = "logout", m
+		} else {
+			continue
+		}
+		if e.skippedDestructive != nil {
+			e.skippedDestructive.Add(1)
+		}
+		if !e.skipped.full() {
+			sc := scanevents.SkippedControl{Label: controlLabel(c), Reason: reason, Match: strings.TrimSpace(match)}
+			if c.Identification != nil {
+				sc.Selector = c.Identification.Value
+			}
+			if pageURL != nil {
+				sc.URL = pageURL()
+			}
+			e.skipped.add(sc)
+		}
+		return true
+	}
+	return false
+}
+
+// firstMatch is re's leftmost match in s, with one FindStringIndex pass; ok is
+// false when re is nil or does not match.
+func firstMatch(re *regexp.Regexp, s string) (match string, ok bool) {
+	if re == nil {
+		return "", false
+	}
+	loc := re.FindStringIndex(s)
+	if loc == nil {
+		return "", false
+	}
+	return s[loc[0]:loc[1]], true
+}
+
+// logoutRe is the logout guard's pattern when the guard is on, else nil.
+func (e *CandidateElementExtractor) logoutRe() *regexp.Regexp {
+	if !e.denyLogout {
+		return nil
+	}
+	return safety.LogoutRe
+}
+
+// pageURLOf resolves page's URL at most once, on first call: a refusal that
+// is only counted never pays the CDP round trip.
+func pageURLOf(page *browser.Page) func() string {
+	return sync.OnceValue(func() string {
+		if page == nil {
+			return ""
+		}
+		u, _ := page.URL()
+		return u
+	})
+}
+
+// SkippedControls is the bounded sample of refused click candidates (at most
+// scanevents.MaxSkippedControlSample, deduplicated).
+func (e *CandidateElementExtractor) SkippedControls() []scanevents.SkippedControl {
+	if e == nil {
+		return nil
+	}
+	return e.skipped.snapshot()
+}
+
+// SkippedDestructive is how many click candidates the deny pattern dropped.
+func (e *CandidateElementExtractor) SkippedDestructive() int64 {
+	if e == nil || e.skippedDestructive == nil {
+		return 0
+	}
+	return e.skippedDestructive.Load()
 }
 
 // NewCandidateElementExtractorDefault creates an extractor with default settings.
@@ -103,7 +302,7 @@ func NewCandidateElementExtractorDefault() *CandidateElementExtractor {
 		crawlFrames:         true,
 		frameIgnorePatterns: []string{},
 		clickOnce:           false, // Default: allow same element from different states
-		clickOnceSeen:       make(map[string]bool),
+		clickOnceSeen:       newClickOnceMemory(),
 	}
 }
 
@@ -112,31 +311,134 @@ func (e *CandidateElementExtractor) SetFollowExternalLinks(follow bool) {
 	e.followExternalLinks = follow
 }
 
-// SetClickOnce enables or disables global element deduplication.
-// across all states during the entire crawl.
+// SetClickOnce enables or disables element deduplication.
 func (e *CandidateElementExtractor) SetClickOnce(enabled bool) {
 	e.clickOnceMutex.Lock()
 	defer e.clickOnceMutex.Unlock()
 	e.clickOnce = enabled
 }
 
+// SetCurrentState sets the state ID that subsequent extractions belong to, so
+// clickOnce dedup is scoped per-state. Passing "" restores un-namespaced dedup.
+// The single-threaded crawler sets this before each Extract from its own
+// goroutine; the lock keeps it race-clean.
+func (e *CandidateElementExtractor) SetCurrentState(stateID string) {
+	e.clickOnceMutex.Lock()
+	defer e.clickOnceMutex.Unlock()
+	e.currentStateID = stateID
+}
+
 // markChecked checks if an element was already extracted and marks it as checked.
 // Returns true if the element is NEW (should be extracted), false if already seen.
 func (e *CandidateElementExtractor) markChecked(candidate *CandidateElement) bool {
-	if !e.clickOnce {
+	e.clickOnceMutex.RLock()
+	clickOnce, stateID := e.clickOnce, e.currentStateID
+	e.clickOnceMutex.RUnlock()
+	if !clickOnce {
 		return true // Always extract when clickOnce is disabled
 	}
 
-	e.clickOnceMutex.Lock()
-	defer e.clickOnceMutex.Unlock()
-
-	// Use GetUniqueString for state-independent element identification
-	uniqueString := candidate.GetUniqueString()
-	if e.clickOnceSeen[uniqueString] {
-		return false // Already extracted
+	// Namespace the element key by the current state so the same element location
+	// in a different state (a wizard/multi-step form reusing one "Next" button
+	// position) is NOT globally suppressed — the old key was state-independent,
+	// which silently dropped later steps of such flows. EventType is included so a
+	// hover-menu action and a click action on the SAME element coexist (a nav
+	// trigger that both clicks through and opens a submenu on hover).
+	key := stateID + "\x00" + string(candidate.EventType) + "\x00" + candidate.GetUniqueString()
+	// A navigable link goes to the same URL whatever state shows it, so it is
+	// clicked once per crawl, keyed by its resolved href without the state:
+	// a 60-link navigation bar used to be re-fired from every state.
+	if href := e.navigableHrefKey(candidate); href != "" {
+		key = "href\x00" + href
 	}
-	e.clickOnceSeen[uniqueString] = true
-	return true // New element
+	return e.clickOnceSeen.claim(key)
+}
+
+// navigableHrefKey is the resolved absolute URL of a navigable anchor (an <a>
+// whose href is absolute or root-relative, not a fragment, javascript: or
+// mailto/tel link) for state-independent click-once, or "".
+func (e *CandidateElementExtractor) navigableHrefKey(c *CandidateElement) string {
+	if c == nil || c.EventType != EventTypeClick || c.TagName != "a" {
+		return ""
+	}
+	href := strings.TrimSpace(c.Href)
+	if href == "" || strings.HasPrefix(href, "#") {
+		return ""
+	}
+	lower := strings.ToLower(href)
+	for _, p := range []string{"javascript:", "mailto:", "tel:", "data:"} {
+		if strings.HasPrefix(lower, p) {
+			return ""
+		}
+	}
+	u, err := url.Parse(href)
+	if err != nil {
+		return ""
+	}
+	switch {
+	case u.IsAbs():
+	case strings.HasPrefix(href, "/") && e.baseURL != nil:
+		u = e.baseURL.ResolveReference(u)
+	default:
+		return "" // path-relative: its target depends on the page
+	}
+	u.Fragment = ""
+	return u.String()
+}
+
+// clickOnceMemory is the crawl-wide set of extracted element keys. Shared by
+// an extractor and its ForTab copies.
+type clickOnceMemory struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func newClickOnceMemory() *clickOnceMemory {
+	return &clickOnceMemory{seen: make(map[string]bool)}
+}
+
+// claim records key and reports whether it was new.
+func (m *clickOnceMemory) claim(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.seen[key] {
+		return false
+	}
+	m.seen[key] = true
+	return true
+}
+
+// ForTab returns an extractor for another crawl tab: the same configuration,
+// form handler and crawl-wide clickOnce memory, but its own current-state
+// namespace. SetCurrentState followed by Extract is two calls, so tabs that
+// shared one extractor could extract one state's elements under another's
+// namespace.
+func (e *CandidateElementExtractor) ForTab() *CandidateElementExtractor {
+	e.clickOnceMutex.RLock()
+	defer e.clickOnceMutex.RUnlock()
+	return &CandidateElementExtractor{
+		clickSelectors:        e.clickSelectors,
+		excludeSelectors:      e.excludeSelectors,
+		useCDP:                e.useCDP,
+		followExternalLinks:   e.followExternalLinks,
+		siteHost:              e.siteHost,
+		crawlConditions:       e.crawlConditions,
+		randomizeElements:     e.randomizeElements,
+		crawlFrames:           e.crawlFrames,
+		frameIgnorePatterns:   e.frameIgnorePatterns,
+		maxListenerProbeNodes: e.maxListenerProbeNodes,
+		crawlScope:            e.crawlScope,
+		baseURL:               e.baseURL,
+		formHandler:           e.formHandler,
+		checkedElements:       e.checkedElements,
+		clickOnce:             e.clickOnce,
+		clickOnceSeen:         e.clickOnceSeen,
+		denyClick:             e.denyClick,
+		denyExtra:             e.denyExtra,
+		skippedDestructive:    e.skippedDestructive,
+		skipped:               e.skipped,
+		denyLogout:            e.denyLogout,
+	}
 }
 
 // SetSiteHost sets the site host for external link detection.
@@ -205,18 +507,55 @@ func (e *CandidateElementExtractor) extractFromPageAndFrames(ctx context.Context
 func (e *CandidateElementExtractor) extractFromPage(page *browser.Page, seen map[string]bool, framePath string) []*CandidateElement {
 	candidates := make([]*CandidateElement, 0)
 
+	// One pierced DOM snapshot per page per extraction: it lists the closed
+	// shadow roots the selector pass must query (script cannot see them) and,
+	// with CDP detection on, every element carrying a click listener — light
+	// DOM, open and closed shadow roots alike — from a single CDP call. A
+	// failure leaves snap nil and both passes fall back to their script-only
+	// paths.
+	snap, err := page.PierceDOM(e.useCDP, e.maxListenerProbeNodes)
+	if err != nil {
+		zap.L().Debug("Pierced DOM snapshot failed; using script-only extraction",
+			zap.String("frame", framePath), zap.Error(err))
+		snap = nil
+	} else if snap.ListenerNodesDropped > 0 {
+		zap.L().Debug("CDP listener pass hit its node cap",
+			zap.String("frame", framePath),
+			zap.Int("kept", len(snap.ClickListeners)),
+			zap.Int("dropped", snap.ListenerNodesDropped))
+	}
+
 	// Method 1: CSS Selector matching
 	// Pass framePath so ClickOnce deduplication works correctly across frames
-	selectorCandidates, err := e.extractBySelectors(page, seen, framePath)
+	selectorCandidates, err := e.extractBySelectors(page, snap, seen, framePath)
 	if err == nil {
 		candidates = append(candidates, selectorCandidates...)
 	}
 
 	// Method 2: CDP Event Listener Detection
 	if e.useCDP {
-		cdpCandidates, err := e.extractByCDP(page, seen, framePath)
+		cdpCandidates, err := e.extractByCDP(page, snap, seen, framePath)
 		if err == nil {
 			candidates = append(candidates, cdpCandidates...)
+		}
+
+		// Method 3: Semantic / delegated-event detection. React/Vue attach one
+		// click listener to the document/root, so per-element getEventListeners
+		// (Method 2) sees nothing and a clickable <div>/<span> is missed by the CSS
+		// selectors too. This shares `seen`, so it only adds what the earlier
+		// passes didn't already surface.
+		semCandidates, err := e.extractBySemantic(page, seen, framePath)
+		if err == nil {
+			candidates = append(candidates, semCandidates...)
+		}
+
+		// Method 4: Hover-menu triggers whose submenu opens on CSS :hover — the
+		// click passes can't reach them (clicking a hover-only trigger does
+		// nothing), so their whole submenu of links would be missed. Narrowly
+		// targeted and capped in JS so it adds only a handful of hover actions.
+		hoverCandidates, err := e.extractHoverMenus(page, seen, framePath)
+		if err == nil {
+			candidates = append(candidates, hoverCandidates...)
 		}
 	}
 
@@ -252,12 +591,31 @@ func (e *CandidateElementExtractor) extractFromFrames(ctx context.Context, page 
 			continue
 		}
 
-		// Recursively extract from this frame
-		frameCandidates := e.extractFromPageAndFrames(ctx, fi.Page, seen, framePath)
+		// Recursively extract from this frame, guarded against go-rod panicking
+		// on a frame that went cross-origin/detached mid-crawl (nil
+		// ContentDocument in getJSCtxID). The browser wrappers already convert
+		// these to errors, but this is a per-frame backstop so a single bad
+		// frame can never abort the whole crawl.
+		frameCandidates := e.safeExtractFrame(ctx, fi.Page, seen, framePath)
 		candidates = append(candidates, frameCandidates...)
 	}
 
 	return candidates
+}
+
+// safeExtractFrame wraps frame extraction in a panic recovery so a go-rod nil
+// dereference on a cross-origin/detached frame is contained to that frame
+// instead of crashing the entire scan.
+func (e *CandidateElementExtractor) safeExtractFrame(ctx context.Context, page *browser.Page, seen map[string]bool, framePath string) (candidates []*CandidateElement) {
+	defer func() {
+		if r := recover(); r != nil {
+			zap.L().Debug("Recovered from panic during frame extraction (cross-origin/detached frame)",
+				zap.String("frame_path", framePath),
+				zap.Any("panic", r))
+			candidates = nil
+		}
+	}()
+	return e.extractFromPageAndFrames(ctx, page, seen, framePath)
 }
 
 // shouldIgnoreFrame checks if a frame should be ignored based on patterns.
@@ -303,7 +661,8 @@ func shuffleCandidates(candidates []*CandidateElement) {
 }
 
 // extractBySelectors extracts candidate elements using CSS selectors.
-func (e *CandidateElementExtractor) extractBySelectors(page *browser.Page, seen map[string]bool, framePath string) ([]*CandidateElement, error) {
+func (e *CandidateElementExtractor) extractBySelectors(page *browser.Page, snap *browser.PierceSnapshot, seen map[string]bool, framePath string) ([]*CandidateElement, error) {
+	pageURL := pageURLOf(page)
 	candidates := make([]*CandidateElement, 0)
 
 	for _, selector := range e.clickSelectors {
@@ -344,7 +703,10 @@ func (e *CandidateElementExtractor) extractBySelectors(page *browser.Page, seen 
 				href = h
 			}
 
-			candidate := e.createCandidateElement(elem, xpath, framePath, href)
+			candidate := e.createCandidateElement(elem, xpath, framePath, href, EventTypeClick)
+			if e.deniedByPattern(candidate, pageURL) {
+				continue
+			}
 
 			if e.markChecked(candidate) {
 				candidates = append(candidates, candidate)
@@ -356,16 +718,131 @@ func (e *CandidateElementExtractor) extractBySelectors(page *browser.Page, seen 
 		}
 	}
 
+	// Shadow-DOM pass: web-component apps render their clickables inside shadow
+	// roots, which the light-DOM page.Elements above cannot see. Run it ONCE with
+	// all click selectors combined: one script walk over the open shadow trees
+	// (and frames hosted inside them) plus one query per closed root from the
+	// pierced snapshot. Each match is identified by its Locator — the host
+	// chain plus the XPath under the last root — because an XPath cannot cross
+	// a shadow boundary, and a structural locator stays the same across reloads
+	// where a query-order data-vgo-uid tag does not.
+	shadowElems, err := page.PiercingElements(strings.Join(e.clickSelectors, ","), snap)
+	if err != nil {
+		return candidates, nil
+	}
+	for _, elem := range shadowElems {
+		if e.isExcluded(elem) {
+			continue
+		}
+		loc, lerr := elem.Locator()
+		if lerr != nil || loc.IsLight() {
+			continue
+		}
+		idValue := loc.String()
+
+		seenKey := framePath + ":" + idValue
+		if seen[seenKey] {
+			continue
+		}
+		seen[seenKey] = true
+
+		href := ""
+		if h, _ := elem.Attribute("href"); h != "" && h != "<nil>" {
+			if e.shouldSkipHref(h) {
+				continue
+			}
+			href = h
+		}
+
+		candidate := e.createCandidateElement(elem, idValue, framePath, href, EventTypeClick)
+		candidate.Identification = NewIdentification(HowLocator, idValue)
+		if e.deniedByPattern(candidate, pageURL) {
+			continue
+		}
+
+		if e.markChecked(candidate) {
+			candidates = append(candidates, candidate)
+			if e.checkedElements != nil {
+				e.checkedElements.IncreaseElementsCounter()
+			}
+		}
+	}
+
 	return candidates, nil
 }
 
 // extractByCDP extracts candidate elements using Chrome DevTools Protocol.
-func (e *CandidateElementExtractor) extractByCDP(page *browser.Page, seen map[string]bool, framePath string) ([]*CandidateElement, error) {
-	results, err := DetectClickablesCDP(page)
+//
+// With a pierced snapshot whose listener probe succeeded, the candidates are the
+// snapshot's click-listener elements (light DOM and every shadow root, closed
+// ones included). Without one it falls back to the script-based light-DOM pass.
+func (e *CandidateElementExtractor) extractByCDP(page *browser.Page, snap *browser.PierceSnapshot, seen map[string]bool, framePath string) ([]*CandidateElement, error) {
+	var results []ClickableResult
+	if snap != nil && snap.ListenersProbed {
+		results = DetectClickablesPierced(page, snap)
+	} else {
+		var err error
+		results, err = DetectClickablesCDP(page)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return e.buildCandidatesFromResults(page, results, seen, framePath, EventTypeClick), nil
+}
+
+// delegatedClickableReasons are the semantic-detector reasons worth adding on top
+// of the CSS-selector + CDP passes: framework-delegated affordances that a single
+// document/root listener (React/Vue) hides from per-element getEventListeners.
+// Native a/button/input reasons are intentionally excluded — the CSS-selector pass
+// already covers those, so re-adding them would only duplicate work and add noise.
+var delegatedClickableReasons = map[string]bool{
+	"cursor":      true, // cursor:pointer on a non-native element (clickable card/div)
+	"tabindex":    true, // focusable custom control
+	"handler":     true, // ng-click / @click / data-click attribute
+	"role-button": true, // ARIA button role
+}
+
+// extractBySemantic catches delegated-event clickables — elements a framework
+// (React/Vue) wires through one listener on the document/root, so per-element CDP
+// getEventListeners sees nothing and the CSS-selector pass misses them because
+// they are plain <div>/<span>. It uses semantic affordances as the proxy and
+// shares the `seen` map, so it only contributes elements the earlier passes did
+// not already surface.
+func (e *CandidateElementExtractor) extractBySemantic(page *browser.Page, seen map[string]bool, framePath string) ([]*CandidateElement, error) {
+	results, err := DetectClickablesSimple(page)
 	if err != nil {
 		return nil, err
 	}
+	filtered := results[:0]
+	for _, r := range results {
+		if delegatedClickableReasons[r.Reason] {
+			filtered = append(filtered, r)
+		}
+	}
+	return e.buildCandidatesFromResults(page, filtered, seen, framePath, EventTypeClick), nil
+}
 
+// extractHoverMenus generates HOVER actions for high-precision menu-hover
+// affordances — nav triggers whose submenu opens on CSS :hover (aria-haspopup,
+// role=menu, Bootstrap dropdown toggles, or an element directly wrapping a hidden
+// nested menu). Clicking these often does nothing (the menu is hover-only), so the
+// click passes miss the whole submenu and every link inside it. Kept deliberately
+// narrow (explicit affordances + a hidden-nested-menu heuristic, capped in JS) so
+// it adds a handful of actions per page, not a hover for every element.
+func (e *CandidateElementExtractor) extractHoverMenus(page *browser.Page, seen map[string]bool, framePath string) ([]*CandidateElement, error) {
+	results, err := DetectHoverMenus(page)
+	if err != nil {
+		return nil, err
+	}
+	return e.buildCandidatesFromResults(page, results, seen, framePath, EventTypeHover), nil
+}
+
+// buildCandidatesFromResults resolves each detected ClickableResult to a live
+// element, applies per-extraction dedup / exclusion / href filtering, and builds
+// CandidateElements with the given event type. Shared by the CDP-listener,
+// semantic/delegated, and hover-menu passes.
+func (e *CandidateElementExtractor) buildCandidatesFromResults(page *browser.Page, results []ClickableResult, seen map[string]bool, framePath string, eventType EventType) []*CandidateElement {
+	pageURL := pageURLOf(page)
 	candidates := make([]*CandidateElement, 0)
 
 	for _, result := range results {
@@ -378,11 +855,15 @@ func (e *CandidateElementExtractor) extractByCDP(page *browser.Page, seen map[st
 			continue
 		}
 
-		// Try to get element
+		// Try to get element. A node from the pierced snapshot resolves by its
+		// backend id in one CDP call (and is the only way into a closed root).
 		var elem *browser.Element
-		if result.XPath != "" {
+		switch {
+		case result.BackendNodeID != 0:
+			elem, _ = page.ElementByBackendNodeID(result.BackendNodeID)
+		case result.XPath != "":
 			elem, _ = page.ElementX(result.XPath)
-		} else if result.Selector != "" {
+		case result.Selector != "":
 			elem, _ = page.Element(result.Selector)
 		}
 
@@ -390,14 +871,33 @@ func (e *CandidateElementExtractor) extractByCDP(page *browser.Page, seen map[st
 			continue
 		}
 
-		// Get XPath for identification
-		xpath, err := elem.GetXPath()
-		if err != nil || xpath == "" {
-			xpath = selector
+		// Identification: the snapshot's locator for an element behind a shadow
+		// or frame hop, else the light-DOM XPath (the snapshot computes it with
+		// the same rule as GetXPath, so it skips that round trip).
+		how := HowXPath
+		xpath := ""
+		switch {
+		case result.Locator != nil && !result.Locator.IsLight():
+			how = HowLocator
+			xpath = result.Locator.String()
+		case result.BackendNodeID != 0 && result.XPath != "":
+			xpath = result.XPath
+		default:
+			var err error
+			xpath, err = elem.GetXPath()
+			if err != nil || xpath == "" {
+				xpath = selector
+			}
 		}
 
-		// Deduplicate using shared seen map (per-extraction dedup)
+		// Deduplicate using shared seen map (per-extraction dedup). Click keeps the
+		// bare "frame:xpath" key so it stays consistent with the CSS-selector pass
+		// (cross-method dedup); a non-click pass (hover) is namespaced so a hover
+		// action and a click action on the same element are not collapsed into one.
 		seenKey := framePath + ":" + xpath
+		if eventType != EventTypeClick {
+			seenKey = string(eventType) + ":" + seenKey
+		}
 		if seen[seenKey] {
 			continue
 		}
@@ -419,7 +919,13 @@ func (e *CandidateElementExtractor) extractByCDP(page *browser.Page, seen map[st
 		seen[seenKey] = true
 
 		// Create CandidateElement
-		candidate := e.createCandidateElement(elem, xpath, framePath, href)
+		candidate := e.createCandidateElement(elem, xpath, framePath, href, eventType)
+		if how != HowXPath {
+			candidate.Identification = NewIdentification(how, xpath)
+		}
+		if e.deniedByPattern(candidate, pageURL) {
+			continue
+		}
 
 		if e.markChecked(candidate) {
 			candidates = append(candidates, candidate)
@@ -429,16 +935,18 @@ func (e *CandidateElementExtractor) extractByCDP(page *browser.Page, seen map[st
 		}
 	}
 
-	return candidates, nil
+	return candidates
 }
 
-// createCandidateElement creates a CandidateElement from a browser element.
-func (e *CandidateElementExtractor) createCandidateElement(elem *browser.Element, xpath string, framePath string, href string) *CandidateElement {
+// createCandidateElement creates a CandidateElement from a browser element with
+// the given event type (click for the selector/CDP/semantic passes, hover for the
+// hover-menu pass).
+func (e *CandidateElementExtractor) createCandidateElement(elem *browser.Element, xpath string, framePath string, href string, eventType EventType) *CandidateElement {
 	candidate := &CandidateElement{
 		Identification: NewIdentification(HowXPath, xpath),
 		RelatedFrame:   framePath,
 		FormInputs:     make([]*FormInput, 0),
-		EventType:      EventTypeClick, // Default event type
+		EventType:      eventType,
 	}
 
 	// Get tag name
@@ -466,6 +974,14 @@ func (e *CandidateElementExtractor) createCandidateElement(elem *browser.Element
 // isExcluded checks if an element or any of its parents matches exclusion selectors.
 // CRITICAL FIX: Implements recursive parent exclusion checking.
 func (e *CandidateElementExtractor) isExcluded(elem *browser.Element) bool {
+	// Nothing to match against — skip entirely. Without this guard the ancestor
+	// walk below still paid an elem.Parent() CDP round-trip per ancestor, all the
+	// way to the root, for every extracted element even though the default crawl
+	// configures no exclusion selectors at all.
+	if len(e.excludeSelectors) == 0 {
+		return false
+	}
+
 	// Check current element
 	for _, excludeSelector := range e.excludeSelectors {
 		if elem.Matches(excludeSelector) {
@@ -513,8 +1029,53 @@ func (e *CandidateElementExtractor) shouldSkipHref(href string) bool {
 		}
 	}
 
+	// Operator scope boundary, on the href itself.
+	if e.outOfCrawlScope(href) {
+		return true
+	}
+
 	// Elements with these hrefs often have onclick handlers that cause state changes
 	return false
+}
+
+// outOfCrawlScope reports whether href resolves to a URL the operator's scope
+// rejects.
+//
+// Only absolute and root-relative hrefs are judged. A PATH-relative href
+// ("admin/users") is left alone: resolving it needs the document's real base,
+// which a <base> tag or a History API push can have moved away from the config's
+// start URL, and a wrong resolution here would drop a legitimate link rather than
+// merely let an extra one through. Anything not judged still meets the crawler's
+// own scope check before it is visited — this pass exists to avoid the navigation,
+// not to replace that check.
+//
+// Un-parseable hrefs are allowed through for the same reason: the other skip rules
+// above and the crawler's check downstream are the authority on those.
+func (e *CandidateElementExtractor) outOfCrawlScope(href string) bool {
+	if e.crawlScope == nil {
+		return false
+	}
+	trimmed := strings.TrimSpace(href)
+	absolute := strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") ||
+		strings.HasPrefix(trimmed, "//")
+	rootRelative := strings.HasPrefix(trimmed, "/") && !strings.HasPrefix(trimmed, "//")
+	if !absolute && !rootRelative {
+		return false
+	}
+
+	ref, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	resolved := ref
+	if e.baseURL != nil {
+		resolved = e.baseURL.ResolveReference(ref)
+	}
+	// A scheme-relative href with no base has no host to judge.
+	if resolved.Host == "" {
+		return false
+	}
+	return !e.crawlScope(resolved.String())
 }
 
 // isExternalLink checks if a href points to an external site.

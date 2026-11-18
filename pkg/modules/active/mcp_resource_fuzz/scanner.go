@@ -10,6 +10,8 @@ import (
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	mcpinfra "github.com/vigolium/vigolium/pkg/modules/infra/mcp"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/modules/shared/filesig"
+	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
@@ -19,15 +21,18 @@ const (
 	maxTemplates = 6
 )
 
-var lfiMarkers = []string{"root:x:", ":0:0:", "/bin/", "[fonts]", "[extensions]"}
-
 type uriPayload struct {
-	value         string
-	vulnTag       string
-	name          string
-	severity      severity.Severity
-	expectMarkers []string
-	oast          bool
+	value    string
+	vulnTag  string
+	name     string
+	severity severity.Severity
+	// confirm structurally validates that the read leaked the targeted file's
+	// real content (see filesig). It replaces the former bare-word marker list
+	// (`root:x:`, `:0:0:`, `/bin/`) that fired on a single substring match — e.g.
+	// a tool error mentioning `/bin/sh` or a reflected payload — rather than on
+	// actual file content.
+	confirm filesig.ConfirmFunc
+	oast    bool
 }
 
 type Module struct {
@@ -71,8 +76,7 @@ func (m *Module) ScanPerHost(
 	if ctx.Service() == nil {
 		return nil, nil
 	}
-	host := ctx.Service().Host()
-	if ds := m.ds.Get(scanCtx.DedupMgr()); ds != nil && ds.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -114,13 +118,16 @@ func (m *Module) ScanPerHost(
 			continue
 		}
 		if p.oast {
-			// OAST hits are tracked out-of-band; nothing to do here besides log
-			// the attempt as evidence for the operator.
-			findings = append(findings, m.makeFinding(urlx.String(), "(bare uri)", p, "request issued; check OAST log"))
+			// The read has been issued with the OAST callback URI. A genuine SSRF
+			// is confirmed out-of-band by the global OAST poller, which emits its
+			// own finding once a callback lands. Emitting one here — before any
+			// callback — would be an unconfirmed false positive.
 			continue
 		}
-		if matched := matchMarkers(body, "", p.expectMarkers); matched > 0 {
-			findings = append(findings, m.makeFinding(urlx.String(), p.value, p, fmt.Sprintf("%d marker(s) matched", matched)))
+		if p.confirm != nil {
+			if ok, n := p.confirm(body, ""); ok {
+				findings = append(findings, m.makeFinding(urlx.String(), p.value, p, fmt.Sprintf("%d content marker(s) confirmed", n)))
+			}
 		}
 	}
 
@@ -135,6 +142,14 @@ func (m *Module) ScanPerHost(
 		if len(placeholders) == 0 {
 			continue
 		}
+		// Per-template benign baseline: fill every placeholder with "1" so marker
+		// subtraction has something real to compare against. The old code looked
+		// up baselines[tpl.URITemplate] but that map is keyed by concrete resource
+		// URIs, so the baseline was always empty.
+		var tplBaseline string
+		if _, b, err := client.ReadResource(9500+ti, substituteTemplate(tpl.URITemplate, placeholders, "", "")); err == nil {
+			tplBaseline = b
+		}
 		for pi, p := range payloads {
 			for _, ph := range placeholders {
 				uri := substituteTemplate(tpl.URITemplate, placeholders, ph, p.value)
@@ -143,12 +158,14 @@ func (m *Module) ScanPerHost(
 					continue
 				}
 				if p.oast {
-					findings = append(findings, m.makeFinding(urlx.String(), uri, p, "template request issued; check OAST log"))
+					// Confirmed out-of-band by the global OAST poller — see the
+					// bare-URI loop above. No in-band finding.
 					continue
 				}
-				baseline := baselines[tpl.URITemplate]
-				if matched := matchMarkers(body, baseline, p.expectMarkers); matched > 0 {
-					findings = append(findings, m.makeFinding(urlx.String(), uri, p, fmt.Sprintf("%d marker(s) matched", matched)))
+				if p.confirm != nil {
+					if ok, n := p.confirm(body, tplBaseline); ok {
+						findings = append(findings, m.makeFinding(urlx.String(), uri, p, fmt.Sprintf("%d content marker(s) confirmed", n)))
+					}
 				}
 			}
 		}
@@ -223,45 +240,39 @@ func substituteTemplate(tpl string, placeholders []string, target, payload strin
 	return out
 }
 
-func matchMarkers(body, baseline string, markers []string) int {
-	if len(markers) == 0 {
-		return 0
-	}
-	c := 0
-	for _, m := range markers {
-		if strings.Contains(body, m) && !strings.Contains(baseline, m) {
-			c++
-		}
-	}
-	return c
-}
-
 func buildPayloads(scanCtx *modkit.ScanContext, targetURL string) []uriPayload {
 	out := []uriPayload{
 		{
-			name:          "file://",
-			vulnTag:       "lfi",
-			severity:      severity.High,
-			value:         "file:///etc/passwd",
-			expectMarkers: lfiMarkers[:3],
+			name:     "file://",
+			vulnTag:  "lfi",
+			severity: severity.High,
+			value:    "file:///etc/passwd",
+			confirm:  filesig.ConfirmPasswd,
 		},
 		{
-			name:          "Path traversal",
-			vulnTag:       "lfi",
-			severity:      severity.High,
-			value:         "../../../../../../etc/passwd",
-			expectMarkers: lfiMarkers[:3],
+			name:     "Path traversal",
+			vulnTag:  "lfi",
+			severity: severity.High,
+			value:    "../../../../../../etc/passwd",
+			confirm:  filesig.ConfirmPasswd,
 		},
 		{
-			name:          "URL encoding bypass",
-			vulnTag:       "lfi",
-			severity:      severity.High,
-			value:         "%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
-			expectMarkers: lfiMarkers[:3],
+			name:     "URL encoding bypass",
+			vulnTag:  "lfi",
+			severity: severity.High,
+			value:    "%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+			confirm:  filesig.ConfirmPasswd,
+		},
+		{
+			name:     "Cloud metadata SSRF (AWS IMDS)",
+			vulnTag:  "ssrf",
+			severity: severity.High,
+			value:    "http://169.254.169.254/latest/meta-data/",
+			confirm:  confirmAWSMetadata,
 		},
 	}
 	if oast := scanCtx.OASTProv(); oast != nil && oast.Enabled() {
-		callback := oast.GenerateURL(targetURL, "uri", "mcp-resource", "mcp-resource-fuzz", "")
+		callback := modkit.OASTURLFor(oast, oastclass.MCPArg, targetURL, "uri", "mcp-resource", "mcp-resource-fuzz", "")
 		if callback != "" {
 			out = append(out, uriPayload{
 				name:     "SSRF (OAST)",
@@ -287,4 +298,26 @@ func capitalise(s string) string {
 		}
 		return strings.ToUpper(s[:1]) + s[1:]
 	}
+}
+
+// confirmAWSMetadata matches the ConfirmFunc contract: it confirms only when the
+// resources/read response carries several structural markers of an AWS IMDS
+// meta-data listing that are absent from the benign baseline. Requiring 2+
+// distinct markers stops a page that merely echoes one token (reflection) from
+// confirming.
+func confirmAWSMetadata(body, baseline string) (bool, int) {
+	markers := []string{
+		"ami-id", "instance-id", "instance-type", "local-ipv4",
+		"iam", "security-credentials", "AccessKeyId", "SecretAccessKey",
+	}
+	hits := 0
+	for _, mrk := range markers {
+		if strings.Contains(body, mrk) && !strings.Contains(baseline, mrk) {
+			hits++
+		}
+	}
+	if hits >= 2 {
+		return true, hits
+	}
+	return false, 0
 }

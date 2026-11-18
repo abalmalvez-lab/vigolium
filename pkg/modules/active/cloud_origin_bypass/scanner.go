@@ -57,8 +57,7 @@ func (m *Module) ScanPerHost(
 	}
 
 	host := service.Host()
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -187,18 +186,15 @@ func (m *Module) checkOrigin(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-
 	useHTTPS := parsed.Scheme == "https"
 	port := 443
 	if !useHTTPS {
 		port = 80
 	}
 	originService := httpmsg.NewServiceSecure(parsed.Host, port, useHTTPS)
-	fuzzedReq = fuzzedReq.WithService(originService)
+	// SetMethod/SetPath/AddOrReplaceHeader produce well-formed raw, so wrap
+	// directly instead of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, originService)
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -233,9 +229,14 @@ func (m *Module) checkOrigin(
 	}
 
 	return &output.ResultEvent{
-		URL:              target,
-		Matched:          target,
-		Request:          string(modifiedRaw),
+		URL:     target,
+		Matched: target,
+		Request: string(modifiedRaw),
+		// The full raw origin response is the proof (it's the request that reached
+		// the origin directly and is missing the CDN's security headers). resp is
+		// still open here (deferred Close), so capture it as the finding's response
+		// rather than letting the executor backfill an unrelated baseline.
+		Response:         resp.FullResponseString(),
 		ExtractedResults: evidence,
 		Info: output.Info{
 			Name:        "Cloud Origin Bypass: Missing Security Headers",

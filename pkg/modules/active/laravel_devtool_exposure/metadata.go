@@ -9,24 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed Laravel developer tools that should not be accessible in
-production: Web Tinker (interactive PHP console), Clockwork (profiling tool),
-Laravel Pulse (monitoring dashboard), and Log Viewer. These tools can expose
-sensitive data such as SQL queries, routes, timings, logs, and may allow
-arbitrary code execution.
+	ModuleDesc = `**What it means:** A Laravel app exposes a local-only developer tool, matched at a known path (/tinker, /__clockwork/latest, /pulse, /log-viewer). Severity varies: Web Tinker Critical, Clockwork and Log Viewer High, Pulse Medium.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Fingerprints 404 responses to detect custom error pages
-- Web Tinker is critical severity due to potential code execution
+**How it's exploited:** An exposed Web Tinker lets an attacker run arbitrary PHP in its console for full remote code execution. Clockwork and Log Viewer leak SQL queries, routes, request data, stack traces, and logs that often contain credentials, while Pulse reveals server metrics.
 
-## References
-- https://github.com/spatie/laravel-web-tinker
-- https://github.com/itsgoingd/clockwork
-- https://laravel.com/docs/pulse
-- https://github.com/opcodesio/log-viewer`
+**Fix:** Disable these packages in production or restrict their routes to authenticated internal access, and ensure APP_DEBUG is false.`
 
 	ModuleConfirmation = "Confirmed when developer tool endpoints return 200 with expected framework-specific markers"
 	ModuleSeverity     = severity.High

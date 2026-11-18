@@ -2,12 +2,13 @@
 
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { Square, Send, Bot, Terminal, MessageSquare, Clock, CheckCircle, XCircle, Loader2, Zap, Layers, Bug, ScrollText, Copy, Check, Upload, ChevronDown, Play, X, Settings2, Crosshair, Scale, ShieldCheck } from 'lucide-react';
+import { Square, Send, Bot, Terminal, Clock, CheckCircle, XCircle, Loader2, Zap, Layers, Bug, ScrollText, Copy, Check, Upload, ChevronDown, Play, Settings2, Crosshair, Scale, ShieldCheck } from 'lucide-react';
 import type { AgentSession, AgentSessionDetail } from '@/api/types';
+import { agentStatusTone, type AgentStatusTone } from '@/api/types';
 import { formatDate, formatDuration, truncate } from '@/lib/formatters';
 import PageShell from './PageShell';
 import Dropdown from './Dropdown';
-import { useAgentsLogic, AGENT_OPTIONS, ARCHON_MODE_OPTIONS, INTENSITY_OPTIONS, AUDIT_MODE_OPTIONS, type ScanProfile, type AdvancedMode, type DetectedInputType } from '@/hooks/useAgentsLogic';
+import { useAgentsLogic, AGENT_OPTIONS, AUDIT_PREP_MODE_OPTIONS, INTENSITY_OPTIONS, AUDIT_MODE_OPTIONS, type DetectedInputType } from '@/hooks/useAgentsLogic';
 
 const INPUT_TYPE_LABELS: Record<DetectedInputType, { label: string; color: string }> = {
   url: { label: 'URL', color: '#00b368' },
@@ -22,9 +23,13 @@ const STATUS_ICON: Record<string, typeof CheckCircle> = {
   running: Loader2,
 };
 
+const STATUS_TONE_COLOR: Record<AgentStatusTone, string> = {
+  ok: '#00b368', warn: '#b8860b', fail: '#e34e1c', running: '#0078c8', idle: '#708e8e',
+};
+
 function StatusBadge({ status }: { status: string }) {
   const Icon = STATUS_ICON[status] || Clock;
-  const color = status === 'completed' ? '#00b368' : status === 'error' ? '#e34e1c' : status === 'running' ? '#0078c8' : '#708e8e';
+  const color = STATUS_TONE_COLOR[agentStatusTone(status)];
   return (
     <span className="flex items-center gap-1 text-xs font-bold" style={{ color }}>
       <Icon className={`w-3 h-3 ${status === 'running' ? 'animate-spin' : ''}`} />
@@ -77,6 +82,11 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
         {session.phases_run && session.phases_run.length > 0 && (
           <div><span className="text-[#708e8e]">phases </span><span className="text-[#005661]">{session.phases_run.join(' \u2192 ')}</span></div>
         )}
+        {session.error_message && (
+          <div className="whitespace-pre-wrap break-words" style={{ color: STATUS_TONE_COLOR[agentStatusTone(session.status) === 'fail' ? 'fail' : 'warn'] }}>
+            <span className="font-bold">{agentStatusTone(session.status) === 'fail' ? 'error ' : 'warnings '}</span>{session.error_message}
+          </div>
+        )}
         {session.module_names && session.module_names.length > 0 && (
           <div><span className="text-[#708e8e]">modules </span><span className="text-[#005661]">{session.module_names.join(', ')}</span></div>
         )}
@@ -104,9 +114,9 @@ function SessionDetailPanel({ session, onClose }: { session: AgentSessionDetail;
               <button onClick={() => copyToClipboard(session.agent_raw_output!, 'output')} className="absolute top-1.5 right-2 z-10 text-[#708e8e] hover:text-[#005661] p-0.5" title="Copy to clipboard">
                 {copied === 'output' ? <Check className="w-3.5 h-3.5 text-[#00b368]" /> : <Copy className="w-3.5 h-3.5" />}
               </button>
-              <div className="px-3 py-2 bg-[#ede4d1] text-[#005661] overflow-x-auto prose prose-xs max-w-none [&_pre]:bg-[#d4e8e2] [&_pre]:p-2 [&_pre]:text-xs [&_pre]:rounded [&_code]:text-[#00b368] [&_p]:m-0 [&_p]:mb-1.5 [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-xs [&_h1]:mt-2 [&_h2]:mt-2 [&_h3]:mt-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0">
-                <ReactMarkdown>{session.agent_raw_output}</ReactMarkdown>
-              </div>
+              {/* ANSI-stripped terminal output, not Markdown: parsing up to 200 KB
+                  of it on every re-render stalled the page. */}
+              <pre className="px-3 py-2 bg-[#ede4d1] text-[#005661] whitespace-pre-wrap break-words font-mono overflow-x-auto">{session.agent_raw_output}</pre>
             </div>
           </details>
         )}
@@ -423,8 +433,8 @@ export default function AgentsPage() {
                         <Dropdown value={h.swarmIntensity} onChange={h.setSwarmIntensity} options={INTENSITY_OPTIONS} />
                       </div>
                       <div>
-                        <label className="text-[#708e8e] text-[10px] block mb-0.5">Archon</label>
-                        <Dropdown value={h.swarmArchon} onChange={h.setSwarmArchon} options={ARCHON_MODE_OPTIONS} />
+                        <label className="text-[#708e8e] text-[10px] block mb-0.5">Vigolium Audit</label>
+                        <Dropdown value={h.swarmAudit} onChange={h.setSwarmAudit} options={AUDIT_PREP_MODE_OPTIONS} />
                       </div>
                     </div>
                     <div className="flex flex-wrap items-end gap-1">
@@ -497,8 +507,8 @@ export default function AgentsPage() {
                         <Dropdown value={h.autopilotIntensity} onChange={h.setAutopilotIntensity} options={INTENSITY_OPTIONS} />
                       </div>
                       <div>
-                        <label className="text-[#708e8e] text-[10px] block mb-0.5">Archon Mode</label>
-                        <Dropdown value={h.autopilotArchonMode} onChange={h.setAutopilotArchonMode} options={ARCHON_MODE_OPTIONS} />
+                        <label className="text-[#708e8e] text-[10px] block mb-0.5">Vigolium Audit Mode</label>
+                        <Dropdown value={h.autopilotAuditMode} onChange={h.setAutopilotAuditMode} options={AUDIT_PREP_MODE_OPTIONS} />
                       </div>
                     </div>
                     <div>
@@ -508,7 +518,7 @@ export default function AgentsPage() {
                     <div className="flex items-center gap-1">
                       {([
                         ['Dry Run', h.autopilotDryRun, h.setAutopilotDryRun] as const,
-                        ['No Archon', h.autopilotNoArchon, h.setAutopilotNoArchon] as const,
+                        ['Skip Audit', h.autopilotNoAudit, h.setAutopilotNoAudit] as const,
                       ]).map(([label, value, setter]) => (
                         <button key={label} type="button" onClick={() => setter(!value)}
                           className={`px-2 py-0.5 text-[9px] font-bold border transition-colors ${
@@ -713,7 +723,7 @@ export default function AgentsPage() {
               </div>
             </button>
             {h.streamingOpen && (
-              <pre ref={h.scanOutputRef} className="flex-1 overflow-auto p-3 text-xs text-[#708e8e] font-mono whitespace-pre-wrap leading-relaxed">
+              <pre ref={h.scanOutputRef} onScroll={h.onScanOutputScroll} className="flex-1 overflow-auto p-3 text-xs text-[#708e8e] font-mono whitespace-pre-wrap leading-relaxed">
                 {h.panelOutput || (
                   <span className="text-[#bbc3c4]">{h.panelError || h.panelPlaceholder}</span>
                 )}

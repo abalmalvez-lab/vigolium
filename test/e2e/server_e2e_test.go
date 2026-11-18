@@ -131,7 +131,7 @@ func (env *apiTestEnv) countRecords(t *testing.T) int {
 	t.Helper()
 	count, err := env.db.NewSelect().Model((*database.HTTPRecord)(nil)).Count(context.Background())
 	require.NoError(t, err)
-	return count
+	return int(count)
 }
 
 // ============================================================
@@ -210,7 +210,7 @@ func TestAPI_Modules_ListAll(t *testing.T) {
 
 	var body struct {
 		Modules []server.ModuleInfo `json:"modules"`
-		Total   int              `json:"total"`
+		Total   int                 `json:"total"`
 	}
 	readJSON(t, resp, &body)
 	assert.Greater(t, body.Total, 0, "expected at least 1 module")
@@ -233,7 +233,7 @@ func TestAPI_Modules_Search(t *testing.T) {
 
 	var body struct {
 		Modules []server.ModuleInfo `json:"modules"`
-		Total   int              `json:"total"`
+		Total   int                 `json:"total"`
 	}
 	readJSON(t, resp, &body)
 	assert.Greater(t, body.Total, 0)

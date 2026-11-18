@@ -57,6 +57,10 @@ func New() *Module {
 	return m
 }
 
+// VulnClass enables cross-module (param, class) dedup: once any open-redirect module
+// reports a parameter, the others in the class skip it.
+func (m *Module) VulnClass() string { return modkit.VulnClassOpenRedirect }
+
 func (m *Module) ScanPerRequest(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
@@ -105,6 +109,10 @@ func (m *Module) ScanPerRequest(
 			if !matchTopParams(ip.Name()) && !matchValueIsURL(paramValue) {
 				continue
 			}
+			// Another open-redirect module already reported this param here.
+			if scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
+				continue
+			}
 			foundIssues, match, err := checkWithAllModules(ctx.Request().Raw(), ip, urlx, ctx.Service(), httpClient)
 			if err == nil && match {
 				results = append(results, foundIssues...)
@@ -130,7 +138,7 @@ func (m *Module) ScanPerRequest(
 	if len(bodyPoints) > 0 {
 		newParamNames := []string{}
 		for _, ip := range bodyPoints {
-			if checkedParams[ip.Name()] {
+			if checkedParams[ip.Name()] || scanCtx.ParamAlreadyFound(ctx, ip.Name(), m.VulnClass()) {
 				continue
 			}
 			paramValue := ip.BaseValue()
@@ -260,12 +268,9 @@ func bulkCheck(rawRequest []byte, urlx *urlutil.URL, httpService *httpmsg.Servic
 			}
 		}
 
-		// Parse the modified raw request
-		req, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-		if err != nil {
-			continue
-		}
-		req.WithService(httpService)
+		// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+		// of re-parsing on this hot path.
+		req := httpmsg.NewRequestResponseRaw(modifiedRaw, httpService)
 
 		resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true})
 		if err != nil {
@@ -323,7 +328,61 @@ func checkWithAllModules(rawRequest []byte, ip httpmsg.InsertionPoint, urlx *url
 	if len(results) == 0 {
 		return results, false, nil
 	}
+
+	// Re-confirm before reporting: prove the redirect is attacker-controlled by
+	// injecting a FRESH random domain and requiring the response to redirect to
+	// THAT domain across multiple rounds. A redirect that doesn't track the
+	// changing injected value (a coincidental string match, or a fixed/cached
+	// redirect) is rejected as a false positive. Fails open on a transient error
+	// so a flaky host doesn't drop a real finding.
+	confirmed, cerr := confirmAttackerControlledRedirect(ip, httpService, httpClient)
+	if cerr != nil {
+		return results, true, nil
+	}
+	if !confirmed {
+		return nil, false, nil
+	}
 	return results, true, nil
+}
+
+// confirmAttackerControlledRedirect injects a fresh random redirect domain into
+// the insertion point and reports whether the response redirects to that exact
+// domain, repeated across multiple rounds with a new domain each time (via
+// modkit.ConfirmReflection). This confirms the redirect target genuinely tracks
+// attacker input rather than coincidentally matching a probe domain.
+func confirmAttackerControlledRedirect(ip httpmsg.InsertionPoint, httpService *httpmsg.Service, httpClient *http.Requester) (bool, error) {
+	return modkit.ConfirmReflection(2, func(canary string) (bool, error) {
+		redirectDomain := canary + ".com"
+		payloads := redirectBypassPayloads(redirectDomain)
+		re := getDomainRedirectRegex(redirectDomain)
+		for _, payload := range payloads {
+			fuzzedRaw := ip.BuildRequest([]byte(payload))
+			// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+			// of re-parsing on this hot path.
+			req := httpmsg.NewRequestResponseRaw(fuzzedRaw, httpService)
+
+			resp, _, rerr := httpClient.Execute(req, http.Options{NoRedirects: true})
+			if rerr != nil {
+				if errors.Is(rerr, hosterrors.ErrUnresponsiveHost) {
+					return false, rerr
+				}
+				continue
+			}
+			matched := false
+			checkOutput(resp, func(nextLoc string) bool {
+				if re.MatchString(nextLoc) {
+					matched = true
+					return false
+				}
+				return true
+			})
+			resp.Close()
+			if matched {
+				return true, nil // this round's fresh domain was reflected in the redirect
+			}
+		}
+		return false, nil
+	})
 }
 
 // https://xxx.{target.com}
@@ -338,22 +397,16 @@ func checkRedirectSubdomain(rawRequest []byte, ip httpmsg.InsertionPoint, urlx *
 		return results, false, err
 	}
 	redirectDomain := fmt.Sprintf("xxx.%s", mainDomain)
-	var payloads []string
-	payloads = append(payloads, fmt.Sprintf("https://%s", redirectDomain))
-	payloads = append(payloads, fmt.Sprintf("//%s", redirectDomain))
-	payloads = append(payloads, redirectDomain)
+	payloads := redirectBypassPayloads(redirectDomain)
 
 scan:
 	for _, payload := range payloads {
 		// Build request with payload injected
 		fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-		// Parse the fuzzed raw request
-		req, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-		if err != nil {
-			continue
-		}
-		req.WithService(httpService)
+		// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+		// of re-parsing on this hot path.
+		req := httpmsg.NewRequestResponseRaw(fuzzedRaw, httpService)
 
 		resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true})
 		if err != nil {
@@ -389,24 +442,16 @@ func checkRedirectDifferentDomain(rawRequest []byte, ip httpmsg.InsertionPoint, 
 	match = false
 	results = []*output.ResultEvent{}
 	redirectDomain := "bttandfriends.com"
-	var payloads []string
-	payloads = append(payloads, fmt.Sprintf("https://%s", redirectDomain))
-	payloads = append(payloads, fmt.Sprintf("//%s", redirectDomain))
-	payloads = append(payloads, redirectDomain)
-	payloads = append(payloads, fmt.Sprintf(`/\%s`, redirectDomain))
-	payloads = append(payloads, fmt.Sprintf("///%s", redirectDomain))
+	payloads := redirectBypassPayloads(redirectDomain)
 
 scan:
 	for _, payload := range payloads {
 		// Build request with payload injected
 		fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-		// Parse the fuzzed raw request
-		req, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-		if err != nil {
-			continue
-		}
-		req.WithService(httpService)
+		// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+		// of re-parsing on this hot path.
+		req := httpmsg.NewRequestResponseRaw(fuzzedRaw, httpService)
 
 		resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true})
 		if err != nil {
@@ -422,7 +467,7 @@ scan:
 					ExtractedResults: []string{payload},
 					Info: output.Info{
 						Description: "Open redirect to different domain",
-						Severity:    severity.High,
+						Severity:    severity.Medium,
 					},
 				})
 				match = true
@@ -474,12 +519,9 @@ func checkRedirectBasedOnParamValue(rawRequest []byte, ip httpmsg.InsertionPoint
 		// Build request with payload injected
 		fuzzedRaw := ip.BuildRequest([]byte(finalURL))
 
-		// Parse the fuzzed raw request
-		req, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-		if err != nil {
-			continue
-		}
-		req.WithService(httpService)
+		// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+		// of re-parsing on this hot path.
+		req := httpmsg.NewRequestResponseRaw(fuzzedRaw, httpService)
 
 		resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true, RawRequest: true}) // raw request
 		if err != nil {
@@ -494,7 +536,7 @@ func checkRedirectBasedOnParamValue(rawRequest []byte, ip httpmsg.InsertionPoint
 			var newSeverity severity.Severity
 			var description string
 			if matchDifferentDomain {
-				newSeverity = severity.High
+				newSeverity = severity.Medium
 				description = "Open redirect to different domain"
 			} else {
 				newSeverity = severity.Medium
@@ -655,5 +697,31 @@ func getLocationUrl(value string) string {
 }
 
 func getDomainRedirectRegex(domain string) *regexp.Regexp {
-	return regexp.MustCompile(fmt.Sprintf(`(?i)^(?:https?:\/\/|\/\/|\/\\\\|\/\\)?(?:[a-zA-Z0-9\-_\.@]*)%s\/?(\/|[^.].*)?$`, domain))
+	// Optional scheme, then any run of slashes/backslashes (covers //, /\, \\, ///,
+	// /\/\, and the backslash-scheme forms browsers normalise), then optional
+	// userinfo, then the attacker domain. The domain must be present, so accepting a
+	// wider set of leading separators catches blocklist-bypass redirect targets
+	// without loosening what counts as a redirect to that domain.
+	return regexp.MustCompile(fmt.Sprintf(`(?i)^(?:https?:)?[\\/]{0,4}(?:[a-zA-Z0-9\-_\.@]*)%s\/?(\/|[^.].*)?$`, domain))
+}
+
+// redirectBypassPayloads returns the redirect-target payloads for domain. Beyond an
+// explicit scheme, a scheme-less "//", and the bare host, it includes slash/backslash
+// and mixed-case scheme variants: an allow-list keyed on the literal "http://"/"https://"
+// prefix fails to block these, yet a browser still follows them as an absolute
+// cross-origin navigation. The same set drives both detection and confirmation, so a
+// redirect reachable only through a bypass form is still re-proven against a fresh
+// random domain rather than silently dropped.
+func redirectBypassPayloads(domain string) []string {
+	return []string{
+		"https://" + domain,
+		"//" + domain,
+		domain,
+		`/\` + domain,
+		`/\/\` + domain,
+		`\\` + domain,
+		"///" + domain,
+		"Https://" + domain, // mixed-case scheme defeats a case-sensitive prefix blocklist
+		`https:\\` + domain, // backslash scheme; browsers normalise the separators to //
+	}
 }

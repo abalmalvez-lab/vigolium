@@ -9,23 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed FastAPI interactive API documentation. FastAPI auto-generates
-Swagger UI at /docs, ReDoc at /redoc, and the OpenAPI spec at /openapi.json by
-default. These endpoints reveal all API routes, schemas, and parameters, increasing
-the attack surface for further exploitation.
+	ModuleDesc = `**What it means:** An isolated credential-free request reached a Swagger UI, ReDoc loader, or structurally valid OpenAPI document at a FastAPI-default path. The path does not by itself prove the framework.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Fingerprints 404 responses to detect custom error pages
-- Reported as low severity (information disclosure)
+**How it's exploited:** Attackers can use documented routes and schemas for reconnaissance. Documentation reachability alone does not prove that any route is sensitive, undocumented, or missing authorization, so this remains an observation.
 
-## References
-- https://fastapi.tiangolo.com/tutorial/metadata/`
+**Fix:** Disable docs in production by setting docs_url, redoc_url, and openapi_url to None, or restrict these paths to authenticated internal users.`
 
-	ModuleConfirmation = "Confirmed when documentation endpoints return 200 with expected FastAPI-specific markers"
-	ModuleSeverity     = severity.Low
+	ModuleConfirmation = "Observed when credential-free 200 responses pass grouped UI markers or structural spec parsing plus soft-404 and catch-all controls"
+	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"fastapi", "python", "info-disclosure", "probe", "light"}
 )

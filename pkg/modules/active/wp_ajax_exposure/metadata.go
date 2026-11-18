@@ -9,23 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for commonly vulnerable WordPress AJAX actions registered via
-wp_ajax_nopriv_* that should not be accessible to unauthenticated users.
-These are among the most frequently exploited WordPress plugin vulnerabilities.
+	ModuleDesc = `**What it means:** The site exposes a WordPress AJAX action (registered via wp_ajax_nopriv_*) from a plugin with a known vulnerability, answering unauthenticated requests at /wp-admin/admin-ajax.php. Matched plugins (Revolution Slider, Duplicator, WP File Manager) have flaws from file download to auth bypass and RCE.
 
-## Notes
-- Runs once per host
-- Tests known vulnerable AJAX action names from popular plugins
-- Sends POST requests to /wp-admin/admin-ajax.php with action parameter
-- Validates responses to distinguish real handlers from WordPress default "0" response
-- Does not attempt exploitation, only confirms action handler existence
+**How it's exploited:** An attacker maps the plugin version from the confirmed action, then sends the documented exploit POST for that CVE (downloading a backup, reading files, or registering an admin) without authentication.
 
-## References
-- https://developer.wordpress.org/plugins/javascript/ajax/
-- https://www.wordfence.com/threat-intel/vulnerabilities`
+**Fix:** Update or remove the plugin, restrict admin-ajax actions to authorized users, and add a WAF rule blocking the vulnerable action names.`
 
-	ModuleConfirmation = "Confirmed when admin-ajax.php returns a non-default response for a known vulnerable action name"
+	ModuleConfirmation = "Confirmed when admin-ajax.php returns a non-default response that contains plugin/action-specific markers for a known vulnerable action name"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"wordpress", "cms", "php", "misconfiguration", "light"}

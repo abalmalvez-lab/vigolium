@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"sort"
+	"strings"
 	"sync"
 
 	urlutil "github.com/projectdiscovery/utils/url"
 	"go.uber.org/zap"
+
+	"github.com/vigolium/vigolium/pkg/utils"
 )
 
 // HttpRequest represents an HTTP request with raw bytes as source of truth.
@@ -28,7 +32,23 @@ type HttpRequest struct {
 	bodyOffset int
 	parsed     bool
 	cachedID   string // Cached SHA-256 hash (computed once by ID())
-	mu         sync.RWMutex
+
+	// Cached URL (computed once by sharedURL()). Invalidated when the service
+	// changes via HttpRequestResponse.WithService. cachedURL is private to this
+	// package and read-only once published: URL() hands callers copies built
+	// from cachedURLParams, never the cached value itself (see URL()).
+	cachedURL       *urlutil.URL
+	cachedURLParams []urlParam
+	cachedURLErr    error
+	urlComputed     bool
+
+	// Cached media/JS-path classification (computed once by IsMediaPath()).
+	// Derived from the URL path, which comes from the immutable raw request
+	// line and is independent of the service, so it never needs invalidation.
+	mediaPath         bool
+	mediaPathComputed bool
+
+	mu sync.RWMutex
 }
 
 // NewHttpRequest creates a new HttpRequest from raw bytes.
@@ -116,11 +136,128 @@ func (r *HttpRequest) BodyToString() string {
 }
 
 // URL constructs and returns the full URL.
+//
+// The URL is parsed once and memoized (raw bytes are immutable; the cache is
+// invalidated when the service changes via HttpRequestResponse.WithService),
+// but every call returns the caller's OWN copy, which it may freely mutate.
+// Returning the cached *urlutil.URL itself was a data race: urlutil's
+// OrderedParams.Iterate — and URL.Clone, which iterates — write the ordered
+// map's internal iteration flag, so passive modules running in parallel over
+// one item (or detached active tasks) that merely iterated or cloned the
+// "read-only" shared URL raced each other. The copy is built from a param
+// snapshot taken before the cache is published, so it never iterates shared
+// state and needs no lock.
 func (r *HttpRequest) URL() (*urlutil.URL, error) {
-	if r.service == nil {
-		return nil, ErrNilService
+	u, params, err := r.sharedURL()
+	if u == nil {
+		return nil, err
 	}
-	return GetURLFromService(r.raw, r.service)
+	return copyURL(u, params), err
+}
+
+// sharedURL returns the memoized parsed URL and its param snapshot. The
+// returned *urlutil.URL is shared by every caller: it must stay inside this
+// package and only be read through methods that do not touch OrderedParams'
+// iteration state (String, Path, Host, ...; never Params.Iterate, Clone,
+// Update or any setter).
+func (r *HttpRequest) sharedURL() (*urlutil.URL, []urlParam, error) {
+	if r.service == nil {
+		return nil, nil, ErrNilService
+	}
+
+	r.mu.RLock()
+	if r.urlComputed {
+		u, params, err := r.cachedURL, r.cachedURLParams, r.cachedURLErr
+		r.mu.RUnlock()
+		return u, params, err
+	}
+	r.mu.RUnlock()
+
+	// GetURLFromService now extracts the path via a cheap first-line scan
+	// (GetPath no longer parses the whole header block), so this no longer pays
+	// a full ExtractAllHeaders pass per probe on top of the one ensureParsed
+	// does for the headers/body accessors. We deliberately go through GetPath
+	// (parseRequestLineString) rather than the cached r.path: the two request-
+	// line parsers disagree on malformed empty-path request lines, and GetPath's
+	// is the one that yields the correct ("" -> "/") result for any raw source.
+	u, err := GetURLFromService(r.raw, r.service)
+	// u is still private to this goroutine, so iterating it here is safe.
+	params := snapshotURLParams(u)
+
+	r.mu.Lock()
+	r.cachedURL = u
+	r.cachedURLParams = params
+	r.cachedURLErr = err
+	r.urlComputed = true
+	r.mu.Unlock()
+	return u, params, err
+}
+
+// urlParam is one query key with its values, in request order.
+type urlParam struct {
+	key    string
+	values []string
+}
+
+// snapshotURLParams captures u's ordered query params. It iterates u, so it
+// must only run before u is shared.
+func snapshotURLParams(u *urlutil.URL) []urlParam {
+	if u == nil || u.Params == nil {
+		return nil
+	}
+	var params []urlParam
+	u.Params.Iterate(func(key string, values []string) bool {
+		params = append(params, urlParam{key: key, values: append([]string(nil), values...)})
+		return true
+	})
+	return params
+}
+
+// copyURL returns an independent copy of the shared URL src whose query params
+// are rebuilt from the snapshot, so it reads src without iterating it.
+func copyURL(src *urlutil.URL, params []urlParam) *urlutil.URL {
+	dst := *src // shallow copy keeps urlutil's unexported parse flags
+	if src.URL != nil {
+		inner := *src.URL // url.Userinfo is immutable, so sharing User is safe
+		dst.URL = &inner
+	}
+	if src.Params != nil {
+		op := urlutil.NewOrderedParams()
+		op.IncludeEquals = src.Params.IncludeEquals
+		for _, p := range params {
+			op.Update(p.key, append([]string(nil), p.values...))
+		}
+		dst.Params = op
+	}
+	return &dst
+}
+
+// IsMediaPath reports whether the request targets a media or JS/static asset
+// (the default-skip set used by active-module eligibility). The result is
+// computed once from the cached URL path and memoized, so the regex is not
+// re-run for every module's CanProcess on the dispatch hot path. A request
+// whose URL cannot be parsed is treated as not media (false); callers that must
+// reject unparseable URLs check URL() separately.
+func (r *HttpRequest) IsMediaPath() bool {
+	r.mu.RLock()
+	if r.mediaPathComputed {
+		v := r.mediaPath
+		r.mu.RUnlock()
+		return v
+	}
+	r.mu.RUnlock()
+
+	// Compute outside the lock: sharedURL() takes r.mu itself.
+	var res bool
+	if u, _, err := r.sharedURL(); err == nil && u != nil {
+		res = utils.IsMediaAndJSURL(u.Path)
+	}
+
+	r.mu.Lock()
+	r.mediaPath = res
+	r.mediaPathComputed = true
+	r.mu.Unlock()
+	return res
 }
 
 // Parameters analyzes the request and returns all parameters.
@@ -138,8 +275,12 @@ func (r *HttpRequest) Parameters() ([]*Param, error) {
 func (r *HttpRequest) ID() string {
 	r.mu.RLock()
 	if r.cachedID != "" {
+		// Copy the value before unlocking: a concurrent writer (a racing
+		// first-caller still committing its identical id) may reassign the
+		// string, and returning r.cachedID after RUnlock reads it unsynchronized.
+		v := r.cachedID
 		r.mu.RUnlock()
-		return r.cachedID
+		return v
 	}
 	r.mu.RUnlock()
 
@@ -154,6 +295,66 @@ func (r *HttpRequest) ID() string {
 	r.cachedID = id
 	r.mu.Unlock()
 	return id
+}
+
+// IdentityFingerprint returns a stable, non-secret label for the credentials
+// carried by this request. It is suitable for cache/dedup keys; raw cookies and
+// authorization values are never returned. Anonymous requests share one label.
+func (r *HttpRequest) IdentityFingerprint() string {
+	if r == nil {
+		return "anonymous"
+	}
+	auth := strings.TrimSpace(r.Header("Authorization"))
+	cookie := identityCookieMaterial(r.Header("Cookie"))
+	if auth == "" && cookie == "" {
+		return "anonymous"
+	}
+	sum := sha256.Sum256([]byte(auth + "\x00" + cookie))
+	return hex.EncodeToString(sum[:8])
+}
+
+// identityCookieMaterial retains every cookie that could carry login/session
+// state. Unknown names are included: treating an application-specific session
+// cookie as anonymous could mix two users' baselines and create authorization
+// false positives. Only clearly non-identity analytics, consent, preference,
+// and CSRF cookies are ignored. Sorting makes equivalent header ordering stable.
+func identityCookieMaterial(header string) string {
+	var identityCookies []string
+	for _, pair := range strings.Split(header, ";") {
+		kv := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(kv[0]))
+		if nonIdentityCookieName(name) {
+			continue
+		}
+		identityCookies = append(identityCookies, name+"="+strings.TrimSpace(kv[1]))
+	}
+	sort.Strings(identityCookies)
+	return strings.Join(identityCookies, "\x00")
+}
+
+func nonIdentityCookieName(name string) bool {
+	if name == "" || strings.Contains(name, "csrf") || strings.Contains(name, "xsrf") {
+		return true
+	}
+	switch name {
+	case "theme", "locale", "language", "lang", "timezone", "tz",
+		"consent", "cookieconsent", "cookie_consent", "cookies_accepted",
+		"preference", "preferences", "prefs":
+		return true
+	}
+	for _, marker := range []string{
+		"_ga", "_gid", "_gat", "ga_", "utm_", "_hj", "hotjar",
+		"amplitude", "mixpanel", "analytics", "segment", "_clck", "_clsk",
+		"_fbp", "_fbc", "_gcl_", "intercom-device-id",
+	} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureParsed lazily parses the raw request into cached fields.
@@ -196,6 +397,13 @@ func (r *HttpRequest) ensureParsed() {
 
 // TruncateBody truncates the request body to maxSize bytes.
 // Headers are preserved. No-op if body is already within limit.
+//
+// It rewrites r.raw, so every cache derived from those bytes MUST be dropped.
+// ID() memoizes the SHA-256 of r.raw and was left stale, so a request truncated
+// after its id had been read kept reporting the pre-truncation hash — the value
+// used for record dedup, stored-record lookup, the host-error tracker, the
+// insertion-point cache and the response-cluster key. (Response truncation
+// already invalidates its own body-derived caches.)
 func (r *HttpRequest) TruncateBody(maxSize int) {
 	r.ensureParsed()
 	bodyLen := len(r.raw) - r.bodyOffset
@@ -203,6 +411,10 @@ func (r *HttpRequest) TruncateBody(maxSize int) {
 		return
 	}
 	r.raw = r.raw[:r.bodyOffset+maxSize]
+
+	r.mu.Lock()
+	r.cachedID = ""
+	r.mu.Unlock()
 }
 
 // ============== Immutable Builder Methods ==============
@@ -300,6 +512,18 @@ func (r *HttpRequest) Clone() *HttpRequest {
 
 // ============== Factory Functions ==============
 
+// escapedRequestTarget returns the origin-form request target (escaped path plus
+// query) for urlx. Unlike urlutil's GetRelativePath — which emits the DECODED
+// url.Path and would turn a crafted "/%23/../x" into "/#/../x" or "/foo%2ebar"
+// into "/foo.bar", silently breaking path-normalization bypasses — this preserves
+// the on-the-wire percent-encoding. The fragment is intentionally omitted: it is
+// not part of an HTTP request target. Empty paths normalize to "/".
+func escapedRequestTarget(urlx *urlutil.URL) string {
+	// Sync RawQuery from the parsed ordered params so RequestURI reflects them.
+	urlx.Update()
+	return urlx.RequestURI()
+}
+
 // HttpRequestFromURL creates a basic GET request from a URL string.
 // Uses DefaultBrowserHeaders to mimic a real Chrome browser.
 func HttpRequestFromURL(urlStr string) (*HttpRequest, error) {
@@ -311,7 +535,7 @@ func HttpRequestFromURL(urlStr string) (*HttpRequest, error) {
 	// Build raw request
 	var buf bytes.Buffer
 	buf.WriteString("GET ")
-	buf.WriteString(urlx.GetRelativePath())
+	buf.WriteString(escapedRequestTarget(urlx))
 	buf.WriteString(" HTTP/1.1\r\n")
 	buf.WriteString("Host: ")
 	buf.WriteString(urlx.Host)
@@ -545,36 +769,47 @@ func (b *requestBuilder) build(original *HttpRequest) *HttpRequest {
 		}
 	}
 
-	// Apply body change using direct replacement with cached bodyOffset
+	// Apply body change. Fast path: when the request has a clean header block with
+	// exactly one Content-Length whose value precedes the body, splice the new body
+	// and patch Content-Length in a single allocation — no header re-parse, no
+	// full message rebuild. This is the common shape for body fuzzers / method-CT
+	// swaps, which previously paid ExtractAllHeaders twice plus a BuildHttpMessage
+	// rebuild per call.
 	if b.bodySet {
-		original.ensureParsed()
-		original.mu.RLock()
-		bodyOffset := original.bodyOffset
-		original.mu.RUnlock()
-
-		// Find current body offset in potentially modified raw
-		_, _, currentBodyOffset, _ := ExtractAllHeaders(raw)
-
-		if currentBodyOffset > 0 && currentBodyOffset <= len(raw) {
-			// Allocate exact size needed and replace body directly
-			newSize := currentBodyOffset + len(b.body)
-			newRaw := make([]byte, newSize)
-			copy(newRaw, raw[:currentBodyOffset])
-			copy(newRaw[currentBodyOffset:], b.body)
+		if newRaw, ok := replaceBodyWithCL(raw, b.body); ok {
 			raw = newRaw
-		} else if bodyOffset > 0 {
-			// Fallback: use original body offset if current parse failed
-			newSize := bodyOffset + len(b.body)
-			newRaw := make([]byte, newSize)
-			copy(newRaw, raw[:bodyOffset])
-			copy(newRaw[bodyOffset:], b.body)
-			raw = newRaw
-		}
+		} else {
+			// Slow path: locate the body offset, splice, then rebuild Content-Length
+			// (covers absent/duplicate Content-Length and unparseable headers).
+			original.ensureParsed()
+			original.mu.RLock()
+			bodyOffset := original.bodyOffset
+			original.mu.RUnlock()
 
-		// Update Content-Length header
-		raw, err = UpdateContentLength(raw)
-		if err != nil {
-			zap.L().Debug("Apply: failed to update content-length", zap.Error(err))
+			// Find current body offset in potentially modified raw
+			_, _, currentBodyOffset, _ := ExtractAllHeaders(raw)
+
+			if currentBodyOffset > 0 && currentBodyOffset <= len(raw) {
+				// Allocate exact size needed and replace body directly
+				newSize := currentBodyOffset + len(b.body)
+				newRaw := make([]byte, newSize)
+				copy(newRaw, raw[:currentBodyOffset])
+				copy(newRaw[currentBodyOffset:], b.body)
+				raw = newRaw
+			} else if bodyOffset > 0 {
+				// Fallback: use original body offset if current parse failed
+				newSize := bodyOffset + len(b.body)
+				newRaw := make([]byte, newSize)
+				copy(newRaw, raw[:bodyOffset])
+				copy(newRaw[bodyOffset:], b.body)
+				raw = newRaw
+			}
+
+			// Update Content-Length header
+			raw, err = UpdateContentLength(raw)
+			if err != nil {
+				zap.L().Debug("Apply: failed to update content-length", zap.Error(err))
+			}
 		}
 	}
 
@@ -588,6 +823,32 @@ func (b *requestBuilder) build(original *HttpRequest) *HttpRequest {
 		raw:     raw,
 		service: service,
 	}
+}
+
+// replaceBodyWithCL replaces the request body with newBody and rewrites the
+// Content-Length value in place, in a single allocation and with no header
+// re-parse or message rebuild. It mirrors ParameterInsertionPoint.buildWithContentLength.
+//
+// It succeeds (ok==true) only when raw has a parseable header block with exactly
+// one Content-Length header whose value lies before the body — the common case.
+// Otherwise it returns ok==false so the caller can fall back to the
+// splice + UpdateContentLength slow path (absent/duplicate Content-Length, or
+// headers that don't parse). The eligibility check is shared with the
+// insertion-point fast path via computeCLRewriteRaw.
+func replaceBodyWithCL(raw, newBody []byte) ([]byte, bool) {
+	cl := computeCLRewriteRaw(raw)
+	if !cl.fast {
+		return nil, false
+	}
+
+	clStr := intToString(len(newBody))
+	resultSize := cl.valueStart + len(clStr) + (cl.bodyOffset - cl.valueEnd) + len(newBody)
+	result := make([]byte, resultSize)
+	n := copy(result, raw[:cl.valueStart])                // headers up to old Content-Length value
+	n += copy(result[n:], clStr)                          // new Content-Length value
+	n += copy(result[n:], raw[cl.valueEnd:cl.bodyOffset]) // rest of headers + blank line
+	copy(result[n:], newBody)                             // new body
+	return result, true
 }
 
 // Sentinel error

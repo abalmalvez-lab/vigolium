@@ -194,12 +194,10 @@ func (m *Module) checkReflection(
 	// Send anchored probe to confirm reflection with our canary
 	payload, searchAnchor := NewBasicReflectionPayload()
 
+	// BuildRequest produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
 	fuzzedRaw := ip.BuildRequest([]byte(payload))
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return false, errors.Wrap(err, "failed to parse fuzzed request")
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -236,12 +234,10 @@ func (m *Module) recordTransformations(
 ) ([]string, error) {
 	ap := NewAnchoredPayload(probe)
 
+	// BuildRequest produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
 	fuzzedRaw := ip.BuildRequest([]byte(ap.FullPayload))
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse fuzzed request")
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -263,12 +259,10 @@ func (m *Module) recordAndClassify(
 ) ([]*TransformResult, []byte, string, error) {
 	ap := NewAnchoredPayload(probe)
 
+	// BuildRequest produces well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
 	fuzzedRaw := ip.BuildRequest([]byte(ap.FullPayload))
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return nil, nil, "", errors.Wrap(err, "failed to parse fuzzed request")
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -342,16 +336,15 @@ func (m *Module) buildResults(
 	if len(interesting) > 0 {
 		// Re-send first interesting probe for the report
 		ap := NewAnchoredPayload(interesting[0].Probe)
+		// BuildRequest produces well-formed raw, so wrap directly instead of
+		// re-parsing on this hot path.
 		fuzzedRaw := ip.BuildRequest([]byte(ap.FullPayload))
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
+		fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
+		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 		if err == nil {
-			fuzzedReq = fuzzedReq.WithService(ctx.Service())
-			resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
-			if err == nil {
-				reqRaw = fuzzedRaw
-				respFull = resp.FullResponseString()
-				resp.Close()
-			}
+			reqRaw = fuzzedRaw
+			respFull = resp.FullResponseString()
+			resp.Close()
 		}
 	}
 
@@ -374,3 +367,8 @@ func (m *Module) buildResults(
 
 	return []*output.ResultEvent{result}, nil
 }
+
+// RequiresReflection opts into the executor's shared reflection probe
+// (modkit.ReflectionAware): the oracle reads the payload back, so a
+// point whose value does not come back is skipped.
+func (m *Module) RequiresReflection() modkit.ReflectionNeed { return modkit.ReflectBody }

@@ -2,8 +2,6 @@ package common_directory_listing
 
 import (
 	"fmt"
-	"regexp"
-	"strings"
 
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/http"
@@ -32,14 +30,6 @@ var probePaths = []probePath{
 	{path: "/aspnet_client/", name: "aspnet_client"},
 	{path: "/App_Data/", name: "App_Data"},
 }
-
-// iisPattern matches IIS default directory listing HTML structure.
-var iisPattern = regexp.MustCompile(`</title></head><body><H1>.*?-.*?</H1><hr>`)
-
-// genericListingPattern matches generic directory listing titles like:
-// <title>listing directory /ftp/</title>, <title>Directory listing for /</title>,
-// <title>Index of /uploads</title>, <title>Directory: /path</title>
-var genericListingPattern = regexp.MustCompile(`(?i)<title>\s*(?:(?:listing|index)\s+(?:of|directory)|directory\s+(?:listing|index|of))\b`)
 
 // Module implements the common directory listing exposure active scanner.
 type Module struct {
@@ -89,16 +79,23 @@ func (m *Module) ScanPerRequest(
 	host := service.Host()
 
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
 	// Fingerprint 404 response body hash
 	notFoundHash := get404Hash(ctx, httpClient)
 
+	// Host-wide catch-all guard: a real autoindex server 404s a non-existent
+	// directory, so if a random guaranteed-nonexistent dir already renders a
+	// listing-shaped body the host templates that body for any path (SPA shell,
+	// wildcard rewrite, soft-404) and every per-directory finding is spurious.
+	if modkit.RandomDirCatchAll(scanCtx, ctx, httpClient, func(b string) bool { return modkit.DetectDirectoryListingServer(b) != "" }) {
+		return nil, nil
+	}
+
 	var results []*output.ResultEvent
-	target := ctx.Target()
+	base := modkit.ServiceBaseURL(service)
 
 	for _, probe := range probePaths {
 		probeRaw, err := httpmsg.SetPath(ctx.Request().Raw(), probe.path)
@@ -107,11 +104,9 @@ func (m *Module) ScanPerRequest(
 		}
 		probeRaw, _ = httpmsg.SetMethod(probeRaw, "GET")
 
-		probeReq, err := httpmsg.ParseRawRequest(string(probeRaw))
-		if err != nil {
-			continue
-		}
-		probeReq = probeReq.WithService(ctx.Service())
+		// SetPath/SetMethod produce well-formed raw, so wrap directly instead
+		// of re-parsing on this hot path.
+		probeReq := httpmsg.NewRequestResponseRaw(probeRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(probeReq, http.Options{})
 		if err != nil {
@@ -140,49 +135,14 @@ func (m *Module) ScanPerRequest(
 		}
 
 		// Check for directory listing indicators
-		if serverType := detectDirectoryListing(body); serverType != "" {
-			results = append(results, buildResult(target, host, probe, serverType, string(probeRaw), resp.FullResponseString()))
+		if serverType := modkit.DetectDirectoryListingServer(body); serverType != "" {
+			results = append(results, buildResult(base, host, probe, serverType, string(probeRaw), resp.FullResponseString()))
 		}
 
 		resp.Close()
 	}
 
 	return results, nil
-}
-
-// detectDirectoryListing checks the response body for server-specific directory listing indicators.
-// Returns the server type string if detected, empty string otherwise.
-func detectDirectoryListing(body string) string {
-	lower := strings.ToLower(body)
-
-	// Jetty: <title>Directory: AND jetty-dir.css
-	if strings.Contains(lower, "<title>directory:") && strings.Contains(lower, "jetty-dir.css") {
-		return "Jetty"
-	}
-
-	// IIS: </title></head><body><H1>...-...</H1><hr>
-	if iisPattern.MatchString(body) {
-		return "IIS"
-	}
-
-	// Apache: <title>Index of AND <h1>Index of
-	if strings.Contains(lower, "<title>index of") && strings.Contains(lower, "<h1>index of") {
-		return "Apache"
-	}
-
-	// Nginx: <title>Index of AND <pre>
-	if strings.Contains(lower, "<title>index of") && strings.Contains(lower, "<pre>") {
-		return "Nginx"
-	}
-
-	// Generic catch-all: matches title patterns like "listing directory", "directory listing",
-	// "index of", "directory of", etc. Covers Express serve-index, Python SimpleHTTPServer,
-	// and other servers with directory listing titles.
-	if genericListingPattern.MatchString(body) {
-		return "Generic"
-	}
-
-	return ""
 }
 
 // get404Hash fetches a known-missing path to fingerprint the 404 page.
@@ -194,11 +154,9 @@ func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) st
 	}
 	raw, _ = httpmsg.SetMethod(raw, "GET")
 
-	req, err := httpmsg.ParseRawRequest(string(raw))
-	if err != nil {
-		return ""
-	}
-	req = req.WithService(ctx.Service())
+	// SetPath/SetMethod produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(req, http.Options{})
 	if err != nil {
@@ -209,12 +167,13 @@ func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) st
 	return utils.Sha1(resp.Body().String())
 }
 
-func buildResult(target, host string, probe probePath, serverType, request, response string) *output.ResultEvent {
+func buildResult(base, host string, probe probePath, serverType, request, response string) *output.ResultEvent {
+	matched := fmt.Sprintf("%s%s", base, probe.path)
 	return &output.ResultEvent{
 		ModuleID: ModuleID,
 		Host:     host,
-		URL:      target,
-		Matched:  fmt.Sprintf("%s%s", target, probe.path),
+		URL:      matched,
+		Matched:  matched,
 		Request:  request,
 		Response: response,
 		ExtractedResults: []string{

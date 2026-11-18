@@ -9,6 +9,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/utils"
 )
@@ -91,23 +92,24 @@ func (m *Module) ScanPerRequest(
 
 	for _, header := range log4jHeaders {
 		for _, tmpl := range jndiTemplates {
-			oastURL := oast.GenerateURL(urlx.String(), header, "header", ModuleID, requestHash)
+			oastURL := modkit.OASTURLFor(oast, oastclass.JNDI, urlx.String(), header, "header", ModuleID, requestHash)
 			if oastURL == "" {
 				continue
 			}
 
 			payload := fmt.Sprintf(tmpl, oastURL)
+			// Record the real JNDI payload so the finding reconstructs the header
+			// with "${jndi:...}" rather than a bare http://<host>.
+			oast.RecordPayload(oastURL, payload)
 
 			modifiedRaw, err := httpmsg.AddOrReplaceHeader(ctx.Request().Raw(), header, payload)
 			if err != nil {
 				continue
 			}
 
-			fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-			if err != nil {
-				continue
-			}
-			fuzzedReq = fuzzedReq.WithService(ctx.Service())
+			// modifiedRaw is internally built (well-formed), so wrap directly
+			// instead of re-parsing on this hot path.
+			fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 			resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 			if err != nil {
@@ -155,19 +157,18 @@ func (m *Module) ScanPerInsertionPoint(
 	requestHash := ctx.Request().ID()
 
 	for _, tmpl := range jndiTemplates {
-		oastURL := oast.GenerateURL(urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
+		oastURL := modkit.OASTURLFor(oast, oastclass.JNDI, urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
 		if oastURL == "" {
 			continue
 		}
 
 		payload := fmt.Sprintf(tmpl, oastURL)
+		oast.RecordPayload(oastURL, payload)
 		fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-		fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-		if err != nil {
-			continue
-		}
-		fuzzedReq = fuzzedReq.WithService(ctx.Service())
+		// BuildRequest produces well-formed raw, so wrap directly instead
+		// of re-parsing on this hot path.
+		fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 		if err != nil {

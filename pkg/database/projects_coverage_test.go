@@ -2,9 +2,13 @@ package database
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
+
+	"github.com/vigolium/vigolium/pkg/apicontract"
 )
 
 // makeProject inserts a project row and returns it.
@@ -196,6 +200,104 @@ func TestReassignAndPurgeProjectData(t *testing.T) {
 	}
 }
 
+// TestReassignProjectData_MovesAllOwnedTables guards the fix that reassignment
+// covers the full project-owned table set (it previously omitted agentic_scans and
+// authentication_hostnames, which then stayed pinned to the deleted source project).
+func TestReassignProjectData_MovesAllOwnedTables(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	src := uuid.NewString()
+	dst := uuid.NewString()
+
+	agentUUID := uuid.NewString()
+	if err := repo.CreateAgenticScan(ctx, &AgenticScan{UUID: agentUUID, ProjectUUID: src, Status: "completed"}); err != nil {
+		t.Fatalf("CreateAgenticScan: %v", err)
+	}
+	if err := repo.SaveAuthenticationHostname(ctx, &AuthenticationHostname{ProjectUUID: src, Hostname: "auth.example.com"}); err != nil {
+		t.Fatalf("SaveAuthenticationHostname: %v", err)
+	}
+	// analysis_artifacts carries project_uuid but was previously omitted from the
+	// owned-table set, so reassignment left its rows pinned to the deleted source.
+	if _, err := db.NewInsert().Model(&AnalysisArtifact{
+		ProjectUUID:    src,
+		HTTPRecordUUID: uuid.NewString(),
+		Kind:           "test",
+		SHA256:         "deadbeef",
+		ByteLength:     3,
+		Content:        []byte("xyz"),
+	}).Exec(ctx); err != nil {
+		t.Fatalf("insert analysis_artifact: %v", err)
+	}
+
+	if err := repo.ReassignProjectData(ctx, src, dst); err != nil {
+		t.Fatalf("ReassignProjectData: %v", err)
+	}
+
+	agentSrc, _ := db.NewSelect().Model((*AgenticScan)(nil)).Where("project_uuid = ?", src).Count(ctx)
+	agentDst, _ := db.NewSelect().Model((*AgenticScan)(nil)).Where("project_uuid = ?", dst).Count(ctx)
+	if agentSrc != 0 || agentDst != 1 {
+		t.Errorf("agentic_scans reassign: src=%d dst=%d, want 0/1 (was previously omitted)", agentSrc, agentDst)
+	}
+	authSrc, _ := db.NewSelect().Model((*AuthenticationHostname)(nil)).Where("project_uuid = ?", src).Count(ctx)
+	authDst, _ := db.NewSelect().Model((*AuthenticationHostname)(nil)).Where("project_uuid = ?", dst).Count(ctx)
+	if authSrc != 0 || authDst != 1 {
+		t.Errorf("authentication_hostnames reassign: src=%d dst=%d, want 0/1 (was previously omitted)", authSrc, authDst)
+	}
+	artSrc, _ := db.NewSelect().Model((*AnalysisArtifact)(nil)).Where("project_uuid = ?", src).Count(ctx)
+	artDst, _ := db.NewSelect().Model((*AnalysisArtifact)(nil)).Where("project_uuid = ?", dst).Count(ctx)
+	if artSrc != 0 || artDst != 1 {
+		t.Errorf("analysis_artifacts reassign: src=%d dst=%d, want 0/1 (was previously omitted)", artSrc, artDst)
+	}
+}
+
+// TestProjectOwnedTablesMatchesSchema is a self-maintaining guard: it enumerates
+// every table in the schema that actually carries a project_uuid column and fails
+// if that set diverges from projectOwnedTables. This would have caught the
+// analysis_artifacts omission the moment the table was added, without anyone
+// remembering to update a hand-maintained seed list.
+func TestProjectOwnedTablesMatchesSchema(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	var tableNames []string
+	if err := db.NewRaw(
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+	).Scan(ctx, &tableNames); err != nil {
+		t.Fatalf("list tables: %v", err)
+	}
+
+	schemaOwned := map[string]bool{}
+	for _, tbl := range tableNames {
+		// Table names come from sqlite_master (trusted); the table-valued
+		// pragma_table_info form lets us project just the column name.
+		var colNames []string
+		if err := db.NewRaw(fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", tbl)).Scan(ctx, &colNames); err != nil {
+			t.Fatalf("table_info(%s): %v", tbl, err)
+		}
+		for _, name := range colNames {
+			if name == "project_uuid" {
+				schemaOwned[tbl] = true
+				break
+			}
+		}
+	}
+
+	listed := map[string]bool{}
+	for _, tbl := range projectOwnedTables {
+		listed[tbl] = true
+		if !schemaOwned[tbl] {
+			t.Errorf("projectOwnedTables lists %q but it has no project_uuid column in the schema", tbl)
+		}
+	}
+	for tbl := range schemaOwned {
+		if !listed[tbl] {
+			t.Errorf("table %q has a project_uuid column but is missing from projectOwnedTables (reassign/purge would orphan its rows)", tbl)
+		}
+	}
+}
+
 func TestGetProjectStatsAndAll(t *testing.T) {
 	db := newTestDB(t)
 	repo := NewRepository(db)
@@ -242,5 +344,31 @@ func TestGetProjectStatsAndAll(t *testing.T) {
 	}
 	if all[projB].HTTP5xx != 1 || all[projB].Critical != 1 {
 		t.Errorf("B aggregate wrong: 5xx=%d critical=%d", all[projB].HTTP5xx, all[projB].Critical)
+	}
+}
+
+// A --project-name that resolves to no project or to several carries a code,
+// so the CLI reports project_not_found / ambiguous_id instead of "failed".
+func TestGetProjectByNameErrorCodes(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+	makeProject(t, repo, "dup", "")
+	makeProject(t, repo, "dup", "")
+
+	codeOf := func(err error) string {
+		var coded interface{ Code() apicontract.ErrorCode }
+		if !errors.As(err, &coded) {
+			return ""
+		}
+		return string(coded.Code())
+	}
+	_, err := repo.GetProjectByName(ctx, "nope")
+	if codeOf(err) != "project_not_found" {
+		t.Errorf("missing name: %v (%q)", err, codeOf(err))
+	}
+	_, err = repo.GetProjectByName(ctx, "dup")
+	if codeOf(err) != "ambiguous_id" {
+		t.Errorf("ambiguous name: %v (%q)", err, codeOf(err))
 	}
 }

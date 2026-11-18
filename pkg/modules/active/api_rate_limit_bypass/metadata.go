@@ -9,22 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects API rate limiting that can be bypassed using IP spoofing headers such as
-X-Forwarded-For, X-Real-IP, and similar headers. First triggers rate limiting by
-sending rapid requests, then tests whether bypass headers circumvent the limit.
+	ModuleDesc = `**What it means:** A throttled GET became successful for two distinct test identities supplied through a forwarding header. This differential is a candidate; a finding requires exhausting identity A, immediate success for identity B, and continued throttling for A and the plain request.
 
-## Notes
-- Runs once per host with internal deduplication
-- Sends up to 10 rapid requests to trigger rate limiting
-- Tests 8 different IP spoofing header variations
-- Only reports when rate limiting is confirmed then bypassed
+**How it's exploited:** An attacker rotates spoofed client-IP headers to obtain fresh rate-limit buckets.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/04-Authentication_Testing/04-Testing_for_Bypassing_Authentication_Schema
-- https://portswigger.net/web-security/authentication/password-based`
+**Fix:** Key limits from the trusted connection source and honor forwarding headers only from known proxies.`
 
-	ModuleConfirmation = "Confirmed when the server enforces rate limiting (429 response) but accepts requests with IP spoofing headers, indicating bypassable rate limiting"
+	ModuleConfirmation = "Candidate after a body-matched 429/header/429 differential with two identities; confirmed when per-identity bucket exhaustion and rotation are demonstrated"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"auth-bypass", "probe", "moderate"}

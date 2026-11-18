@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -12,16 +14,15 @@ import (
 // AgentConfig holds AI agent integration settings. Dispatch goes through the
 // in-process olium runtime; there are no external subprocess backends.
 type AgentConfig struct {
-	DefaultAgent  string              `yaml:"default_agent"`
-	TemplatesDir  string              `yaml:"templates_dir"`
-	SessionsDir   string              `yaml:"sessions_dir"` // directory for agent run session artifacts (default: ~/.vigolium/agent-sessions/)
-	Stream        *bool               `yaml:"stream,omitempty"`
-	LLM           LLMConfig           `yaml:"llm"`
-	ContextLimits ContextLimits       `yaml:"context_limits,omitempty"` // limits for DB context enrichment
-	Guardrails    AutopilotGuardrails `yaml:"guardrails,omitempty"`     // guardrails for SDK autonomous mode
-	Browser       BrowserConfig       `yaml:"browser,omitempty"`        // optional agent-browser integration for browser-based auth flows
-	Audit         AuditAgentConfig    `yaml:"audit,omitempty"`          // optional vigolium-audit integration for background security audits
-	Olium         OliumConfig         `yaml:"olium"`                    // native in-process olium agent engine settings
+	DefaultAgent  string           `yaml:"default_agent"`
+	TemplatesDir  string           `yaml:"templates_dir"`
+	SessionsDir   string           `yaml:"sessions_dir"` // directory for agent run session artifacts (default: ~/.vigolium/agent-sessions/)
+	Stream        *bool            `yaml:"stream,omitempty"`
+	LLM           LLMConfig        `yaml:"llm"`
+	ContextLimits ContextLimits    `yaml:"context_limits,omitempty"` // limits for DB context enrichment
+	Browser       BrowserConfig    `yaml:"browser,omitempty"`        // optional agent-browser integration for browser-based auth flows
+	Audit         AuditAgentConfig `yaml:"audit,omitempty"`          // optional vigolium-audit integration for background security audits
+	Olium         OliumConfig      `yaml:"olium"`                    // native in-process olium agent engine settings
 }
 
 // OliumConfig holds settings for the native in-process olium agent engine.
@@ -31,43 +32,124 @@ type AgentConfig struct {
 // Provider naming is vendor-first (anthropic-* / openai-* / google-*) so the
 // prefix tells you which credentials to provide:
 //   - openai-codex-oauth — uses oauth_cred_path (a JSON file produced by `codex login`)
-//   - openai-api-key     — uses llm_api_key (or $OPENAI_API_KEY)
+//   - openai-api-key     — uses llm_api_key (or $OPENAI_API_KEY); OpenAI Chat Completions API
+//   - openai-responses   — uses llm_api_key (or $OPENAI_API_KEY); public OpenAI Responses API (/v1/responses)
 //   - anthropic-api-key  — uses llm_api_key (or $ANTHROPIC_API_KEY)
 //   - anthropic-oauth    — uses oauth_token (or $ANTHROPIC_API_KEY); for tokens minted with `claude setup-token`
 //   - anthropic-cli      — shells out to the `claude` binary; no key needed here
+//     (alias: anthropic-claude-cli)
+//   - anthropic-claude-sdk-bridge — drives Claude Code through the Agent SDK via
+//     the `vigolium-audit bridge` sidecar (bridge_binary; empty = embedded blob,
+//     then PATH). No key needed — uses ambient Claude Code subscription auth;
+//     an explicit llm_api_key / oauth_token is forwarded when set.
 //   - anthropic-vertex   — uses oauth_cred_path (GCP service-account JSON, or $GOOGLE_APPLICATION_CREDENTIALS),
 //     plus google_cloud_project + google_cloud_location; routes claude-* models to publishers/anthropic.
 //   - google-vertex      — same GCP creds as anthropic-vertex, but routes gemini-* models to publishers/google.
 //   - openai-compatible  — any OpenAI Chat-Completions-compatible endpoint
 //     (Ollama, OpenRouter, LM Studio, vLLM, Together, Groq, LocalAI, custom
 //     proxies); configured under olium.custom_provider.
+//   - anthropic-compatible — any Anthropic Messages-compatible endpoint
+//     (a self-hosted gateway or Messages-format proxy) at a custom base_url;
+//     configured under olium.custom_provider (base_url / model_id / api_key /
+//     extra_headers).
 //
 // YAML tags intentionally omit `omitempty` so that every field surfaces in
 // `vigolium config ls olium` (including empty strings rendered as "(empty)"),
 // making the available knobs discoverable.
 type OliumConfig struct {
-	Provider            string               `yaml:"provider"`              // openai-codex-oauth | openai-api-key | anthropic-api-key | anthropic-oauth | anthropic-cli | anthropic-vertex | google-vertex | openai-compatible
-	Model               string               `yaml:"model"`                 // empty (default) = provider default; for openai-compatible this falls back to custom_provider.model_id
+	Provider            string               `yaml:"provider"`              // openai-codex-oauth | openai-api-key | openai-responses | anthropic-api-key | anthropic-oauth | anthropic-cli | anthropic-vertex | google-vertex | openai-compatible | anthropic-compatible
+	Model               string               `yaml:"model"`                 // empty (default) = provider default; for openai-compatible / anthropic-compatible this falls back to custom_provider.model_id
 	OAuthCredPath       string               `yaml:"oauth_cred_path"`       // OAuth/SA file path (openai-codex-oauth, anthropic-vertex, google-vertex); default ~/.codex/auth.json. For Vertex providers, falls back to $GOOGLE_APPLICATION_CREDENTIALS.
+	BridgeBinary        string               `yaml:"bridge_binary"`         // path to the `vigolium-audit` binary hosting the SDK bridge (anthropic-claude-sdk-bridge); empty = embedded blob, then PATH
 	OAuthToken          string               `yaml:"oauth_token"`           // OAuth bearer token (anthropic-oauth); produced by `claude setup-token`. Supports ${ENV_VAR} expansion, falls back to $ANTHROPIC_API_KEY when empty
-	LLMAPIKey           string               `yaml:"llm_api_key"`           // API-key providers (anthropic-api-key, openai-api-key); supports ${ENV_VAR} expansion at load time, falls back to provider-specific env (ANTHROPIC_API_KEY / OPENAI_API_KEY)
+	LLMAPIKey           string               `yaml:"llm_api_key"`           // API-key providers (anthropic-api-key, openai-api-key, openai-responses); supports ${ENV_VAR} expansion at load time, falls back to provider-specific env (ANTHROPIC_API_KEY / OPENAI_API_KEY)
 	GoogleCloudProject  string               `yaml:"google_cloud_project"`  // GCP project for Vertex providers; $GOOGLE_CLOUD_PROJECT wins, then YAML, then SA file's project_id
 	GoogleCloudLocation string               `yaml:"google_cloud_location"` // GCP region for Vertex providers; $GOOGLE_CLOUD_LOCATION wins, then YAML, default us-central1
-	ReasoningEffort     string               `yaml:"reasoning_effort"`      // minimal|low|medium|high|xhigh (codex today); default medium
+	ReasoningEffort     string               `yaml:"reasoning_effort"`      // minimal|low|medium|high|xhigh|max; default medium. Forwarded to every provider that has an effort dial (minimal is OpenAI-only, max is Anthropic-only; each provider drops the level it cannot express)
 	SystemPrompt        string               `yaml:"system_prompt"`         // empty = built-in olium prompt
-	CustomProvider      CustomProviderConfig `yaml:"custom_provider"`       // openai-compatible knobs: base_url / model_id / api_key / extra_headers
-	MaxTokens           int                  `yaml:"max_tokens"`            // default 1000000
-	Temperature         float64              `yaml:"temperature"`           // default 0.0
+	CustomProvider      CustomProviderConfig `yaml:"custom_provider"`       // openai-compatible / anthropic-compatible knobs: base_url / model_id / api_key / extra_headers
+	MaxTokens           int                  `yaml:"max_tokens"`            // per-response output cap; 0 = provider default (64000 on Anthropic). Honored by the Anthropic transports only; a value above the model's cap is ignored rather than sent
+	Temperature         float64              `yaml:"temperature"`           // accepted but ignored: current Claude models reject sampling params
 	MaxTurns            int                  `yaml:"max_turns"`             // default 32. Applies to short non-autopilot engine uses (swarm phases, source analysis, query). Autopilot ignores this and uses its own pkg/olium/autopilot.DefaultAutopilotMaxTurns (200); override autopilot via --max-commands or the API MaxCommands field.
 	CacheSize           int                  `yaml:"cache_size"`            // LRU entries; default 1024, 0 disables
-	MaxConcurrent       int                  `yaml:"max_concurrent"`        // global cap on simultaneous in-flight provider calls; default 4, 0 disables (unbounded)
+	MaxConcurrent       int                  `yaml:"max_concurrent"`        // global cap on simultaneous in-flight provider calls; default 4 (0/unset), negative disables the cap (unbounded)
 	CallTimeoutSec      int                  `yaml:"call_timeout_sec"`      // per-call deadline in seconds (default 600 = 10m). Negative = inherit only the parent ctx (no enforced timeout).
+	PreflightTimeout    string               `yaml:"preflight_timeout"`     // agent preflight ping deadline, a Go duration ("15s", "1m"); empty = auto: 15s, or 60s for a local endpoint (openai-/anthropic-compatible on loopback, e.g. Ollama / LM Studio). --preflight-timeout overrides per run
+	AlwaysOnSkills      []string             `yaml:"always_on_skills"`      // skills always loaded regardless of planner selection (autopilot/swarm); empty = built-in default [triage-finding, write-jsext]
+
+	// AutopilotMode selects the durable-autopilot behavior:
+	//   - legacy  (default) — current behavior, byte-for-byte unchanged: no
+	//     section rotation, report_finding writes findings directly, the new
+	//     agent_sections / agent_finding_candidates tables are never touched.
+	//   - shadow  — enable bounded operator sections with context rotation AND
+	//     mirror every report_finding call to a candidate row, so the fresh-
+	//     context verifier can grade them without changing the direct-finding
+	//     behavior (findings still land immediately; promoted candidates are
+	//     tagged distinctly for FP-rate comparison).
+	//   - enforced — enable rotation and route findings through the
+	//     candidate → verify → promote pipeline (report_finding is replaced by
+	//     propose_candidate; only verified candidates become findings).
+	// Empty or any unrecognized value resolves to "legacy" via EffectiveAutopilotMode.
+	AutopilotMode string `yaml:"autopilot_mode"`
 }
 
-// CustomProviderConfig configures the `openai-compatible` provider — any
-// backend that speaks the OpenAI Chat Completions wire format. Examples:
-// Ollama (http://localhost:11434/v1), OpenRouter, LM Studio, vLLM, Together,
-// Groq, LocalAI, or a custom proxy.
+// Autopilot mode constants for OliumConfig.AutopilotMode. Exported so callers
+// (CLI/pipeline/autopilot) branch on the same canonical strings.
+const (
+	AutopilotModeLegacy   = "legacy"
+	AutopilotModeShadow   = "shadow"
+	AutopilotModeEnforced = "enforced"
+)
+
+// NormalizeAutopilotMode resolves an arbitrary autopilot-mode string to one of
+// the canonical values, defaulting to "legacy" for empty/unknown input. The
+// single source of truth consulted by both EffectiveAutopilotMode and the
+// autopilot runtime, so an invalid value can never silently enable rotation /
+// verification.
+func NormalizeAutopilotMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case AutopilotModeShadow:
+		return AutopilotModeShadow
+	case AutopilotModeEnforced:
+		return AutopilotModeEnforced
+	default:
+		return AutopilotModeLegacy
+	}
+}
+
+// EffectiveAutopilotMode returns the resolved durable-autopilot mode, defaulting
+// to "legacy" when unset or set to an unrecognized value.
+func (c *OliumConfig) EffectiveAutopilotMode() string {
+	if c == nil {
+		return AutopilotModeLegacy
+	}
+	return NormalizeAutopilotMode(c.AutopilotMode)
+}
+
+// DefaultAlwaysOnSkills are the general-purpose skills kept available in
+// every planner-filtered agentic run, even when the planner doesn't pick
+// them. They aren't tied to a single vulnerability class, so filtering them
+// out would only ever hurt.
+var DefaultAlwaysOnSkills = []string{"triage-finding", "write-jsext"}
+
+// EffectiveAlwaysOnSkills returns the configured always-on skill names, or the
+// built-in default when unset. A configured empty list (explicit `[]`) is
+// indistinguishable from unset in YAML, so the default applies — to truly opt
+// out of always-on skills, use --no-skill-filter or rely on planner picks.
+func (c *OliumConfig) EffectiveAlwaysOnSkills() []string {
+	if c == nil || len(c.AlwaysOnSkills) == 0 {
+		return DefaultAlwaysOnSkills
+	}
+	return c.AlwaysOnSkills
+}
+
+// CustomProviderConfig configures the custom-base-url providers. For
+// `openai-compatible` it fronts any OpenAI Chat Completions endpoint — Ollama
+// (http://localhost:11434/v1), OpenRouter, LM Studio, vLLM, Together, Groq,
+// LocalAI, or a custom proxy. For `anthropic-compatible` it fronts any
+// Anthropic Messages (/v1/messages) endpoint — a self-hosted gateway or
+// Messages-format proxy. (ExtraBody / provider_routing apply to
+// openai-compatible only.)
 //
 // BaseURL is the only required field. APIKey is optional (Ollama, LM Studio,
 // and local proxies typically don't need one — when empty, no Authorization
@@ -83,6 +165,92 @@ type CustomProviderConfig struct {
 	ModelID      string          `yaml:"model_id"`      // default model when olium.model and --model are empty
 	APIKey       string          `yaml:"api_key"`       // optional; supports ${ENV_VAR} expansion. Empty = no Authorization header sent
 	ExtraHeaders ExtraHeaderList `yaml:"extra_headers"` // curl-style "Key: Value" entries applied to every request; can override standard headers
+
+	// ProviderRouting is the typed convenience knob for OpenRouter's provider
+	// routing object. Plays cleanly with `vigolium config set
+	// ...provider_routing.<field>` because every field exists as a leaf in
+	// the marshaled YAML. Merged into the request body as the "provider"
+	// key. See ProviderRoutingConfig for the field list. Use ExtraBody for
+	// non-OpenRouter backends or for OpenRouter fields not covered here
+	// (max_price, preferred_min_throughput, preferred_max_latency).
+	ProviderRouting ProviderRoutingConfig `yaml:"provider_routing"`
+
+	// ExtraBody is a generic JSON-body passthrough merged into every
+	// openai-compatible request. The canonical use case is OpenRouter
+	// extensions the typed knob doesn't cover, and other backends'
+	// body-level options (vLLM, Together's "transforms", etc.). Reserved
+	// top-level keys (model, messages, tools, stream, stream_options) are
+	// rejected at request time. Setting both this and ProviderRouting with
+	// a `provider` key here raises a conflict error — use one or the other.
+	ExtraBody map[string]any `yaml:"extra_body,omitempty"`
+}
+
+// ProviderRoutingConfig is the typed knob for OpenRouter's provider routing
+// object — the JSON `provider` field documented at
+// https://openrouter.ai/docs/features/provider-routing.
+//
+// YAML tags deliberately omit `omitempty` so every field exists as a leaf in
+// the marshaled config, which is what `vigolium config set
+// ...provider_routing.<field>` needs to navigate to. The trade-off is that
+// saved configs show unset fields as YAML nulls; the runtime emit path
+// (ProviderRoutingMap) drops those, so the wire body stays clean.
+//
+// Pointer types are used for bools where false != unset (OpenRouter's
+// default for `allow_fallbacks` is true; a user setting `false` alone has
+// a real semantic intent).
+//
+// Fields not covered here (max_price, preferred_min_throughput,
+// preferred_max_latency) are intentionally deferred; use
+// custom_provider.extra_body as the escape hatch.
+type ProviderRoutingConfig struct {
+	Order             []string `yaml:"order"`              // upstream provider slugs in preference order
+	Only              []string `yaml:"only"`               // restrict to these provider slugs
+	Ignore            []string `yaml:"ignore"`             // exclude these provider slugs
+	AllowFallbacks    *bool    `yaml:"allow_fallbacks"`    // default unset (OpenRouter defaults to true); false = strict
+	Sort              string   `yaml:"sort"`               // "price" | "throughput" | "latency"
+	Quantizations     []string `yaml:"quantizations"`      // e.g. ["fp8", "int8"]
+	DataCollection    string   `yaml:"data_collection"`    // "allow" | "deny"
+	RequireParameters *bool    `yaml:"require_parameters"` // only providers that honour every request parameter
+	ZDR               *bool    `yaml:"zdr"`                // Zero Data Retention only
+}
+
+// ProviderRoutingMap returns the routing config as a map[string]any with
+// only the fields the user actually set. Returns nil if every field is at
+// its zero value, signalling "no routing preferences — let OpenRouter
+// decide". Slices are emitted only when non-empty.
+func (c *ProviderRoutingConfig) ProviderRoutingMap() map[string]any {
+	out := map[string]any{}
+	if len(c.Order) > 0 {
+		out["order"] = c.Order
+	}
+	if len(c.Only) > 0 {
+		out["only"] = c.Only
+	}
+	if len(c.Ignore) > 0 {
+		out["ignore"] = c.Ignore
+	}
+	if c.AllowFallbacks != nil {
+		out["allow_fallbacks"] = *c.AllowFallbacks
+	}
+	if c.Sort != "" {
+		out["sort"] = c.Sort
+	}
+	if len(c.Quantizations) > 0 {
+		out["quantizations"] = c.Quantizations
+	}
+	if c.DataCollection != "" {
+		out["data_collection"] = c.DataCollection
+	}
+	if c.RequireParameters != nil {
+		out["require_parameters"] = *c.RequireParameters
+	}
+	if c.ZDR != nil {
+		out["zdr"] = *c.ZDR
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ExtraHeaderList is a list of curl-style "Key: Value" header strings. It
@@ -157,6 +325,65 @@ func (c *CustomProviderConfig) ExtraHeadersMap() map[string]string {
 	return out
 }
 
+// ExtraBodyMap returns the extra_body map, or nil if unset. Provided so
+// callers stay symmetric with ExtraHeadersMap and so future validation
+// (e.g. ${ENV_VAR} expansion) has a single hook point.
+func (c *CustomProviderConfig) ExtraBodyMap() map[string]any {
+	if len(c.ExtraBody) == 0 {
+		return nil
+	}
+	return c.ExtraBody
+}
+
+// EffectiveExtraBody combines the typed ProviderRouting knob with the
+// generic ExtraBody passthrough into a single body-extension map. The
+// typed knob becomes the "provider" key. Returns nil if neither field is
+// set. Returns an error if both set a "provider" key (the operator must
+// pick one path — typed is recommended).
+func (c *CustomProviderConfig) EffectiveExtraBody() (map[string]any, error) {
+	routing := c.ProviderRouting.ProviderRoutingMap()
+	extra := c.ExtraBodyMap()
+	if routing == nil && extra == nil {
+		return nil, nil
+	}
+	if routing != nil {
+		if extra != nil {
+			if _, conflict := extra["provider"]; conflict {
+				return nil, fmt.Errorf("custom_provider: both provider_routing and extra_body.provider are set; remove one (provider_routing is the recommended typed form)")
+			}
+		}
+	}
+	out := make(map[string]any, len(extra)+1)
+	for k, v := range extra {
+		out[k] = v
+	}
+	if routing != nil {
+		out["provider"] = routing
+	}
+	return out, nil
+}
+
+// DisplayProvider returns the olium provider name for operator-facing output
+// (startup banner, hot-reload log), substituting the implicit default when
+// unset. Display-only: actual per-provider runtime resolution lives in the
+// olium runner, so don't use this to drive provider selection.
+func (c *OliumConfig) DisplayProvider() string {
+	if c == nil || c.Provider == "" {
+		return "openai-codex-oauth"
+	}
+	return c.Provider
+}
+
+// DisplayModel returns the olium model for operator-facing output, or a
+// "(provider default)" placeholder when unset (the concrete model is chosen
+// per-provider at runtime). Pairs with DisplayProvider.
+func (c *OliumConfig) DisplayModel() string {
+	if c == nil || c.Model == "" {
+		return "(provider default)"
+	}
+	return c.Model
+}
+
 // EffectiveCallTimeout returns the per-call timeout. 0 → 10m default,
 // negative → no enforced timeout (parent ctx only).
 func (c *OliumConfig) EffectiveCallTimeout() time.Duration {
@@ -169,9 +396,61 @@ func (c *OliumConfig) EffectiveCallTimeout() time.Duration {
 	return 10 * time.Minute
 }
 
-// EffectiveMaxConcurrent returns MaxConcurrent or the default (4). Use 0 in
-// config to explicitly disable the cap (unbounded parallelism — only
-// sensible if the upstream provider has no rate limit, which is rare).
+// Default agent preflight deadlines: a hosted provider answers a one-token
+// ping in a few seconds, while a local model (Ollama, LM Studio) may first have
+// to load its weights.
+const (
+	DefaultPreflightTimeout      = 15 * time.Second
+	DefaultLocalPreflightTimeout = 60 * time.Second
+)
+
+// EffectivePreflightTimeout returns the deadline of the agent preflight ping:
+// preflight_timeout when it parses as a positive duration, else the default for
+// the configured provider (DefaultLocalPreflightTimeout for a local endpoint).
+func (c *OliumConfig) EffectivePreflightTimeout() time.Duration {
+	if c == nil {
+		return DefaultPreflightTimeout
+	}
+	if raw := strings.TrimSpace(c.PreflightTimeout); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	if c.IsLocalProvider() {
+		return DefaultLocalPreflightTimeout
+	}
+	return DefaultPreflightTimeout
+}
+
+// IsLocalProvider reports whether the configured provider is a model served on
+// this machine: an openai-/anthropic-compatible endpoint whose base_url host is
+// loopback (Ollama on :11434, LM Studio on :1234, a local vLLM).
+func (c *OliumConfig) IsLocalProvider() bool {
+	if c == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Provider)) {
+	case "openai-compatible", "anthropic-compatible":
+	default:
+		return false
+	}
+	u, err := url.Parse(strings.TrimSpace(c.CustomProvider.BaseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// EffectiveMaxConcurrent returns the provider-call concurrency cap. A positive
+// value is used as-is; 0 (unset) resolves to the default of 4; a NEGATIVE value
+// disables the cap entirely (unbounded parallelism — only sensible if the
+// upstream provider has no rate limit, which is rare). Note: 0 does NOT mean
+// unbounded — use a negative value for that.
 func (c *OliumConfig) EffectiveMaxConcurrent() int {
 	if c.MaxConcurrent < 0 {
 		return 0
@@ -220,13 +499,6 @@ func (c *ContextLimits) EffectiveMinRiskScore() int {
 		return c.MinRiskScore
 	}
 	return 50
-}
-
-// AutopilotGuardrails controls safety and observability for SDK autonomous mode.
-type AutopilotGuardrails struct {
-	LogCommands     bool     `yaml:"log_commands,omitempty"`     // log agent tool use at INFO level (default: false)
-	MaxTurns        int      `yaml:"max_turns,omitempty"`        // hard ceiling for max turns (0 = no override, use MaxCommands*3)
-	DisallowedTools []string `yaml:"disallowed_tools,omitempty"` // extra tools to block in SDK mode
 }
 
 // BrowserConfig controls optional agent-browser integration for browser-based auth flows.
@@ -318,12 +590,12 @@ func (c *AuditAgentConfig) EffectiveSyncInterval() int {
 // Deprecated: configure agent.olium; this block is ignored.
 type LLMConfig struct {
 	Provider    string  `yaml:"provider"`    // "anthropic" (default) or "openai"
-	Model       string  `yaml:"model"`       // e.g. "claude-sonnet-4-6", "gpt-4o"
+	Model       string  `yaml:"model"`       // e.g. "claude-sonnet-5", "gpt-5.5"
 	APIKey      string  `yaml:"api_key"`     // inline key (prefer api_key_env)
 	APIKeyEnv   string  `yaml:"api_key_env"` // env var name; defaults to ANTHROPIC_API_KEY / OPENAI_API_KEY
 	BaseURL     string  `yaml:"base_url"`    // custom endpoint for OpenAI-compatible providers
 	MaxTokens   int     `yaml:"max_tokens"`  // default: 4096
-	Temperature float64 `yaml:"temperature"` // default: 0.0
+	Temperature float64 `yaml:"temperature"` // accepted but ignored (see llm.CompletionRequest)
 	CacheSize   int     `yaml:"cache_size"`  // LRU entries; default: 256, 0 = disabled
 	CacheTTL    int     `yaml:"cache_ttl"`   // seconds; default: 300
 }
@@ -371,7 +643,7 @@ func (c *AgentConfig) Validate() error {
 func DefaultLLMConfig() LLMConfig {
 	return LLMConfig{
 		Provider:  "anthropic",
-		Model:     "claude-sonnet-4-6",
+		Model:     "claude-sonnet-5",
 		CacheSize: 256,
 		CacheTTL:  300,
 		MaxTokens: 4096,
@@ -406,7 +678,7 @@ func DefaultOliumConfig() OliumConfig {
 		Model:           "",
 		OAuthCredPath:   "~/.codex/auth.json",
 		ReasoningEffort: "medium",
-		MaxTokens:       1000000,
+		MaxTokens:       0, // 0 = the provider's own ceiling; see OliumConfig.MaxTokens
 		Temperature:     0.0,
 		MaxTurns:        32,
 		CacheSize:       1024,

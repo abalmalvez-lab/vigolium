@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Flask/Werkzeug installations by analyzing HTTP response
-headers (Server: Werkzeug), cookies (Flask default signed session cookie),
-and body patterns (Werkzeug Debugger, Jinja2 errors, Flask tracebacks).
-Reports with Certain confidence on strong signals, Firm on weak signals only.
+	ModuleDesc = `**What it means:** The application runs the Flask framework and Werkzeug WSGI toolkit, shown by the Server header, a Flask signed session cookie, the Werkzeug debugger, or Jinja2/Flask tracebacks. Informational fingerprinting, though an exposed debugger is itself a serious risk.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Deduplicates by host to avoid redundant processing
-- Strong signals: Werkzeug Debugger in body, Werkzeug in Server header
-- Weak signals: Flask session cookie, Jinja2 errors, Flask tracebacks
-- Requires 1+ strong signal or 2+ weak signals to report
+**How it's exploited:** Knowing the framework lets an attacker target Flask/Werkzeug weaknesses: known CVEs, server-side template injection, weak SECRET_KEY session forgery, and the Werkzeug debugger PIN bypass that can lead to remote code execution when reachable.
 
-## References
-- https://flask.palletsprojects.com/`
+**Fix:** Set Server to a generic value, never run the Werkzeug debugger or debug mode in production, and disable detailed tracebacks.`
 
 	ModuleConfirmation = "Confirmed when Flask/Werkzeug-specific signals are detected in the response"
 	ModuleSeverity     = severity.Info

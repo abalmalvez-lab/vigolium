@@ -1,13 +1,36 @@
 import { existsSync } from "fs";
+import { readFile } from "fs/promises";
 import { join, resolve } from "path";
 import chalk from "chalk";
+import { resolveAgentTransport } from "../adapters/detect.js";
 import { getContentLoader, resolveRoots, type ContentVariant } from "../content-loader.js";
+import {
+  buildCodexTriggerPrompt,
+  isCodexHandoffMode,
+} from "../engine/codex-handoff.js";
 import { composeUserPrompt, parseToolsField } from "../engine/prompts.js";
 import { topologicalOrder } from "../engine/phase.js";
 import { probeGit } from "../engine/git.js";
 import { compact } from "../engine/util.js";
-import type { AgentPlatform, AuditMode, PhaseDef, RunOptions } from "../engine/types.js";
-import { resolveRequestedModes, resolveAuditContext } from "./run.js";
+import {
+  knowledgeBaseReference,
+  resolveKnowledgeBaseInput,
+  type KnowledgeBaseReference,
+  type ResolvedKnowledgeBase,
+} from "../engine/knowledge-base.js";
+import type {
+  AgentPlatform,
+  AgentTransport,
+  AuditMode,
+  PhaseDef,
+  RunOptions,
+} from "../engine/types.js";
+import {
+  modeMayResolveKnowledgeBase,
+  modeSupportsKnowledgeBase,
+  resolveRequestedModes,
+  resolveAuditContext,
+} from "./run.js";
 import { detectRefreshRoute } from "./refresh-detect.js";
 import { failCli, statusArrow } from "./util.js";
 
@@ -31,6 +54,12 @@ export async function dryRunCommand(opts: RunOptions): Promise<void> {
   if (platform !== "claude" && platform !== "codex") {
     return fail(json, `--agent must be "claude" or "codex"`);
   }
+  let transport: AgentTransport;
+  try {
+    transport = resolveAgentTransport(opts.transport);
+  } catch (err) {
+    return fail(json, (err as Error).message);
+  }
   const targetDir = resolve(opts.target ?? ".");
   const loader = getContentLoader();
   const roots = resolveRoots();
@@ -45,6 +74,28 @@ export async function dryRunCommand(opts: RunOptions): Promise<void> {
     auditContext = await resolveAuditContext({ targetDir, opts, json });
   } catch (err) {
     return fail(json, (err as Error).message);
+  }
+
+  const acceptsKnowledgeBase = requestedModes.some(modeMayResolveKnowledgeBase);
+  if ((opts.knowledgeBase !== undefined || opts.knowledgeBaseRaw !== undefined) && !acceptsKnowledgeBase) {
+    return fail(json, "--knowledge-base and --knowledge-base-raw are only supported by lite, balanced, deep, and knowledge-base modes");
+  }
+  let knowledgeBase: ResolvedKnowledgeBase | undefined;
+  if (acceptsKnowledgeBase) {
+    try {
+      knowledgeBase = await resolveKnowledgeBaseInput({
+        targetDir,
+        adoptPriorRun: requestedModes[0] !== "knowledge-base",
+        ...compact({
+          path: opts.knowledgeBase,
+          raw: opts.knowledgeBaseRaw,
+          resume: opts.resume || undefined,
+          resumeMode: opts.resume ? requestedModes[0] : undefined,
+        }),
+      });
+    } catch (err) {
+      return fail(json, (err as Error).message);
+    }
   }
 
   const plans: ModePlan[] = [];
@@ -80,8 +131,22 @@ export async function dryRunCommand(opts: RunOptions): Promise<void> {
           focus: auditContext.focus,
           expectedBehaviors: auditContext.expectedBehaviors,
           liveTarget: opts.liveTarget,
+          knowledgeBase: modeSupportsKnowledgeBase(resolvedMode) && knowledgeBase !== undefined
+            ? knowledgeBaseReference(knowledgeBase)
+            : undefined,
         }),
       }),
+    );
+  }
+
+  if (
+    (opts.knowledgeBase !== undefined || opts.knowledgeBaseRaw !== undefined)
+    && !plans.some((plan) => modeSupportsKnowledgeBase(plan.resolvedMode))
+  ) {
+    return fail(
+      json,
+      "knowledge-base input cannot be applied because refresh routed to revisit; " +
+        "run a lite, balanced, deep, or knowledge-base mode instead",
     );
   }
 
@@ -90,19 +155,38 @@ export async function dryRunCommand(opts: RunOptions): Promise<void> {
       JSON.stringify({
         kind: "dryRun",
         platform,
+        transport,
         targetDir,
         gitAvailable: git.available,
         noGit,
         focus: auditContext.focus ?? null,
         expectedBehaviors: auditContext.expectedBehaviors ?? null,
         maxCost: opts.maxCost ?? null,
+        knowledgeBase: knowledgeBase === undefined
+          ? null
+          : {
+              sourceKind: knowledgeBase.sourceKind,
+              sourceLabel: knowledgeBase.sourceLabel,
+              fileCount: knowledgeBase.files.length,
+              totalBytes: knowledgeBase.totalBytes,
+              aggregateSha256: knowledgeBase.aggregateSha256,
+            },
         plans: plans.map(serializePlan),
       }) + "\n",
     );
     return;
   }
 
-  renderPlans({ platform, targetDir, gitAvailable: git.available, noGit, plans, opts });
+  renderPlans({
+    platform,
+    transport,
+    targetDir,
+    gitAvailable: git.available,
+    noGit,
+    plans,
+    opts,
+    ...(knowledgeBase !== undefined ? { knowledgeBase } : {}),
+  });
 }
 
 interface ResolvedPhase {
@@ -117,6 +201,7 @@ interface ResolvedPhase {
 }
 
 interface ModePlan {
+  execution: "codex-handoff" | "phase-graph";
   requestedMode: AuditMode;
   resolvedMode: AuditMode;
   routingNote?: string;
@@ -141,7 +226,44 @@ async function buildModePlan(args: {
   focus?: string;
   expectedBehaviors?: string;
   liveTarget?: string;
+  knowledgeBase?: KnowledgeBaseReference;
 }): Promise<ModePlan> {
+  if (args.platform === "codex" && isCodexHandoffMode(args.resolvedMode)) {
+    const dispatchPath = join(args.roots.contentRoot, "harnesses", "codex", "agents-dispatch.md");
+    const dispatchBody = await readFile(dispatchPath, "utf8");
+    const userPrompt = buildCodexTriggerPrompt({
+      mode: args.resolvedMode,
+      targetDir: args.targetDir,
+      ...(args.liveTarget !== undefined ? { liveTarget: args.liveTarget } : {}),
+    });
+    return {
+      execution: "codex-handoff",
+      requestedMode: args.requestedMode,
+      resolvedMode: args.resolvedMode,
+      ...(args.routingNote !== undefined ? { routingNote: args.routingNote } : {}),
+      commandSourcePath: dispatchPath,
+      commandOrigin: "embedded",
+      bodyChars: dispatchBody.length,
+      phases: [{
+        phase: {
+          id: "handoff",
+          title: `${args.resolvedMode} codex dispatch`,
+          agent: null,
+          requires_git: false,
+          requires_knowledge_base: false,
+          parallel_with: [],
+          depends_on: [],
+        },
+        skipped: false,
+        contentOrigin: "embedded",
+        agentSource: "(AGENTS.md dispatch)",
+        systemPromptChars: 0,
+        userPromptChars: userPrompt.length,
+        tools: [],
+      }],
+    };
+  }
+
   const command = await args.loader.loadCommand(args.resolvedMode, { variant: args.variant });
   const ordered = topologicalOrder(command.phases);
   const excludeSet = new Set(args.excludePhases ?? []);
@@ -150,6 +272,7 @@ async function buildModePlan(args: {
     focus: args.focus,
     expectedBehaviors: args.expectedBehaviors,
     liveTarget: args.liveTarget,
+    knowledgeBase: args.knowledgeBase,
   });
 
   const phases: ResolvedPhase[] = await Promise.all(
@@ -158,6 +281,8 @@ async function buildModePlan(args: {
         ? args.noGit
           ? "requires_git, but git checks disabled via --no-git"
           : "requires_git but target has no git history"
+        : phase.requires_knowledge_base && args.knowledgeBase === undefined
+          ? "no knowledge-base flag or knowledge-base directory was resolved"
         : excludeSet.has(phase.id)
           ? "excluded by refresh fresh-fallback policy"
           : undefined;
@@ -195,6 +320,7 @@ async function buildModePlan(args: {
   );
 
   return {
+    execution: "phase-graph",
     requestedMode: args.requestedMode,
     resolvedMode: args.resolvedMode,
     ...(args.routingNote !== undefined ? { routingNote: args.routingNote } : {}),
@@ -232,6 +358,7 @@ function detectOriginFromPath(
 
 function serializePlan(p: ModePlan): unknown {
   return {
+    execution: p.execution,
     requestedMode: p.requestedMode,
     resolvedMode: p.resolvedMode,
     routingNote: p.routingNote ?? null,
@@ -243,11 +370,13 @@ function serializePlan(p: ModePlan): unknown {
       title: ph.phase.title,
       agent: ph.phase.agent,
       requiresGit: ph.phase.requires_git,
+      requiresKnowledgeBase: ph.phase.requires_knowledge_base,
       dependsOn: ph.phase.depends_on,
       parallelWith: ph.phase.parallel_with,
       skipped: ph.skipped,
       skipReason: ph.skipReason ?? null,
       contentOrigin: ph.contentOrigin,
+      agentSource: ph.agentSource,
       systemPromptChars: ph.systemPromptChars,
       userPromptChars: ph.userPromptChars,
       tools: ph.tools,
@@ -257,14 +386,20 @@ function serializePlan(p: ModePlan): unknown {
 
 function renderPlans(args: {
   platform: AgentPlatform;
+  transport: AgentTransport;
   targetDir: string;
   gitAvailable: boolean;
   noGit?: boolean;
   plans: ModePlan[];
   opts: RunOptions;
+  knowledgeBase?: ResolvedKnowledgeBase;
 }): void {
   console.log(chalk.bold(`\nvigolium-audit — dry run (no adapter calls)`));
   console.log(`${statusArrow("Platform")} Platform:  ${chalk.cyan(args.platform)}`);
+  const transportLabel = args.platform === "codex" && args.transport === "auto"
+    ? "auto (sdk)"
+    : args.transport;
+  console.log(`${statusArrow("Adapter")} Transport: ${chalk.cyan(transportLabel)}`);
   console.log(`${statusArrow("Target")} Target:    ${chalk.cyan(args.targetDir)}`);
   const gitLine = args.noGit
     ? chalk.yellow("skipped (--no-git)")
@@ -276,17 +411,24 @@ function renderPlans(args: {
   if (args.opts.focusFile) console.log(`${statusArrow("Focus")} Focus:     ${chalk.cyan(args.opts.focusFile)}`);
   if (args.opts.expectedBehaviorsFile) console.log(`${statusArrow("Expected")} Expected:  ${chalk.cyan(args.opts.expectedBehaviorsFile)}`);
   if (args.opts.liveTarget) console.log(`${statusArrow("Live")} Live:      ${chalk.cyan(args.opts.liveTarget)}`);
+  if (args.knowledgeBase !== undefined) {
+    console.log(
+      `${statusArrow("Knowledge base")} Knowledge: ${chalk.cyan(`${args.knowledgeBase.files.length} file${args.knowledgeBase.files.length === 1 ? "" : "s"}`)} ` +
+        chalk.dim(`(${args.knowledgeBase.totalBytes} bytes, ${args.knowledgeBase.sourceKind})`),
+    );
+  }
 
   for (const plan of args.plans) {
     const header = plan.requestedMode === plan.resolvedMode
       ? plan.resolvedMode
       : `${plan.requestedMode} → ${plan.resolvedMode}`;
     console.log(chalk.green(`\n[mode ${header}]`) + (plan.routingNote ? chalk.dim(` ${plan.routingNote}`) : ""));
+    console.log(`  execution: ${chalk.cyan(plan.execution)}`);
     console.log(`  source: ${chalk.dim(plan.commandSourcePath)} ${chalk.dim(`(${plan.commandOrigin}, ${plan.bodyChars} body chars)`)}`);
 
     for (const ph of plan.phases) {
       const status = ph.skipped ? chalk.dim("[skip]") : chalk.green("[run] ");
-      const agent = ph.phase.agent ? chalk.cyan(ph.phase.agent) : chalk.dim("(inline)");
+      const agent = ph.phase.agent ? chalk.cyan(ph.phase.agent) : chalk.dim(ph.agentSource);
       const tools = ph.tools.length > 0 ? chalk.dim(` tools=${ph.tools.length}`) : chalk.dim(" tools=∅");
       const promptInfo = chalk.dim(` sys=${ph.systemPromptChars}c usr=${ph.userPromptChars}c`);
       const origin = chalk.dim(` (${ph.contentOrigin})`);

@@ -1,0 +1,931 @@
+package database
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/vigolium/vigolium/pkg/apicontract"
+)
+
+// MergeOptions tunes what a SQLite-to-SQLite merge copies.
+type MergeOptions struct {
+	// SkipHTTPRecords omits the http_records table from the copy. It is safe for
+	// readers that never resolve a finding's linked records: finding_records
+	// carries no foreign key to http_records (it is a bare
+	// PRIMARY KEY (finding_id, record_uuid) table), and findings embed their own
+	// request/response inline, so the junction and every finding still merge
+	// intact — a later record lookup simply resolves to nothing.
+	//
+	// This exists because http_records holds the raw request/response blobs and
+	// is ~98% of the bytes in a typical result database. A read that renders
+	// purely from findings (the finding tree/table/JSON views) would otherwise
+	// pay to copy every blob into the destination only to discard it.
+	SkipHTTPRecords bool
+
+	// SkipRecordBodies copies http_records without its raw_request/raw_response
+	// columns, which are nullable and hold ~96% of the table's bytes. Every row
+	// still lands, with its metadata intact, so row counts and any predicate over
+	// metadata (status/method/host/content-type) are unaffected — unlike dropping
+	// rows, this changes nothing observable for such a reader.
+	//
+	// It is only safe when nothing downstream reads the raw corpus: a filter that
+	// LIKEs over it (see QueryFilters.UsesRawCorpus) silently matches nothing, and
+	// a renderer that prints it silently prints empty. Ignored when
+	// SkipHTTPRecords is set, which already omits the table.
+	SkipRecordBodies bool
+
+	// SkipFindings omits findings, the finding_records junction, the finding
+	// history tables (finding_observations, finding_status_events) and
+	// oast_interactions from the copy. Safe only for a reader that shows no
+	// finding and filters no record by one.
+	//
+	// It is the only option here that bounds the MERGING process's memory rather
+	// than the destination's size. The three tables it drops are the ones that
+	// cannot be copied set-based — findings.id is AUTOINCREMENT and is referenced
+	// by both the junction and the OAST rows, so the id remapping needs every
+	// source row in Go before the write transaction opens. Each finding row
+	// carries its inline request, response, and additional_evidence, so a corpus
+	// with many findings is buffered in full, per source, whether or not anything
+	// will read one.
+	SkipFindings bool
+}
+
+// recordBodyColumns are the http_records blob columns holding the raw
+// request/response corpus — the bulk of the table's bytes, and what
+// MergeOptions.SkipRecordBodies / QueryBuilder.OmitBodies leave out. Both are
+// nullable with no default, so a copy that omits them inserts NULL rather than
+// failing.
+//
+// Note oast_interactions has columns of the same names on a different table;
+// this list is for http_records only.
+var recordBodyColumns = []string{"raw_request", "raw_response"}
+
+// findingBodyColumns are the findings blob columns — the inline request/response
+// evidence a finding carries. Excluded from the findings list queries, which
+// render from metadata and re-fetch evidence per page.
+var findingBodyColumns = []string{"additional_evidence", "request", "response"}
+
+// MergeStats reports what a SQLite-to-SQLite merge copied into the destination.
+type MergeStats struct {
+	ProjectsMerged       int
+	ScansMerged          int
+	AgenticScansMerged   int
+	RecordsMerged        int
+	FindingsMerged       int
+	FindingsDeduped      int
+	FindingRecordsMerged int
+	OASTMerged           int
+	ObservationsMerged   int
+	StatusEventsMerged   int
+
+	// rekeyNeeded is set when findings were merged from a source below schema
+	// v6 (identity v2), so the destination must re-key them.
+	rekeyNeeded bool
+}
+
+// Add accumulates o's counters into s, for aggregating the stats of several
+// merges (e.g. a multi-source import) into a single total.
+func (s *MergeStats) Add(o *MergeStats) {
+	if o == nil {
+		return
+	}
+	s.ProjectsMerged += o.ProjectsMerged
+	s.ScansMerged += o.ScansMerged
+	s.AgenticScansMerged += o.AgenticScansMerged
+	s.RecordsMerged += o.RecordsMerged
+	s.FindingsMerged += o.FindingsMerged
+	s.FindingsDeduped += o.FindingsDeduped
+	s.FindingRecordsMerged += o.FindingRecordsMerged
+	s.OASTMerged += o.OASTMerged
+	s.ObservationsMerged += o.ObservationsMerged
+	s.StatusEventsMerged += o.StatusEventsMerged
+}
+
+// mergeCopyTables lists the uuid-keyed result tables copied set-based with
+// OR IGNORE. projects/scans/http_records have a TEXT uuid primary key and
+// oast_payloads a TEXT nonce one; agentic_scans has an AUTOINCREMENT integer
+// id plus a UNIQUE(uuid) business key. The AUTOINCREMENT "id" column is always
+// dropped from the copy (see the dropColumn call in mergeOnce) so the
+// destination assigns its own and dedup falls on the uuid. findings and the
+// tables keyed by findings.id (finding_records, finding_observations,
+// finding_status_events, oast_interactions) instead need id remapping
+// (findings.id is AUTOINCREMENT) and are handled row-by-row below.
+//
+// Scope boundary: this merges scan *results* only. The other project-scoped
+// tables in db.go CreateSchema (scopes, authentication_hostnames, scan_logs)
+// are deliberately NOT merged — they are configuration/session/log state, not
+// results, and would each need their own dedup key. A new project-scoped
+// *result* table must be added here (with a dedup key) to flow through
+// --db-isolate. Kept as an allowlist so table names interpolated into DDL/DML
+// are never attacker-influenced.
+var mergeCopyTables = []string{"projects", "scans", "http_records", "agentic_scans", "oast_payloads"}
+
+// MergeSQLiteFile merges every native-scan result row from the SQLite database
+// at srcPath into dest (which must be an already-open, schema-current SQLite
+// database). It is safe to call repeatedly with the same source: rows dedup on
+// their natural keys (uuid for records/scans, (project_uuid, finding_hash) for
+// findings), so a re-merge is idempotent. project_uuid values are copied
+// verbatim, so the merged rows stay scoped to whatever project the scan ran
+// under.
+//
+// The whole operation runs on a single pinned connection inside one
+// BEGIN IMMEDIATE transaction, and retries on SQLITE_BUSY/locked so it
+// tolerates other processes briefly holding the destination's write lock.
+func MergeSQLiteFile(ctx context.Context, dest *DB, srcPath string) (*MergeStats, error) {
+	return MergeSQLiteFileWithOptions(ctx, dest, srcPath, MergeOptions{})
+}
+
+// MergeSQLiteFileWithOptions is MergeSQLiteFile with control over what is
+// copied; see MergeOptions.
+func MergeSQLiteFileWithOptions(ctx context.Context, dest *DB, srcPath string, opts MergeOptions) (*MergeStats, error) {
+	if dest.Driver() != "sqlite" {
+		return nil, fmt.Errorf("merge requires a SQLite destination, got %q", dest.Driver())
+	}
+	var stats *MergeStats
+	err := retryOnBusy(ctx, func() error {
+		var e error
+		stats, e = mergeOnce(ctx, dest, srcPath, opts)
+		return e
+	})
+	if err != nil {
+		return stats, err
+	}
+	// A source written before identity v2 carries content hashes for
+	// insertion-point findings; re-key what landed so a re-detection (hashed
+	// v2) finds them and same-location rows from both stores merge.
+	if stats != nil && stats.rekeyNeeded {
+		if _, err := dest.RekeyFindingIdentities(ctx, ""); err != nil {
+			return stats, fmt.Errorf("re-key merged findings: %w", err)
+		}
+	}
+	return stats, nil
+}
+
+// attachSpec renders srcPath as a read-only URI filename for ATTACH.
+//
+// A merge only ever reads its source, but a plain-filename ATTACH opens it
+// read-write: the source then shares the connection's write lock, a hot -wal
+// sidecar can be recovered into it, and any statement that named src.* by
+// mistake would modify an engagement's evidence rather than fail. `mode=ro`
+// makes that a driver-level error instead of a convention, so it is applied
+// unconditionally — a guarantee that held only for some paths would be worse
+// than none, because nothing at the call site says which kind of path it has.
+//
+// The path is percent-encoded, which matters because the bundled modernc driver
+// parses EVERY ATTACH filename as a URI — not only ones beginning with "file:",
+// as documented SQLite does with SQLITE_USE_URI. Measured against the driver in
+// go.mod rather than assumed, over paths containing a space, '#', '%' and '?':
+// the encoded form opens the right database read-only in every case except a
+// literal '?', while the unencoded form loses `mode=ro` outright on '?' and
+// attaches a DIFFERENT database on '#'.
+//
+// The encoding (and the '?' refusal, and the absolute-path rule, which matters
+// because a URI filename resolves against the process CWD rather than the main
+// database's directory) now lives in sqliteFileURIPath, shared with the two DSN
+// builders in db.go. One encoder, so a path that opens cannot fail to attach.
+func attachSpec(srcPath string) (string, error) {
+	uri, err := sqliteFileURIPath(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("cannot attach: %w", err)
+	}
+	return "file:" + uri + "?mode=ro", nil
+}
+
+// mergeOnce performs a single merge attempt. Any failure rolls back the
+// transaction (so a retry starts clean) and detaches the source.
+func mergeOnce(ctx context.Context, dest *DB, srcPath string, opts MergeOptions) (*MergeStats, error) {
+	stats := &MergeStats{}
+
+	conn, err := dest.SQLDB().Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire merge connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	release, err := attachMergeSource(ctx, conn, srcPath)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	// A SQLite file with none of vigolium's tables merges as zeros, which read
+	// as a clean import of an empty store; it is refused instead.
+	var core int
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM src.sqlite_master WHERE type = 'table' AND name = ?", coreTableName).Scan(&core); err != nil {
+		return nil, fmt.Errorf("inspect source database: %w", err)
+	}
+	if core == 0 {
+		return nil, &ForeignStoreError{Path: srcPath}
+	}
+
+	// Pre-read the row-by-row tables before opening the write transaction: a
+	// SQLite connection cannot run new statements while a result-set cursor is
+	// open on it, so these reads must be fully drained first.
+	//
+	// This is where SkipFindings pays: the read below is the whole of a source's
+	// finding corpus, inline evidence included, resident in Go at once. Skipping
+	// leaves all three nil, and every step downstream is a no-op on empty input.
+	var (
+		srcFindings       []bufferedRow
+		srcFindingRecords []bufferedRow
+		srcOAST           []bufferedRow
+		srcObservations   []bufferedRow
+		srcStatusEvents   []bufferedRow
+		srcAliases        []bufferedRow
+		aliasCols         []string
+		findingCols       []string
+		oastCols          []string
+		observationCols   []string
+		statusEventCols   []string
+	)
+	if !opts.SkipFindings {
+		srcFindings, findingCols, err = readRows(ctx, conn, "findings")
+		if err != nil {
+			return nil, fmt.Errorf("read source findings: %w", err)
+		}
+		srcFindingRecords, _, err = readRows(ctx, conn, "finding_records")
+		if err != nil {
+			return nil, fmt.Errorf("read source finding_records: %w", err)
+		}
+		srcOAST, oastCols, err = readRows(ctx, conn, "oast_interactions")
+		if err != nil {
+			return nil, fmt.Errorf("read source oast_interactions: %w", err)
+		}
+		// A source from before schema v3 has neither table; readRows returns
+		// nothing for a missing table, and the merges below no-op.
+		srcObservations, observationCols, err = readRows(ctx, conn, "finding_observations")
+		if err != nil {
+			return nil, fmt.Errorf("read source finding_observations: %w", err)
+		}
+		srcStatusEvents, statusEventCols, err = readRows(ctx, conn, "finding_status_events")
+		if err != nil {
+			return nil, fmt.Errorf("read source finding_status_events: %w", err)
+		}
+		srcAliases, aliasCols, err = readRows(ctx, conn, "finding_hash_aliases")
+		if err != nil {
+			return nil, fmt.Errorf("read source finding_hash_aliases: %w", err)
+		}
+		stats.rekeyNeeded = len(srcFindings) > 0 && sourceSchemaVersion(ctx, conn) < identityV2Version
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin merge transaction: %w", err)
+	}
+	// Rollback is a no-op once Commit has succeeded, so an unconditional
+	// deferred rollback cleanly covers every early-return error path.
+	defer func() { _ = tx.Rollback() }()
+
+	// Set-based copies for uuid-keyed tables (OR IGNORE dedups by primary key /
+	// unique key). The AUTOINCREMENT "id" column is never copied: tables that
+	// have one (agentic_scans) dedup on their UNIQUE(uuid) instead, and letting
+	// the destination assign ids avoids cross-database id collisions.
+	for _, table := range mergeCopyTables {
+		if opts.SkipHTTPRecords && table == "http_records" {
+			continue
+		}
+		cols, err := commonColumns(ctx, conn, table)
+		if err != nil {
+			return nil, fmt.Errorf("inspect columns for %s: %w", table, err)
+		}
+		cols = dropColumn(cols, "id")
+		if opts.SkipRecordBodies && table == "http_records" {
+			for _, c := range recordBodyColumns {
+				cols = dropColumn(cols, c)
+			}
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		colList := strings.Join(cols, ", ")
+		q := fmt.Sprintf("INSERT OR IGNORE INTO main.%s (%s) SELECT %s FROM src.%s", table, colList, colList, table)
+		res, err := tx.ExecContext(ctx, q)
+		if err != nil {
+			return nil, fmt.Errorf("copy %s: %w", table, err)
+		}
+		n, _ := res.RowsAffected()
+		switch table {
+		case "projects":
+			stats.ProjectsMerged = int(n)
+		case "scans":
+			stats.ScansMerged = int(n)
+		case "http_records":
+			stats.RecordsMerged = int(n)
+		case "agentic_scans":
+			stats.AgenticScansMerged = int(n)
+		}
+	}
+
+	// findings: insert without id, dedup on (project_uuid, finding_hash), and
+	// build a src→dst id map so the junction and OAST rows can be relinked.
+	idMap, err := mergeFindings(ctx, tx, srcFindings, findingCols, stats)
+	if err != nil {
+		return nil, fmt.Errorf("merge findings: %w", err)
+	}
+
+	if err := mergeFindingRecords(ctx, tx, srcFindingRecords, idMap, stats); err != nil {
+		return nil, fmt.Errorf("merge finding_records: %w", err)
+	}
+
+	if err := mergeOAST(ctx, tx, srcOAST, oastCols, idMap, stats); err != nil {
+		return nil, fmt.Errorf("merge oast_interactions: %w", err)
+	}
+
+	if err := mergeFindingObservations(ctx, tx, srcObservations, observationCols, idMap, stats); err != nil {
+		return nil, fmt.Errorf("merge finding_observations: %w", err)
+	}
+
+	if err := mergeFindingStatusEvents(ctx, tx, srcStatusEvents, statusEventCols, idMap, stats); err != nil {
+		return nil, fmt.Errorf("merge finding_status_events: %w", err)
+	}
+
+	if err := mergeFindingHashAliases(ctx, tx, srcAliases, aliasCols, idMap); err != nil {
+		return nil, fmt.Errorf("merge finding_hash_aliases: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit merge: %w", err)
+	}
+	return stats, nil
+}
+
+// bufferedRow holds one source row's column values, copied so they survive the
+// cursor advancing (database/sql may reuse []byte buffers across Next()).
+type bufferedRow []any
+
+// readRows reads every row of src.<table> into memory and returns the rows
+// alongside the table's column names (in physical order).
+func readRows(ctx context.Context, conn *sql.Conn, table string) ([]bufferedRow, []string, error) {
+	cols, err := tableColumns(ctx, conn, "src", table)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(cols) == 0 {
+		return nil, nil, nil
+	}
+	q := fmt.Sprintf("SELECT %s FROM src.%s", strings.Join(cols, ", "), table)
+	rows, err := conn.QueryContext(ctx, q)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []bufferedRow
+	for rows.Next() {
+		scanDst := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range scanDst {
+			ptrs[i] = &scanDst[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, nil, err
+		}
+		out = append(out, bufferedRow(copyValues(scanDst)))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return out, cols, nil
+}
+
+// copyValues deep-copies []byte values so buffered rows don't alias driver
+// scratch buffers reused by the next Scan.
+func copyValues(in []any) []any {
+	out := make([]any, len(in))
+	for i, v := range in {
+		if b, ok := v.([]byte); ok {
+			cp := make([]byte, len(b))
+			copy(cp, b)
+			out[i] = cp
+			continue
+		}
+		out[i] = v
+	}
+	return out
+}
+
+// mergeFindings inserts each source finding into main.findings, deduping on
+// (project_uuid, finding_hash), and returns a map from the source finding id to
+// the destination finding id (whether freshly inserted or pre-existing).
+func mergeFindings(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []string, stats *MergeStats) (map[int64]int64, error) {
+	idMap := make(map[int64]int64, len(rows))
+	if len(rows) == 0 {
+		return idMap, nil
+	}
+
+	idIdx := indexOf(cols, "id")
+	projIdx := indexOf(cols, "project_uuid")
+	hashIdx := indexOf(cols, "finding_hash")
+	if idIdx < 0 || projIdx < 0 || hashIdx < 0 {
+		return nil, fmt.Errorf("findings table missing id/project_uuid/finding_hash columns")
+	}
+
+	// Insert column list excludes the AUTOINCREMENT id; the destination assigns
+	// its own.
+	insertCols := make([]string, 0, len(cols)-1)
+	for i, c := range cols {
+		if i == idIdx {
+			continue
+		}
+		insertCols = append(insertCols, c)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(insertCols)), ", ")
+	insertQ := fmt.Sprintf(
+		"INSERT INTO main.findings (%s) VALUES (%s) ON CONFLICT (project_uuid, finding_hash) DO NOTHING RETURNING id",
+		strings.Join(insertCols, ", "), placeholders)
+
+	for _, row := range rows {
+		srcID, ok := toInt64(row[idIdx])
+		if !ok {
+			continue
+		}
+		args := make([]any, 0, len(insertCols))
+		for i := range row {
+			if i == idIdx {
+				continue
+			}
+			args = append(args, row[i])
+		}
+
+		var dstID sql.NullInt64
+		err := tx.QueryRowContext(ctx, insertQ, args...).Scan(&dstID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// Conflict: the finding already exists in the destination. Look up
+			// its id so the junction still links correctly.
+			var existing sql.NullInt64
+			if lookupErr := tx.QueryRowContext(ctx,
+				"SELECT id FROM main.findings WHERE project_uuid = ? AND finding_hash = ?",
+				row[projIdx], row[hashIdx]).Scan(&existing); lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+				return nil, lookupErr
+			}
+			if existing.Valid {
+				idMap[srcID] = existing.Int64
+			}
+			stats.FindingsDeduped++
+		case err != nil:
+			return nil, err
+		default:
+			if dstID.Valid {
+				idMap[srcID] = dstID.Int64
+				stats.FindingsMerged++
+			}
+		}
+	}
+	return idMap, nil
+}
+
+// mergeFindingRecords copies the finding↔record junction, remapping the source
+// finding id to the destination id. Rows whose finding was not mapped (e.g. a
+// finding that failed to insert) are skipped rather than orphaned.
+func mergeFindingRecords(ctx context.Context, tx *sql.Tx, rows []bufferedRow, idMap map[int64]int64, stats *MergeStats) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		srcFID, ok := toInt64(row[0])
+		if !ok {
+			continue
+		}
+		dstFID, mapped := idMap[srcFID]
+		if !mapped {
+			continue
+		}
+		res, err := tx.ExecContext(ctx,
+			"INSERT OR IGNORE INTO main.finding_records (finding_id, record_uuid) VALUES (?, ?)",
+			dstFID, row[1])
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			stats.FindingRecordsMerged++
+		}
+	}
+	return nil
+}
+
+// mergeOAST copies OAST interactions, remapping the nullable finding_id FK. A
+// finding_id that does not map to a destination finding is nulled rather than
+// left dangling.
+func mergeOAST(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []string, idMap map[int64]int64, stats *MergeStats) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	idIdx := indexOf(cols, "id")
+	findingIdx := indexOf(cols, "finding_id")
+
+	insertCols := dropColumn(cols, "id")
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(insertCols)), ", ")
+	insertQ := fmt.Sprintf("INSERT INTO main.oast_interactions (%s) VALUES (%s)",
+		strings.Join(insertCols, ", "), placeholders)
+
+	for _, row := range rows {
+		args := make([]any, 0, len(insertCols))
+		for i, val := range row {
+			if i == idIdx {
+				continue
+			}
+			if i == findingIdx {
+				if fid, ok := toInt64(val); ok {
+					if dst, mapped := idMap[fid]; mapped {
+						val = dst
+					} else {
+						val = nil
+					}
+				}
+			}
+			args = append(args, val)
+		}
+		if _, err := tx.ExecContext(ctx, insertQ, args...); err != nil {
+			return err
+		}
+		stats.OASTMerged++
+	}
+	return nil
+}
+
+// mergeFindingObservations copies finding observations, remapping finding_id
+// to the destination finding. When the source finding deduped onto an existing
+// destination finding, its observations land on that finding — the merged
+// scan observed it, which is exactly what a re-detection records. Rows whose
+// finding was not mapped are skipped rather than orphaned; OR IGNORE keeps the
+// (finding_id, scan_uuid) key idempotent across re-merges.
+func mergeFindingObservations(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []string, idMap map[int64]int64, stats *MergeStats) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	findingIdx := indexOf(cols, "finding_id")
+	if findingIdx < 0 {
+		return fmt.Errorf("finding_observations table missing finding_id column")
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(cols)), ", ")
+	stmt, err := tx.PrepareContext(ctx, fmt.Sprintf("INSERT OR IGNORE INTO main.finding_observations (%s) VALUES (%s)",
+		strings.Join(cols, ", "), placeholders))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, row := range rows {
+		srcFID, ok := toInt64(row[findingIdx])
+		if !ok {
+			continue
+		}
+		dstFID, mapped := idMap[srcFID]
+		if !mapped {
+			continue
+		}
+		args := slices.Clone([]any(row))
+		args[findingIdx] = dstFID
+		res, err := stmt.ExecContext(ctx, args...)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			stats.ObservationsMerged++
+		}
+	}
+	return nil
+}
+
+// sourceSchemaVersion reads src.schema_meta's version (0 when absent).
+func sourceSchemaVersion(ctx context.Context, conn *sql.Conn) int {
+	var v int
+	if err := conn.QueryRowContext(ctx, "SELECT version FROM src.schema_meta WHERE id = 1").Scan(&v); err != nil {
+		return 0
+	}
+	return v
+}
+
+// mergeFindingHashAliases copies the source's hash aliases, remapping
+// finding_id; an alias the destination already has is kept as it is.
+func mergeFindingHashAliases(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []string, idMap map[int64]int64) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	findingIdx := indexOf(cols, "finding_id")
+	if findingIdx < 0 {
+		return fmt.Errorf("finding_hash_aliases table missing finding_id column")
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(cols)), ", ")
+	stmt, err := tx.PrepareContext(ctx, fmt.Sprintf("INSERT OR IGNORE INTO main.finding_hash_aliases (%s) VALUES (%s)",
+		strings.Join(cols, ", "), placeholders))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, row := range rows {
+		srcFID, ok := toInt64(row[findingIdx])
+		if !ok {
+			continue
+		}
+		dstFID, mapped := idMap[srcFID]
+		if !mapped {
+			continue
+		}
+		args := slices.Clone([]any(row))
+		args[findingIdx] = dstFID
+		if _, err := stmt.ExecContext(ctx, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeFindingStatusEvents copies the append-only status history, remapping
+// finding_id and letting the destination assign ids. An event already present
+// on the destination finding (same transition at the same instant) is skipped,
+// so re-merging the same source does not duplicate history.
+func mergeFindingStatusEvents(ctx context.Context, tx *sql.Tx, rows []bufferedRow, cols []string, idMap map[int64]int64, stats *MergeStats) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	idIdx := indexOf(cols, "id")
+	findingIdx := indexOf(cols, "finding_id")
+	fromIdx := indexOf(cols, "from_status")
+	toIdx := indexOf(cols, "to_status")
+	createdIdx := indexOf(cols, "created_at")
+	if findingIdx < 0 || fromIdx < 0 || toIdx < 0 || createdIdx < 0 {
+		return fmt.Errorf("finding_status_events table missing finding_id/from_status/to_status/created_at columns")
+	}
+	insertCols := dropColumn(cols, "id")
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(insertCols)), ", ")
+	stmt, err := tx.PrepareContext(ctx, fmt.Sprintf(
+		`INSERT INTO main.finding_status_events (%s) SELECT %s
+		 WHERE NOT EXISTS (
+		     SELECT 1 FROM main.finding_status_events
+		     WHERE finding_id = ? AND to_status = ? AND created_at = ?
+		       AND COALESCE(from_status, '') = COALESCE(?, '')
+		 )`,
+		strings.Join(insertCols, ", "), placeholders))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, row := range rows {
+		srcFID, ok := toInt64(row[findingIdx])
+		if !ok {
+			continue
+		}
+		dstFID, mapped := idMap[srcFID]
+		if !mapped {
+			continue
+		}
+		args := make([]any, 0, len(insertCols)+4)
+		for i, val := range row {
+			if i == idIdx {
+				continue
+			}
+			if i == findingIdx {
+				val = dstFID
+			}
+			args = append(args, val)
+		}
+		args = append(args, dstFID, row[toIdx], row[createdIdx], row[fromIdx])
+		res, err := stmt.ExecContext(ctx, args...)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			stats.StatusEventsMerged++
+		}
+	}
+	return nil
+}
+
+// commonColumns returns the columns present in BOTH src.<table> and
+// main.<table>, in src's physical order. Guards against schema drift where the
+// destination is missing a column the source has.
+func commonColumns(ctx context.Context, conn *sql.Conn, table string) ([]string, error) {
+	srcCols, err := tableColumns(ctx, conn, "src", table)
+	if err != nil {
+		return nil, err
+	}
+	dstCols, err := tableColumns(ctx, conn, "main", table)
+	if err != nil {
+		return nil, err
+	}
+	dstSet := make(map[string]bool, len(dstCols))
+	for _, c := range dstCols {
+		dstSet[c] = true
+	}
+	out := make([]string, 0, len(srcCols))
+	for _, c := range srcCols {
+		if dstSet[c] {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// tableColumns returns the column names of schema.table (e.g. src.findings) in
+// physical order via PRAGMA table_info.
+func tableColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf("PRAGMA %s.table_info(%s)", schema, table))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var cols []string
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		cols = append(cols, name)
+	}
+	return cols, rows.Err()
+}
+
+// dropColumn returns s without the named column (order preserved).
+func dropColumn(s []string, name string) []string {
+	out := make([]string, 0, len(s))
+	for _, c := range s {
+		if c != name {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func indexOf(s []string, target string) int {
+	for i, v := range s {
+		if v == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	default:
+		return 0, false
+	}
+}
+
+// retryOnBusy runs fn under the merge's busy-retry budget. A thin wrapper over
+// RetryBusy, kept so the merge call site and its test read as before; a wedged
+// destination surfaces as a *LockedError (database_locked) rather than a hang.
+func retryOnBusy(ctx context.Context, fn func() error) error {
+	policy := DefaultRetryPolicy
+	policy.Op = "merge into a busy destination"
+	return RetryBusy(ctx, fn, policy)
+}
+
+// ForeignStoreError is a SQLite file that is not a vigolium store: it has no
+// http_records table.
+type ForeignStoreError struct{ Path string }
+
+func (e *ForeignStoreError) Error() string {
+	return fmt.Sprintf("%s is a SQLite database but not a vigolium store (no %s table)", e.Path, coreTableName)
+}
+
+// Code classifies the refusal for the CLI's error envelope.
+func (e *ForeignStoreError) Code() apicontract.ErrorCode { return apicontract.CodeSourceIncompatible }
+
+// sqliteSidecars are the files SQLite keeps beside a database.
+var sqliteSidecars = []string{"-wal", "-shm", "-journal"}
+
+// IsSQLiteSidecar reports whether path names a SQLite sidecar file (-wal,
+// -shm, -journal) rather than a database.
+func IsSQLiteSidecar(path string) bool {
+	for _, suf := range sqliteSidecars {
+		if strings.HasSuffix(path, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasLiveWAL reports whether path has a non-empty -wal sidecar: committed
+// pages that are not yet in the main file.
+func hasLiveWAL(path string) bool {
+	st, err := os.Stat(path + "-wal")
+	return err == nil && st.Size() > 0
+}
+
+// attachMergeSource attaches srcPath as "src" on conn without leaving
+// anything beside it, and returns the function that detaches it and cleans
+// up.
+//
+// A source with no live WAL is attached immutable: SQLite then reads the main
+// file alone and creates no -shm or -wal next to it. immutable=1 ignores an
+// uncheckpointed WAL, so a source that has one is attached mode=ro instead,
+// which reads the WAL but needs a -shm; the sidecars that attach created are
+// removed after the detach. When that cannot work (the directory is not
+// writable, so no -shm can be made) the source and its WAL are copied to a
+// scratch directory and the copy is attached.
+func attachMergeSource(ctx context.Context, conn *sql.Conn, srcPath string) (func(), error) {
+	attach := func(path string, immutable bool) error {
+		spec, err := attachSpec(path)
+		if err != nil {
+			return err
+		}
+		if immutable {
+			spec += "&immutable=1"
+		}
+		// ATTACH must run outside a transaction. Single quotes are escaped
+		// rather than bound: driver parameter support for ATTACH filenames is
+		// not something to rely on.
+		spec = strings.ReplaceAll(spec, "'", "''")
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH DATABASE '%s' AS src", spec)); err != nil {
+			return fmt.Errorf("attach source database: %w", err)
+		}
+		// The first read is where a mode=ro attach that cannot create its -shm
+		// fails, so it is probed here rather than mid-merge.
+		var n int
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM src.sqlite_master").Scan(&n); err != nil {
+			_, _ = conn.ExecContext(ctx, "DETACH DATABASE src")
+			return fmt.Errorf("read source database: %w", err)
+		}
+		return nil
+	}
+	detach := func() { _, _ = conn.ExecContext(ctx, "DETACH DATABASE src") }
+
+	if !hasLiveWAL(srcPath) {
+		if err := attach(srcPath, true); err != nil {
+			return nil, err
+		}
+		return detach, nil
+	}
+
+	existed := map[string]bool{}
+	for _, suf := range sqliteSidecars {
+		if _, err := os.Stat(srcPath + suf); err == nil {
+			existed[suf] = true
+		}
+	}
+	removeCreated := func() {
+		for _, suf := range sqliteSidecars {
+			if !existed[suf] {
+				_ = os.Remove(srcPath + suf)
+			}
+		}
+	}
+	if err := attach(srcPath, false); err == nil {
+		return func() { detach(); removeCreated() }, nil
+	}
+	removeCreated()
+
+	dir, err := os.MkdirTemp("", "vigolium-merge-src-*")
+	if err != nil {
+		return nil, fmt.Errorf("copy source with a live WAL: %w", err)
+	}
+	cleanupDir := func() { _ = os.RemoveAll(dir) }
+	copyPath := filepath.Join(dir, filepath.Base(srcPath))
+	for _, suf := range []string{"", "-wal"} {
+		if err := copyFile(srcPath+suf, copyPath+suf); err != nil {
+			cleanupDir()
+			return nil, fmt.Errorf("copy source with a live WAL: %w", err)
+		}
+	}
+	if err := attach(copyPath, false); err != nil {
+		cleanupDir()
+		return nil, err
+	}
+	return func() { detach(); cleanupDir() }, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}

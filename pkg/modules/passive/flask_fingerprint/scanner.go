@@ -49,7 +49,7 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 
 	host := urlx.Host
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if diskSet != nil && diskSet.Contains(host) {
 		return nil, nil
 	}
 
@@ -100,8 +100,9 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 			extracted = append(extracted, "Body: Jinja2 template error")
 		}
 
-		// Weak Signal 5: Response body on error contains "Traceback" + "flask" (case insensitive)
-		bodyLower := strings.ToLower(body)
+		// Weak Signal 5: Response body on error contains "Traceback" + "flask" (case insensitive).
+		// Shared, memoized lowercased body (computed once per response across modules).
+		bodyLower := ctx.Response().BodyLowerString()
 		if strings.Contains(bodyLower, "traceback") && strings.Contains(bodyLower, "flask") {
 			weakSignalCount++
 			extracted = append(extracted, "Body: Flask traceback detected")
@@ -132,6 +133,11 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		scanCtx.MarkTech(host, "python")
 	}
 
+	// Claim the host only now that it matched: a host whose
+	// first response showed nothing stays open for later responses.
+	if diskSet != nil && !diskSet.ClaimOnMatch(host) {
+		return nil, nil
+	}
 	return []*output.ResultEvent{
 		{
 			ModuleID:         ModuleID,

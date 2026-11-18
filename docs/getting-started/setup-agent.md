@@ -25,14 +25,17 @@ The supported providers:
 
 | Provider | Auth | Default model | Notes |
 |---|---|---|---|
-| `openai-codex-oauth` *(default)* | `~/.codex/auth.json` (from `codex login`) | `gpt-5.5` | Cheapest with a ChatGPT sub. |
-| `anthropic-api-key` | `$ANTHROPIC_API_KEY` | `claude-opus-4-7` | Direct Anthropic API billing. |
-| `anthropic-oauth` | `claude setup-token` bearer | `claude-opus-4-7` | Uses your Claude Pro/Max plan. |
+| `openai-compatible` *(shipped default)* | Optional API key | `gemma4:latest` | Defaults to local Ollama at `http://localhost:11434/v1`. |
+| `openai-codex-oauth` | `~/.codex/auth.json` (from `codex login`) | `gpt-5.5` | Reuses a Codex/ChatGPT subscription. |
+| `anthropic-api-key` | `$ANTHROPIC_API_KEY` | `claude-opus-5` | Direct Anthropic API billing. |
+| `anthropic-oauth` | `claude setup-token` bearer | `claude-opus-5` | Uses your Claude Pro/Max plan. |
 | `openai-api-key` | `$OPENAI_API_KEY` | `gpt-5.5` | Direct OpenAI API billing. |
-| `anthropic-cli` | `claude` binary on `$PATH` | `claude-opus-4-7` | Shells out to Claude Code. |
-| `anthropic-vertex` | GCP service-account JSON | `claude-opus-4-6` | Claude on Vertex AI. |
+| `openai-responses` | `$OPENAI_API_KEY` | provider default | Public OpenAI Responses API. |
+| `anthropic-cli` | `claude` binary on `$PATH` | `claude-opus-5` | Shells out to Claude Code (alias: `anthropic-claude-cli`). |
+| `anthropic-claude-sdk-bridge` | Claude Code subscription (no key) | bridge default | Claude Code via the Agent SDK (`vigolium-audit bridge` sidecar). |
+| `anthropic-vertex` | GCP service-account JSON | `claude-opus-5` | Claude on Vertex AI. |
 | `google-vertex` | GCP service-account JSON | `gemini-2.5-pro` | Gemini on Vertex AI. |
-| `openai-compatible` | optional `api_key` | none — pick one | Ollama, OpenRouter, LM Studio, vLLM, … |
+| `anthropic-compatible` | optional API key | configured model | Anthropic Messages-compatible custom endpoint. |
 
 Verify any setup with:
 
@@ -52,7 +55,7 @@ If you already use OpenAI's **Codex CLI**, vigolium reuses the same OAuth creden
 # 1. Install Codex CLI (one-time) and log in via `codex login`
 codex exec 'hello'             # sanity check — should print a model name
 
-# 2. Pin vigolium to it (defaults already match; this just makes it explicit).
+# 2. Select Codex OAuth instead of the shipped local-model default.
 vigolium config set agent.olium.provider openai-codex-oauth
 vigolium config set agent.olium.oauth_cred_path ~/.codex/auth.json
 vigolium config set agent.olium.model gpt-5.5
@@ -98,6 +101,44 @@ vigolium config set agent.olium.custom_provider.api_key '${OPENROUTER_API_KEY}'
 vigolium config set agent.olium.custom_provider.extra_headers.add 'HTTP-Referer: https://your-site.example'
 vigolium config set agent.olium.custom_provider.extra_headers.add 'X-Title: vigolium'
 ```
+
+#### Provider routing (OpenRouter)
+
+Pin or restrict the upstream provider via the typed `provider_routing` block:
+
+```bash
+vigolium config set agent.olium.custom_provider.provider_routing.order.add deepseek
+vigolium config set agent.olium.custom_provider.provider_routing.allow_fallbacks false
+vigolium config set agent.olium.custom_provider.provider_routing.sort throughput
+```
+
+Or as YAML:
+
+```yaml
+agent:
+  olium:
+    custom_provider:
+      provider_routing:
+        order: [deepseek]
+        allow_fallbacks: false
+        sort: throughput
+```
+
+Supported fields: `order`, `only`, `ignore`, `allow_fallbacks` (default `true` on OpenRouter), `sort` (`price` / `throughput` / `latency`), `quantizations`, `data_collection` (`allow` / `deny`), `require_parameters`, `zdr`. See [OpenRouter's provider routing docs](https://openrouter.ai/docs/features/provider-routing) for field semantics.
+
+For fields the typed knob doesn't cover (`max_price`, `preferred_min_throughput`, `preferred_max_latency`) or other openai-compatible backend extensions, use `extra_body` (YAML-only — `config set` doesn't traverse arbitrary nested maps):
+
+```yaml
+agent:
+  olium:
+    custom_provider:
+      extra_body:
+        provider:
+          max_price: { prompt: 0.0001, completion: 0.0002 }
+        transforms: [middle-out]
+```
+
+The keys `model`, `messages`, `tools`, `stream`, `stream_options` are reserved and rejected at request time. Setting both `provider_routing` and `extra_body.provider` is also rejected.
 
 ### LM Studio
 
@@ -169,7 +210,7 @@ export ANTHROPIC_API_KEY=sk-ant-oat01-<your-token> # shell rc; survives reboots
 
 # 2. Point vigolium at the OAuth provider.
 vigolium config set agent.olium.provider anthropic-oauth
-vigolium config set agent.olium.model claude-opus-4-7
+vigolium config set agent.olium.model claude-opus-5
 
 # 3. Verify.
 vigolium ol -p 'what model are you running'
@@ -187,7 +228,7 @@ For users billing through the standard Anthropic API.
 export ANTHROPIC_API_KEY=sk-ant-api03-<your-key>
 
 vigolium config set agent.olium.provider anthropic-api-key
-vigolium config set agent.olium.model claude-opus-4-7
+vigolium config set agent.olium.model claude-opus-5
 
 vigolium ol -p 'what model are you running'
 ```
@@ -200,12 +241,29 @@ If you'd rather have vigolium delegate to the `claude` binary on `$PATH` (so it 
 which claude   # must resolve
 
 vigolium config set agent.olium.provider anthropic-cli
-vigolium config set agent.olium.model claude-opus-4-7
+vigolium config set agent.olium.model claude-opus-5
 ```
 
 This mode is slower than the API-key/OAuth paths (subprocess overhead) but useful when you want a single source of auth across `claude` and `vigolium`.
 
 > **Note on permissions.** vigolium invokes `claude -p` with `--permission-mode bypassPermissions` so Bash / Read / WebFetch tool calls execute without interactive approval (the wrapper is non-interactive — there's no TTY for you to confirm prompts on). This is equivalent to running `claude --dangerously-skip-permissions` and applies for the duration of the subprocess only.
+
+### 4d. Claude Code via the Agent SDK (`anthropic-claude-sdk-bridge`)
+
+Drives Claude Code through the **Agent SDK** instead of the plain `claude -p` CLI, by shelling out to the `vigolium-audit bridge` sidecar. Like `anthropic-cli` it uses your logged-in Claude Code subscription (no key), but the run is a controlled, reproducible SDK invocation: it always loads the `vigolium-scanner` skill (so the agent knows the `vigolium` CLI) and does **not** pull in your personal `~/.claude` config or a project's `CLAUDE.md`.
+
+```bash
+claude            # be logged in once
+
+vigolium config set agent.olium.provider anthropic-claude-sdk-bridge
+vigolium config set agent.olium.model opus   # optional: opus | sonnet | a full id; omit for the bridge default
+
+vigolium ol -p 'what model are you running'
+```
+
+The `vigolium-audit` binary that hosts the bridge is **embedded** in vigolium — no separate install. Override it with `vigolium config set agent.olium.bridge_binary /path/to/vigolium-audit` or the per-run `--bridge-bin` flag. If you have an API key or OAuth token in `agent.olium.llm_api_key` / `oauth_token`, it's forwarded to the bridge; otherwise the ambient subscription is used.
+
+**When to pick this over `anthropic-cli`:** choose the bridge for a portable, self-contained run that behaves the same on any machine (CI, containers) and comes pre-wired with the vigolium scanner skill. Choose `anthropic-cli` when you want your full personal Claude Code environment — your `CLAUDE.md`, MCP servers, and installed skills — applied to the current project directory.
 
 ---
 
@@ -257,7 +315,7 @@ vigolium agent audit --driver=piolium --source ~/src/your-app --intensity deep  
 
 # 5. Override pi's provider/model just for this run if you want.
 vigolium agent audit --driver=piolium --source ~/src/your-app \
-  --pi-provider vertex-anthropic --pi-model claude-opus-4-6
+  --pi-provider vertex-anthropic --pi-model claude-opus-5
 ```
 
 Vigolium runs a one-turn preflight against pi before the audit to catch auth/quota errors early. If preflight fails you'll see the upstream error (e.g. `No API key found for google-vertex. Use /login to log into a provider`) and the audit won't start.

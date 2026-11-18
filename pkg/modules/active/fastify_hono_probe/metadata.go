@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for framework-specific documentation, metrics, and debug endpoints exposed
-by Fastify and Hono Node.js frameworks. These frameworks may inadvertently expose
-Swagger documentation, API references, metrics endpoints, and overview pages in
-production deployments.
+	ModuleDesc = `**What it means:** A Fastify or Hono Node.js app exposes internal framework endpoints in production - Swagger/OpenAPI docs, a Scalar API reference, or a metrics endpoint at paths like /documentation/json, /reference, or /.well-known/fastify/metrics - leaking the API surface and runtime state to anonymous users.
 
-## Notes
-- Runs once per host with internal deduplication
-- Tests 8 framework-specific paths across Fastify and Hono
-- Each probe has tailored response matching to reduce false positives
+**How it's exploited:** An attacker reads the OpenAPI/Swagger spec to map every route, parameter, and auth requirement, turning a black-box target into a documented attack surface for parameter fuzzing and admin-endpoint abuse.
 
-## References
-- https://fastify.dev/docs/latest/
-- https://hono.dev/docs/`
+**Fix:** Disable or restrict the Swagger, documentation, metrics, and overview routes in production, gating them behind authentication or an internal-only network.`
 
 	ModuleConfirmation = "Confirmed when the server responds with framework-specific content at known documentation or debug paths, indicating exposed internal endpoints"
 	ModuleSeverity     = severity.Medium

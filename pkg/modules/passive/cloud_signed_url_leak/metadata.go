@@ -9,21 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects leaked AWS presigned URLs, GCS signed URLs, and Azure SAS tokens
-in HTTP response bodies. Parses expiry and permissions to assess risk level.
+	ModuleDesc = `**What it means:** A response contains an S3, GCS, or Azure signed capability URL. This is often the intended way to deliver an object, so ordinary short-lived URLs are observations. Long lifetime, Azure write permissions, or explicit shared caching raise a candidate.
 
-## Notes
-- Scans response body for X-Amz-Signature, X-Goog-Signature, and Azure SAS parameters
-- Upgrades severity to High if write-capable or long-lived (>24h)
-- Deduplicates by URL and signature hash
+**How it's exploited:** Anyone obtaining the URL via logs, history, referrers, or caches can replay it until expiry. Severity rises to High when the token is write-capable (PUT/DELETE, Azure w/d/c/a) or long-lived (24+ hours).
 
-## References
-- https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
-- https://cloud.google.com/storage/docs/access-control/signed-urls
-- https://learn.microsoft.com/en-us/azure/storage/common/storage-sas-overview`
+**Fix:** Keep signed URLs out of cacheable responses; scope each to read-only and the shortest lifetime, and rotate any exposed token.`
 
-	ModuleConfirmation = "Confirmed when response body contains cloud storage signed URL or SAS token parameters"
+	ModuleConfirmation = "Observation for ordinary signed capabilities; candidate only with long lifetime, provider-declared write permission, or explicit shared-cache context; unauthorized replay is never inferred"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"cloud", "info-disclosure", "light"}

@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects Joomla Web Services API (Joomla 4+) exposure by analyzing
-response headers and bodies. Identifies application/vnd.api+json content types,
-API resource links, and CORS headers on API responses that indicate endpoints
-are accessible anonymously or with overly permissive cross-origin settings.
+	ModuleDesc = `**What it means:** The target exposes the Joomla 4+ Web Services API, identified passively from /api/index.php returning a JSON:API response (application/vnd.api+json). Mainly an informational fingerprint of the reachable REST surface; a wildcard CORS header raises it to Medium, since any origin can read the API.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects application/vnd.api+json content type
-- Identifies /api/index.php path patterns
-- Flags overly permissive CORS (Access-Control-Allow-Origin: *) on API endpoints
-- Deduplicates by host
+**How it's exploited:** A live API lets an attacker map the REST surface, enumerate users and config endpoints, and target Joomla-version CVEs. With wildcard CORS, a malicious page can read it cross-origin and exfiltrate session data.
 
-## References
-- https://docs.joomla.org/J4.x:Joomla_Core_APIs
-- https://developer.joomla.org/security-centre.html`
+**Fix:** Restrict the API to trusted networks or tokens, disable it if unused, and never return wildcard CORS.`
 
 	ModuleConfirmation = "Confirmed when responses contain Joomla API content types or resource structures"
 	ModuleSeverity     = severity.Low

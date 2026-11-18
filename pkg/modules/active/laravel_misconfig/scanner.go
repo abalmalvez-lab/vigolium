@@ -15,6 +15,14 @@ import (
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
+// decoyRounds is how many same-directory negative-control probes the catch-all
+// disproof issues per candidate. A universal catch-all / echo host that answers
+// EVERY path with the same 200 shell (often reflecting the request URI, and —
+// under a gzip + bogus Content-Length: 0 transport quirk — captured as only a
+// truncated TAIL fragment) trips at least one round and the candidate is dropped.
+// Two rounds tolerate a single WAF/CDN flake without over-probing.
+const decoyRounds = 2
+
 type probe struct {
 	path        string
 	name        string
@@ -22,6 +30,31 @@ type probe struct {
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
+	// rejectHTML marks a probe whose genuine hit is a structured-data / config /
+	// log file that is NEVER served as an HTML *document* (a .env, a plaintext
+	// application log). When set, an HTML content-type is a hard reject: it is the
+	// decisive, truncation-proof guard against the universal catch-all / echo host
+	// that answers any path with its text/html shell — the Content-Type header
+	// survives the body-truncation quirk even when a weak marker (APP_KEY=,
+	// Illuminate\) surviving in the tail would otherwise forge a match. It is NOT
+	// set for probes whose genuine hit legitimately IS an HTML page (an Ignition /
+	// Whoops error page, a Telescope / Horizon / Debugbar dashboard) — those rely
+	// on the decoy catch-all disproof instead.
+	rejectHTML bool
+}
+
+// accepts reports whether body satisfies this probe's marker requirement (any
+// single marker hit). Centralized so the primary match and the catch-all decoy
+// disproof apply the EXACT same predicate — the decoy sibling must be judged by
+// the same rule the candidate was, so a truncated-tail echo / catch-all server
+// that serves the marker for every path is disproved.
+func (p probe) accepts(body string) (matched []string, ok bool) {
+	for _, marker := range p.markers {
+		if strings.Contains(body, marker) {
+			matched = append(matched, marker)
+		}
+	}
+	return matched, len(matched) > 0
 }
 
 var probes = []probe{
@@ -45,7 +78,7 @@ var probes = []probe{
 	{
 		path:    "/_debugbar/open",
 		name:    "Laravel Debugbar Open",
-		markers: []string{"debugbar", "queries", "route", "PhpDebugBar"},
+		markers: []string{"debugbar", "PhpDebugBar", "phpdebugbar"},
 		sev:     severity.High,
 		desc:    "Laravel Debugbar open endpoint exposed, potentially leaking SQL queries, routes, and request data",
 	},
@@ -69,6 +102,7 @@ var probes = []probe{
 		name:        "Laravel Application Log",
 		markers:     []string{"[stacktrace]", "local.ERROR", "production.ERROR", "Illuminate\\"},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
+		rejectHTML:  true,
 		sev:         severity.High,
 		desc:        "Laravel application log exposed, potentially containing stack traces, secrets, and user data",
 	},
@@ -76,7 +110,7 @@ var probes = []probe{
 	{
 		path:        "/telescope",
 		name:        "Laravel Telescope Dashboard",
-		markers:     []string{"telescope", "Laravel Telescope", "app.js"},
+		markers:     []string{"Laravel Telescope", "telescope-data", "window.Telescope"},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.High,
 		desc:        "Laravel Telescope debugging dashboard exposed, revealing requests, queries, and application internals",
@@ -84,7 +118,7 @@ var probes = []probe{
 	{
 		path:    "/telescope/requests",
 		name:    "Laravel Telescope Requests",
-		markers: []string{"telescope", "entries", "content"},
+		markers: []string{"Laravel Telescope", "telescope-data", "\"entries\":"},
 		sev:     severity.High,
 		desc:    "Laravel Telescope requests endpoint exposed, revealing all HTTP request/response pairs",
 	},
@@ -92,7 +126,7 @@ var probes = []probe{
 	{
 		path:        "/horizon",
 		name:        "Laravel Horizon Dashboard",
-		markers:     []string{"horizon", "Laravel Horizon", "app.js"},
+		markers:     []string{"Laravel Horizon", "window.Horizon", "horizon-data"},
 		antiMarkers: []string{"404 Not Found"},
 		sev:         severity.Medium,
 		desc:        "Laravel Horizon queue dashboard exposed, revealing job queue configuration and status",
@@ -103,6 +137,7 @@ var probes = []probe{
 		name:        "Laravel Storage .env",
 		markers:     []string{"APP_KEY=", "DB_", "MAIL_"},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
+		rejectHTML:  true,
 		sev:         severity.Critical,
 		desc:        "Environment file exposed via Laravel storage symlink",
 	},
@@ -110,8 +145,9 @@ var probes = []probe{
 	{
 		path:        "/storage/logs/debug.log",
 		name:        "Laravel Debug Log",
-		markers:     []string{"[stacktrace]", "DEBUG", "ERROR", "Illuminate\\"},
+		markers:     []string{"[stacktrace]", "local.DEBUG", "local.ERROR", "production.ERROR", "Illuminate\\"},
 		antiMarkers: []string{"<html", "<!DOCTYPE"},
+		rejectHTML:  true,
 		sev:         severity.Medium,
 		desc:        "Laravel debug log exposed, potentially containing sensitive debugging information",
 	},
@@ -173,11 +209,8 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -209,11 +242,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -255,11 +286,9 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -287,6 +316,19 @@ func (m *Module) probeFile(
 		}
 	}
 
+	// Content-type discipline (survives the body-truncation quirk — the
+	// Content-Type header is intact even when a gzip / Content-Length: 0 transport
+	// quirk leaves only a truncated tail of the body): a Laravel .env or plaintext
+	// log is served as text/plain or an octet download, NEVER as an HTML document.
+	// A universal catch-all / echo host that answers any path with its text/html
+	// shell would otherwise forge a match on a weak marker (APP_KEY=, Illuminate\)
+	// surviving in the tail. A genuine config/log file never comes back as
+	// text/html, so this is a zero-false-negative guard for that probe class.
+	if p.rejectHTML &&
+		modkit.ClassifyContentType(resp.Response().Header.Get("Content-Type")) == modkit.ContentClassHTML {
+		return nil
+	}
+
 	body := resp.Body().String()
 
 	// Check against 404 fingerprint
@@ -303,6 +345,12 @@ func (m *Module) probeFile(
 		}
 	}
 
+	// Catch-all / SPA shell guard: a themed app that returns the same shell for
+	// any path is a false positive even when a weak marker appears in that shell.
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	// Check anti-markers
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
@@ -315,15 +363,33 @@ func (m *Module) probeFile(
 		return nil
 	}
 
-	matched := false
-	var matchedMarkers []string
-	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
-			matched = true
-			matchedMarkers = append(matchedMarkers, marker)
-		}
+	// Strip the reflected request path (and any echoed request body) before marker
+	// matching: a host that mirrors the requested URI back into its response — the
+	// truncated-tail echo server — would otherwise let a path segment satisfy a
+	// marker. The original body is kept for anti-markers and stored evidence.
+	matchBody := modkit.StripReflectedProbePath(body, p.path)
+	if reqBody := ctx.Request().BodyToString(); reqBody != "" {
+		matchBody = modkit.StripReflected(matchBody, reqBody)
 	}
-	if !matched {
+
+	matchedMarkers, ok := p.accepts(matchBody)
+	if !ok {
+		return nil
+	}
+
+	// Multi-round catch-all disproof (truncation-proof): probe guaranteed-
+	// nonexistent siblings sharing this path's directory (and extension). If a
+	// random same-shape path returns the same status and ALSO satisfies this
+	// probe's predicate, the host serves this content for ANY path — a reflecting /
+	// echo server, a SPA fallback, an extension-scoped catch-all — so the match
+	// proves nothing. A genuinely exposed endpoint has no such sibling (the decoy
+	// 404s), so this costs no true positives, and it is robust to the body-
+	// truncation quirk because the decoy is run through the same predicate rather
+	// than a body-similarity compare (each truncated fragment differs).
+	if modkit.MultiRoundExtDecoyCatchAll(ctx, httpClient, p.path, body, status, decoyRounds, func(b string) bool {
+		_, sibOK := p.accepts(b)
+		return sibOK
+	}) {
 		return nil
 	}
 

@@ -9,27 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript and TypeScript response bodies for Next.js Server Actions that perform
-state-changing operations (database mutations, writes) without any authorization checks.
-Server Actions marked with "use server" execute on the server and are directly callable
-from the client. If they lack session validation or auth guards, any unauthenticated
-user can invoke them to modify data.
+	ModuleDesc = `**What it means:** A source-like JS/TS file contains a server directive and mutation syntax but no recognized authorization token. File-level regex cannot resolve imported helpers, middleware, action registration, or call flow.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects "use server" directive combined with mutation patterns (create, update, delete, etc.)
-- Flags when no authorization patterns are found (getSession, auth(), verifyToken, etc.)
-- Deduplicates by host+path
-- CWE-862: Missing Authorization
+**How it's exploited:** A real flaw requires a reachable action whose mutation succeeds without authorization. The module does not replay an anonymous action call, so it reports a candidate rather than a confirmed bypass.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/data-fetching/server-actions-and-mutations
-- https://cwe.mitre.org/data/definitions/862.html
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/05-Authorization_Testing/02-Testing_for_Bypassing_Authorization_Schema`
+**Fix:** Enforce an explicit auth check at the start of every state-changing Server Action, not just UI or middleware.`
 
-	ModuleConfirmation = "Confirmed when a Server Action contains mutation operations but no authorization checks"
-	ModuleSeverity     = severity.High
+	ModuleConfirmation = "Candidate when source-like code combines server directive and mutations without recognized auth; confirmation requires call-graph review or an unauthorized action replay"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"nextjs", "javascript", "authentication", "light"}
 )

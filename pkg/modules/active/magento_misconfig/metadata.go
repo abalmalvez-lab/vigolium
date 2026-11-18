@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Magento-specific files and endpoints that should not be publicly
-accessible: setup wizard, downloader interface, version disclosure files,
-exposed configuration, and admin panel paths.
+	ModuleDesc = `**What it means:** A Magento or Adobe Commerce store exposes files or interfaces that should never be reachable in production. Known paths are confirmed only on a 200 with expected content markers, ranging from version disclosure to credential leaks.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Covers both Magento 1.x and Magento 2.x paths
-- Fingerprints 404 responses to detect custom error pages
+**How it's exploited:** Exposed config (app/etc/local.xml, app/etc/env.php) hands an attacker the DB credentials and crypt key, enabling session forgery and store takeover. An open setup wizard or downloader lets an attacker install malicious extensions.
 
-## References
-- https://experienceleague.adobe.com/docs/commerce-operations/configuration-guide/overview.html
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Block public access to setup, downloader, app/etc, and var/log, move the admin panel off the default URL, and rotate any exposed credentials or crypt key.`
 
 	ModuleConfirmation = "Confirmed when probed Magento endpoints return 200 with expected content markers"
 	ModuleSeverity     = severity.High

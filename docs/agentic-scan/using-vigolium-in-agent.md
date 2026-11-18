@@ -45,15 +45,30 @@ The skill uses lazy-loaded references: the main `SKILL.md` stays small, and deta
 
 ```
 public/skills/vigolium-scanner/
-├── SKILL.md                              # Main skill (decision tree, recipes, flags)
-└── references/
-    ├── scanning-commands.md              # scan, scan-url, scan-request, run
-    ├── server-and-ingestion.md           # server, ingest, traffic, traffic replay
-    ├── agent-commands.md                 # agent, agent query, autopilot, swarm
-    ├── data-and-management.md            # db, module, ext, config, scope, export
-    ├── flags-reference.md                # Complete alphabetical flag index
-    └── writing-extensions.md             # JS extension API and examples
+├── SKILL.md                      # always loaded: router, mental model, invariants
+└── references/                   # loaded on demand, one hop from SKILL.md
+    ├── agent-loop.md             # driving vigolium from an agent: start here
+    ├── loop-*.md                 # one file per step: scan, watch, read, confirm, hand off
+    ├── invariants.md             # cross-command rules, the -j envelope, exit codes
+    ├── scanning.md               # scan, scan-url, scan-request, run, phases, strategies
+    ├── agent-modes.md            # agent query/autopilot/swarm/audit/olium/triage/session
+    ├── auth.md                   # --auth-file / --auth, YAML format, extract rules
+    ├── data.md                   # db, finding, traffic, module, ext, js, config, export
+    ├── server.md                 # vigolium server: REST API, recording/MITM proxy, live mirror
+    ├── ingest.md                 # vigolium ingest: local/remote, per-format input examples
+    ├── extensions.md             # writing JS scanner modules against vigolium.*
+    └── flags.generated.md        # generated from the command tree — grep by flag name
 ```
+
+Only `SKILL.md` is always in context; it routes to at most one reference per
+task. `flags.generated.md` is produced by `make skill-flags` (which shells out to
+`vigolium skills gen-flags`), so its flag data always matches the binary.
+
+If you are building an agent integration rather than reading interactively,
+start with `references/agent-loop.md` — it routes the
+`scope → scan → read → confirm → hand off` loop to one `loop-*.md` file per step
+and states the token-bounding flags; `references/invariants.md` holds the `-j`
+contract and exit codes.
 
 ---
 
@@ -323,7 +338,7 @@ vigolium run dynamic-assessment -t https://example.com
 vigolium scan -t https://example.com --only dynamic-assessment
 ```
 
-**Run only known-issue-scan (Nuclei templates + Kingfisher secrets):**
+**Run only known-issue-scan (Nuclei templates + native secret detection):**
 ```
 > Run known-issue scan, only critical and high severity
 ```
@@ -400,7 +415,7 @@ vigolium module ls --type active -v
 > Only run reflected XSS and error-based SQL injection modules
 ```
 ```bash
-vigolium scan -t https://example.com -m xss-reflected,sqli-error
+vigolium scan -t https://example.com -m xss-light-url-params,sqli-error-based
 ```
 
 **Filter modules by tags (OR logic):**
@@ -424,8 +439,8 @@ vigolium scan -t https://example.com -m sqli-error --module-tag xss
 > Disable all SQL injection modules, enable all XSS modules
 ```
 ```bash
-vigolium module disable sqli
-vigolium module enable xss
+vigolium module disable sqli --force   # --force: the term matches more than 5 modules
+vigolium module enable xss --force
 ```
 
 **Enable by exact module ID:**
@@ -433,7 +448,7 @@ vigolium module enable xss
 > Enable only the reflected XSS module
 ```
 ```bash
-vigolium module enable active-xss-reflected --id
+vigolium module enable xss-light-url-params --id
 ```
 
 ---
@@ -461,7 +476,7 @@ vigolium server --service-port 8443 --no-auth
 > Start the server and auto-scan every request that comes in
 ```
 ```bash
-vigolium server -t https://example.com --scan-on-receive
+vigolium server --scan-on-receive
 ```
 
 **Start server with transparent proxy for recording:**
@@ -472,13 +487,16 @@ vigolium server -t https://example.com --scan-on-receive
 vigolium server --ingest-proxy-port 8080
 ```
 
-**High-concurrency server:**
+**Increase the ingestion queue:**
 ```
-> Start a high-throughput server with 200 workers
+> Increase the in-memory queue before disk/Redis spillover
 ```
 ```bash
-vigolium server -c 200 --mem-buffer 50000
+vigolium server --mem-buffer 50000
 ```
+
+Background scanner concurrency comes from `scanning_pace` configuration;
+`server` does not expose the native scan `-c` flag.
 
 **Ingest an OpenAPI spec locally:**
 ```
@@ -493,7 +511,7 @@ vigolium ingest -t https://api.example.com -I openapi -i spec.yaml
 > Import the spec and scan immediately
 ```
 ```bash
-vigolium ingest -t https://api.example.com -I openapi -i spec.yaml -S
+vigolium ingest -t https://api.example.com -I openapi -i spec.yaml --scan-on-receive
 ```
 
 **Ingest Burp export:**
@@ -655,15 +673,15 @@ vigolium agent autopilot -t https://example.com
 > Autonomous scan focused on auth bypass, with source code for context
 ```
 ```bash
-vigolium agent autopilot -t https://api.example.com --source ./src --focus "auth bypass"
+vigolium agent autopilot -t https://api.example.com --source ./src --prompt "focus on auth bypass"
 ```
 
-**Custom limits (fewer commands, shorter timeout):**
+**Custom wall-clock limit:**
 ```
-> Limit the agent to 50 commands and 15 minutes
+> Limit the agent to 15 minutes
 ```
 ```bash
-vigolium agent autopilot -t https://example.com --max-commands 50 --timeout 15m
+vigolium agent autopilot -t https://example.com --max-duration 15m
 ```
 
 **Preview the system prompt (dry run):**
@@ -679,7 +697,8 @@ vigolium agent autopilot -t https://example.com --dry-run
 > Use my own system prompt for autopilot
 ```
 ```bash
-vigolium agent autopilot -t https://example.com --system-prompt my-system-prompt.md
+vigolium agent autopilot -t https://example.com \
+  --system-prompt-file my-system-prompt.md
 ```
 
 **Use a different provider per invocation:**
@@ -692,7 +711,7 @@ vigolium agent autopilot -t https://example.com --provider anthropic-api-key --l
 
 **Autopilot tool surface:**
 - `bash` (catastrophic patterns hard-rejected: `rm -rf /`, fork bombs, `dd` to block devices, `mkfs` against real devices), `read_file`, `write_file`, `edit_file`, `ls`, `grep`, `glob`, `web_fetch`
-- Plus autopilot-only tools: `halt_scan`, `report_finding`, `load_skill` (when skills are loaded), and vigtool (`run_scan`, `list_findings`, etc.) when a DB repository is attached
+- Plus autopilot-only tools: `halt_scan`, `report_finding`, `load_skill` (when skills are loaded), and vigtool (`run_native_scan`, `list_findings`, etc.) when a DB repository is attached
 - Per-tool timeout: 5 minutes (configurable via `agent.olium.call_timeout_sec`)
 - Hard cap: 200 findings (soft warning at 50); turn cap from `--intensity`: quick 150, balanced 500 (default), deep 1500
 
@@ -706,20 +725,18 @@ vigolium agent autopilot -t https://example.com --provider anthropic-api-key --l
 vigolium agent swarm --discover -t https://example.com
 ```
 
-The swarm runs:
-1. **Discover** — Native content discovery + spidering (no AI)
-2. **Plan** — AI analyzes discovery results, produces an attack plan
-3. **Scan** — Native executor with agent-selected modules (no AI)
-4. **Triage** — AI reviews findings, confirms/dismisses, suggests follow-ups
-5. **Rescan** — Targeted re-scanning from triage recommendations (no AI)
-6. **Report** — Structured output from database (no AI)
+Swarm normalizes input, optionally authenticates/analyzes source, performs
+native discovery and stack recon, asks the planner to select modules and
+extensions, probes planner-only paths, scans, optionally replans an empty
+result, and then triages/rescans. `quick` disables triage; the default
+`balanced` and `deep` presets enable it.
 
 **Swarm with focus area and source code:**
 ```
 > Swarm scan focused on SQL injection, with source code
 ```
 ```bash
-vigolium agent swarm --discover -t https://example.com --focus "SQL injection" --source ./src
+vigolium agent swarm --discover -t https://example.com --prompt "focus on SQL injection" --source ./src
 ```
 
 **Control rescan iterations:**
@@ -730,12 +747,12 @@ vigolium agent swarm --discover -t https://example.com --focus "SQL injection" -
 vigolium agent swarm --discover -t https://example.com --max-iterations 3
 ```
 
-**Skip discovery and start from planning (use existing DB data):**
+**Start a new run at planning:**
 ```
-> I already have traffic in the database, start from planning
+> Normalize this target, then skip ahead to planning
 ```
 ```bash
-vigolium agent swarm --discover -t https://example.com --skip discover --start-from plan
+vigolium agent swarm -t https://example.com --start-from plan
 ```
 
 **Skip triage (just discover → plan → scan):**
@@ -746,12 +763,12 @@ vigolium agent swarm --discover -t https://example.com --skip discover --start-f
 vigolium agent swarm --discover -t https://example.com --skip triage --skip rescan
 ```
 
-**Use a scanning profile:**
+**Use the deep intensity preset:**
 ```
-> Run swarm with the deep scanning profile
+> Run swarm at deep intensity
 ```
 ```bash
-vigolium agent swarm --discover -t https://example.com --profile deep
+vigolium agent swarm --discover -t https://example.com --intensity deep
 ```
 
 **Preview agent prompts (dry run):**
@@ -855,12 +872,12 @@ vigolium traffic --header "Bearer"
 vigolium traffic --columns HOST,METHOD,PATH,STATUS,AUTH
 ```
 
-**Watch mode (auto-refresh):**
+**Refresh in a shell loop:**
 ```
 > Monitor traffic in real-time, refresh every 5 seconds
 ```
 ```bash
-vigolium traffic --watch 5s
+while true; do clear; vigolium traffic --limit 20; sleep 5; done
 ```
 
 **View raw HTTP request/response:**
@@ -895,12 +912,12 @@ vigolium finding --severity high,critical
 vigolium finding --search "sql injection"
 ```
 
-**Watch findings in real-time:**
+**Refresh findings in a shell loop:**
 ```
 > Monitor findings as they come in
 ```
 ```bash
-vigolium finding --watch 5s
+while true; do clear; vigolium finding --limit 20; sleep 5; done
 ```
 
 **Replay stored traffic (re-send requests):**
@@ -908,7 +925,7 @@ vigolium finding --watch 5s
 > Replay login-related requests and compare responses
 ```
 ```bash
-vigolium traffic replay login
+vigolium traffic login --replay
 ```
 
 **Replay and replace stored responses:**
@@ -916,7 +933,7 @@ vigolium traffic replay login
 > Replay requests to api.example.com and update stored responses
 ```
 ```bash
-vigolium traffic replay --host api.example.com --in-replace
+vigolium traffic --host api.example.com --replay --in-replace
 ```
 
 ---
@@ -939,20 +956,20 @@ vigolium db stats
 vigolium db stats --detailed
 ```
 
-**Stats for a specific host:**
+**Inspect records for a specific host:**
 ```
 > Stats for example.com only
 ```
 ```bash
-vigolium db stats --host example.com
+vigolium traffic --host example.com
 ```
 
-**Live-updating stats:**
+**Refresh stats in a shell loop:**
 ```
 > Watch database stats, refresh every 10 seconds
 ```
 ```bash
-vigolium db stats --watch 10s
+while true; do clear; vigolium db stats --detailed; sleep 10; done
 ```
 
 **List database records with filters:**
@@ -960,7 +977,7 @@ vigolium db stats --watch 10s
 > Show findings table, critical and high severity
 ```
 ```bash
-vigolium db ls --table findings --severity critical,high
+vigolium db list findings --severity critical,high
 ```
 
 **List available tables and columns:**
@@ -968,8 +985,8 @@ vigolium db ls --table findings --severity critical,high
 > What tables are in the database? What columns does findings have?
 ```
 ```bash
-vigolium db ls --list-tables
-vigolium db ls --list-columns --table findings
+vigolium db list --list-tables
+vigolium db list findings --list-columns
 ```
 
 **Clean records by hostname:**
@@ -1009,16 +1026,12 @@ vigolium db clean --orphans
 > Wipe the entire database and start fresh
 ```
 ```bash
-vigolium db clean --force
+vigolium db reset --force
 ```
 
-**Reclaim disk space after deletion:**
-```
-> Vacuum the database to reclaim space
-```
-```bash
-vigolium db clean --vacuum
-```
+SQLite deletes run `VACUUM` automatically to reclaim space. Use
+`db reset --force` only when you intend to recreate the database file and
+schema from scratch.
 
 ---
 
@@ -1351,7 +1364,7 @@ vigolium strategy
 ```bash
 vigolium project create my-project
 vigolium project list
-vigolium project use my-project
+eval "$(vigolium project use <project-uuid>)"
 ```
 
 **Scope CLI operations to a project:**
@@ -1367,7 +1380,7 @@ vigolium scan -t https://example.com --project-name my-project
 > Show stats for my-project
 ```
 ```bash
-VIGOLIUM_PROJECT=my-project vigolium db stats
+vigolium db stats --project-name my-project
 ```
 
 ---
@@ -1384,13 +1397,13 @@ These are examples of natural language prompts you can give to Claude Code or Co
 | "Scan my OpenAPI spec with auth" | `vigolium scan -I openapi -i spec.yaml -t <url> --spec-header "Authorization: Bearer ..."` |
 | "Only run XSS modules" | `vigolium scan -t <url> --module-tag xss` |
 | "Review my code for security issues" | `vigolium agent query --prompt-template security-code-review --source ./src` |
-| "Autonomous scan focused on injection" | `vigolium agent autopilot -t <url> --focus "injection"` |
+| "Autonomous scan focused on injection" | `vigolium agent autopilot -t <url> --prompt "focus on injection"` |
 | "Run the full AI pipeline" | `vigolium agent swarm --discover -t <url>` |
 | "Show me all critical findings" | `vigolium finding --severity critical` |
 | "Export results as HTML report" | `vigolium export --format html -o report.html` |
 | "What traffic is in the database?" | `vigolium traffic` |
 | "Write me an extension that checks for exposed .env files" | Generates a JS extension file |
-| "Start the server with auto-scan" | `vigolium server -t <url> --scan-on-receive` |
+| "Start the server with auto-scan" | `vigolium server --scan-on-receive` (no target flag; scoped by `scope.*` rules) |
 | "Source-aware AI scan" | `vigolium agent swarm -t <url> --source ./src` |
 | "Multi-phase code audit" | `vigolium agent audit --source ./src` |
 | "Clean up old scan data" | `vigolium db clean --before <date> --force` |
@@ -1403,7 +1416,7 @@ These are examples of natural language prompts you can give to Claude Code or Co
 2. **Use strategies** — `lite` for quick checks, `balanced` for most cases, `deep` for full coverage. When you have source code, reach for an agent mode (`swarm`, `autopilot`, `audit`, or `query`) instead.
 3. **Phase isolation** — Use `--only` or `vigolium run <phase>` to iterate on a single phase without re-running the entire pipeline.
 4. **Module tags** — Filter modules by technology (`spring`, `nodejs`) or vulnerability class (`xss`, `injection`) to reduce noise.
-5. **Watch mode** — Add `--watch 5s` to `traffic`, `finding`, or `db stats` for real-time monitoring during long scans.
+5. **Live monitoring** — Wrap `traffic`, `finding`, or `db stats` in a short shell loop; these commands no longer expose a `--watch` flag.
 6. **Dry-run agents** — Always `--dry-run` first for agent commands to preview prompts before spending AI tokens.
 7. **Swarm over autopilot** — Use `agent swarm --discover` for structured scans (lower cost, reproducible). Use `agent autopilot` for exploratory, creative scanning.
 8. **Extensions for custom logic** — Write JS extensions instead of modifying core modules. They run alongside built-in modules with `--ext`.

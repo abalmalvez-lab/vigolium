@@ -1,8 +1,6 @@
 package modkit
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"math"
 	"time"
@@ -10,6 +8,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/utils"
 )
 
 const (
@@ -100,7 +99,7 @@ func (sc *ScanContext) WildcardProbe(
 
 		// Build a GET probe to a random nonexistent path. Use a clearly
 		// synthetic prefix so any debug logs stay legible.
-		probePath := "/" + randomToken(12) + "-vigolium-wp/" + randomToken(8)
+		probePath := "/" + utils.RandomOf(12, utils.HEX_CHARSET) + "-vigolium-wp/" + utils.RandomOf(8, utils.HEX_CHARSET)
 		raw, perr := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 		if perr != nil {
 			cache.Add(host, entry)
@@ -156,14 +155,4 @@ func (sc *ScanContext) getWildcardCache() *lru.Cache[string, *WildcardEntry] {
 		sc.wildcardCache, _ = lru.New[string, *WildcardEntry](wildcardCacheSize)
 	})
 	return sc.wildcardCache
-}
-
-func randomToken(n int) string {
-	b := make([]byte, (n+1)/2)
-	if _, err := rand.Read(b); err != nil {
-		// Fall back to a deterministic token — the path just needs to be
-		// unlikely to collide with a real route.
-		return fmt.Sprintf("rnd%dxx", time.Now().UnixNano()&0xffff)
-	}
-	return hex.EncodeToString(b)[:n]
 }

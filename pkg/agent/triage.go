@@ -6,9 +6,11 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/vigolium/vigolium/pkg/agent/parsing"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/olium/skill"
 	"go.uber.org/zap"
 )
 
@@ -33,9 +35,16 @@ type TriageLoopConfig struct {
 	StreamWriter    io.Writer
 	Verbose         bool // forwarded to agent.Options.Verbose for the per-tool result preview
 
+	// Skills, when non-nil and non-empty, is the planner-filtered skill set the
+	// triage agent loads (via load_skill) to confirm/escalate findings. Built
+	// by the swarm triage step from the plan's recommended_skills + always-on
+	// set. nil → triage runs without skills (e.g. the pipeline triage path).
+	Skills *skill.Registry
+
 	// Loop control
 	MaxRounds                 int
 	MaxFindingsPerTriageBatch int // if >0, split findings into batches of this size for triage
+	BatchConcurrency          int // max triage batches run concurrently per round; 0 = default 3 (mirrors master-agent batches)
 	MaxFindingsPerRound       int // max findings loaded per triage round; 0 = default 5000
 	ResumeFromRound           int // skip triage rounds before this (0 = start from beginning)
 	ProgressCallback          func(ProgressEvent)
@@ -150,14 +159,16 @@ func RunTriageLoop(ctx context.Context, cfg TriageLoopConfig) (*TriageLoopResult
 			numBatches = 1 // single unbatched call
 		}
 
-		for batchIdx := 0; batchIdx < numBatches; batchIdx++ {
-			select {
-			case <-ctx.Done():
-				return result, ctx.Err()
-			default:
-			}
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		default:
+		}
 
-			// Build triage agent options
+		// buildBatchOpts assembles the triage agent Options for one batch. Kept
+		// pure (no shared-state writes) so the concurrent phase below only runs
+		// the expensive LLM call.
+		buildBatchOpts := func(batchIdx int) Options {
 			opts := Options{
 				AgentName:      cfg.AgentName,
 				PromptTemplate: cfg.PromptTemplate,
@@ -195,24 +206,97 @@ func RunTriageLoop(ctx context.Context, cfg TriageLoopConfig) (*TriageLoopResult
 			if len(appendParts) > 0 {
 				opts.Append = strings.Join(appendParts, "\n\n")
 			}
+			return opts
+		}
 
-			var agentResult *Result
-			const maxTriageRetries = 3
-			for triageAttempt := 1; triageAttempt <= maxTriageRetries; triageAttempt++ {
-				var runErr error
-				agentResult, runErr = cfg.Engine.Run(ctx, opts)
-				if runErr == nil {
-					break
+		// Run each batch's triage agent call concurrently (bounded). The batches
+		// review disjoint finding-ID sets, so they are independent — the same
+		// pattern as the master-agent batches. Results are collected per index;
+		// parsing/merging/artifact writes stay on this goroutine afterwards in
+		// batch order, so merged, result, the session-dir files, and DryRun
+		// stdout all remain deterministic and lock-free.
+		outcomes := make([]*Result, numBatches)
+
+		concurrency := cfg.BatchConcurrency
+		if concurrency <= 0 {
+			concurrency = 3
+		}
+		if concurrency > numBatches {
+			concurrency = numBatches
+		}
+
+		batchCtx, cancelBatches := context.WithCancel(ctx)
+		sem := make(chan struct{}, concurrency)
+		var wg sync.WaitGroup
+		var fatalOnce sync.Once
+		var fatalErr error
+		recordFatal := func(err error) {
+			// First fatal error wins; cancel the rest, mirroring the serial path.
+			fatalOnce.Do(func() {
+				fatalErr = err
+				cancelBatches()
+			})
+		}
+
+		const maxTriageRetries = 3
+		for batchIdx := 0; batchIdx < numBatches; batchIdx++ {
+			batchIdx := batchIdx
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-batchCtx.Done():
+					return // shutting down before this batch ran
 				}
-				if isRetryableAgentError(ctx, runErr) && triageAttempt < maxTriageRetries {
-					zap.L().Warn("triage agent failed (retryable), will retry",
-						zap.Int("round", round),
-						zap.Int("batch", batchIdx+1),
-						zap.Int("attempt", triageAttempt),
-						zap.Error(runErr))
-					continue
+
+				opts := buildBatchOpts(batchIdx)
+				for triageAttempt := 1; triageAttempt <= maxTriageRetries; triageAttempt++ {
+					var agentResult *Result
+					var runErr error
+					// With a planner-filtered skill set, surface it (and the
+					// load_skill tool) to the triage agent; otherwise plain Run.
+					if cfg.Skills != nil && cfg.Skills.Len() > 0 {
+						agentResult, runErr = cfg.Engine.RunWithSkills(batchCtx, opts, cfg.Skills)
+					} else {
+						agentResult, runErr = cfg.Engine.Run(batchCtx, opts)
+					}
+					if runErr == nil {
+						outcomes[batchIdx] = agentResult
+						return
+					}
+					if isRetryableAgentError(batchCtx, runErr) && triageAttempt < maxTriageRetries {
+						zap.L().Warn("triage agent failed (retryable), will retry",
+							zap.Int("round", round),
+							zap.Int("batch", batchIdx+1),
+							zap.Int("attempt", triageAttempt),
+							zap.Error(runErr))
+						continue
+					}
+					recordFatal(fmt.Errorf("triage round %d batch %d failed: %w", round, batchIdx+1, runErr))
+					return
 				}
-				return result, fmt.Errorf("triage round %d batch %d failed: %w", round, batchIdx+1, runErr)
+			}()
+		}
+		wg.Wait()
+		cancelBatches()
+
+		// A genuine batch failure fails the round, matching the serial path's
+		// fail-fast return. Parent-context cancellation surfaces as ctx.Err().
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		if fatalErr != nil {
+			return result, fatalErr
+		}
+
+		// Process completed batches in order: artifacts, DryRun output, parse,
+		// merge into the combined result.
+		for batchIdx := 0; batchIdx < numBatches; batchIdx++ {
+			agentResult := outcomes[batchIdx]
+			if agentResult == nil {
+				continue
 			}
 
 			// Save rendered prompt and raw output to session dir
@@ -225,9 +309,6 @@ func RunTriageLoop(ctx context.Context, cfg TriageLoopConfig) (*TriageLoopResult
 
 			if cfg.DryRun {
 				_, _ = fmt.Fprint(os.Stdout, agentResult.RawOutput)
-				if batchIdx == numBatches-1 {
-					return result, nil
-				}
 				continue
 			}
 
@@ -253,6 +334,10 @@ func RunTriageLoop(ctx context.Context, cfg TriageLoopConfig) (*TriageLoopResult
 			}
 		}
 
+		if cfg.DryRun {
+			return result, nil
+		}
+
 		result.TriageResults = append(result.TriageResults, merged)
 		result.Confirmed += len(merged.Confirmed)
 		result.FalsePositives += len(merged.FalsePositives)
@@ -261,7 +346,7 @@ func RunTriageLoop(ctx context.Context, cfg TriageLoopConfig) (*TriageLoopResult
 		// false positives → false_positive. Findings without a finding_hash
 		// (older agents not echoing it back) are left as-is for manual triage.
 		if cfg.Repository != nil {
-			writeBackTriageVerdicts(ctx, cfg.Repository, cfg.AgenticScanUUID, merged)
+			writeBackTriageVerdicts(ctx, cfg.Repository, cfg.ProjectUUID, cfg.AgenticScanUUID, merged)
 		}
 
 		if cfg.ProgressCallback != nil {
@@ -370,8 +455,10 @@ func aggregateFollowUps(followUps []FollowUpScan) ScanRequest {
 // writeBackTriageVerdicts persists the triage agent's classifications back to
 // Finding.Status. Confirmed findings move draft → triaged; false positives move
 // draft → false_positive. Skips entries with empty finding_hash and logs any
-// hashes the agent emitted but that didn't match a row.
-func writeBackTriageVerdicts(ctx context.Context, repo *database.Repository, agenticScanUUID string, merged *TriageResult) {
+// hashes the agent emitted but that didn't match a row. The write is scoped to
+// the run's project (and agentic scan) so a hash shared with another project's
+// finding never flips that finding.
+func writeBackTriageVerdicts(ctx context.Context, repo *database.Repository, projectUUID, agenticScanUUID string, merged *TriageResult) {
 	if merged == nil {
 		return
 	}
@@ -380,7 +467,7 @@ func writeBackTriageVerdicts(ctx context.Context, repo *database.Repository, age
 			if t.FindingHash == "" {
 				continue
 			}
-			rows, err := repo.UpdateFindingStatusByHash(ctx, agenticScanUUID, t.FindingHash, status)
+			rows, err := repo.UpdateFindingStatusByHash(ctx, projectUUID, agenticScanUUID, t.FindingHash, status)
 			if err != nil {
 				zap.L().Warn("triage writeback failed",
 					zap.String("finding_hash", t.FindingHash),

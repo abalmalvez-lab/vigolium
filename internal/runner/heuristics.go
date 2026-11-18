@@ -6,9 +6,12 @@ import (
 	"fmt"
 	neturl "net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/sourcegraph/conc/pool"
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/terminal"
@@ -25,6 +28,33 @@ type HeuristicsResult struct {
 	IsSPA         bool // advanced only
 	SkipSpidering bool
 	Reason        string
+	// Reachable is true when the root answered with an HTTP response (any
+	// status). False with ErrClass set when it did not.
+	Reachable bool
+	// ErrClass is the transport error class (http.TransportErr*) when the root
+	// did not answer: dns, refused, timeout, tls, reset or other.
+	ErrClass string
+	// fromPreflight marks a result taken from the preflight answer, whose
+	// unreachable line was already printed.
+	fromPreflight bool
+}
+
+// maxHeuristicsProbeConcurrency caps how many target root pages are probed in
+// parallel. Each target is usually a distinct host (so the per-host rate limiter
+// doesn't serialize them); the cap keeps a huge target list from opening too many
+// connections at once.
+const maxHeuristicsProbeConcurrency = 20
+
+// heuristicsProbeConcurrency returns the worker count for the parallel root-page
+// probe: the smaller of the target count and the cap, with a floor of 1.
+func heuristicsProbeConcurrency(targets int) int {
+	if targets < 1 {
+		return 1
+	}
+	if targets > maxHeuristicsProbeConcurrency {
+		return maxHeuristicsProbeConcurrency
+	}
+	return targets
 }
 
 // runHeuristicsCheckPhase probes the root page of each CLI target and
@@ -38,13 +68,51 @@ func (r *Runner) runHeuristicsCheckPhase(ctx context.Context, infra *phaseInfra)
 		terminal.HiTeal(level),
 		terminal.Orange(fmt.Sprintf("%d", len(r.options.Targets)))))
 
+	// Probe every target's root page concurrently — each probe is one to three
+	// blocking requests, and targets are typically distinct hosts, so a serial
+	// loop pays the full sum of per-target latency for nothing. The per-host rate
+	// limiter still bounds same-host concurrency. Results are collected under a
+	// mutex; the per-target log lines are emitted afterwards in target order so
+	// the phase output stays deterministic regardless of probe completion order.
 	results := make(map[string]*HeuristicsResult, len(r.options.Targets))
+	var resultsMu sync.Mutex
+	probePool := pool.New().WithMaxGoroutines(heuristicsProbeConcurrency(len(r.options.Targets)))
+	progress := r.currentPhase.Load().trackTargets(len(r.options.Targets))
 	for _, target := range r.options.Targets {
+		target := target
 		rootURL := normalizeToRoot(target)
-		result := probeTarget(ctx, infra.httpRequester, rootURL, level)
-		results[target] = result
+		probePool.Go(func() {
+			if ctx.Err() != nil {
+				return
+			}
+			// A root preflight already fetched is classified from its bytes
+			// rather than requested again.
+			result := probeTarget(ctx, infra.httpRequester, rootURL, level, r.preflightFor(rootURL))
+			resultsMu.Lock()
+			results[target] = result
+			resultsMu.Unlock()
+			progress.Add(1)
+		})
+	}
+	probePool.Wait()
 
-		// Log each result
+	for _, target := range r.options.Targets {
+		result := results[target]
+		if result == nil {
+			continue // probe skipped due to cancellation
+		}
+		if !result.Reachable && result.ErrClass != "" {
+			zap.L().Warn("HeuristicsCheck: target unreachable",
+				zap.String("target", target),
+				zap.String("class", result.ErrClass))
+			if !r.options.Silent && !result.fromPreflight {
+				fmt.Fprintf(os.Stderr, "  %s %s — %s\n",
+					terminal.Orange(terminal.SymbolArrow),
+					terminal.Gray(target),
+					terminal.Orange(result.Reason))
+			}
+			continue
+		}
 		if result.SkipSpidering {
 			zap.L().Info("HeuristicsCheck: target flagged",
 				zap.String("target", target),
@@ -76,15 +144,67 @@ func (r *Runner) runHeuristicsCheckPhase(ctx context.Context, infra *phaseInfra)
 			skipped++
 		}
 	}
-	if skipped > 0 {
-		r.printPhaseDetail(fmt.Sprintf("Skipping spidering: %s | Elapsed: %s",
-			terminal.Orange(fmt.Sprintf("%d/%d targets", skipped, len(results))),
-			terminal.Orange(fmtDuration(elapsed))))
+	total := len(results)
+	willSpider := total - skipped
+
+	// Conclude with what the probe found and the decision it drove, so the phase
+	// isn't a bare "Elapsed" line: content-type mix + how many targets advance to
+	// spidering vs. are skipped as non-crawlable (blank/JSON/API roots).
+	var decision string
+	switch {
+	case total == 0:
+		decision = terminal.Gray("no targets")
+	case skipped == 0:
+		decision = fmt.Sprintf("%s eligible for spidering", terminal.Orange(fmt.Sprintf("%d/%d", willSpider, total)))
+	case willSpider == 0:
+		decision = fmt.Sprintf("%s — spidering skipped (non-crawlable roots)", terminal.Orange(fmt.Sprintf("%d/%d", skipped, total)))
+	default:
+		decision = fmt.Sprintf("spidering %s, skipping %s",
+			terminal.Orange(fmt.Sprintf("%d", willSpider)),
+			terminal.Orange(fmt.Sprintf("%d", skipped)))
+	}
+
+	if ctSummary := summarizeContentTypes(results); ctSummary != "" {
+		r.printPhaseDetail(fmt.Sprintf("Result: %s root pages — %s | Elapsed: %s",
+			ctSummary, decision, terminal.Orange(fmtDuration(elapsed))))
 	} else {
-		r.printPhaseDetail(fmt.Sprintf("Elapsed: %s", terminal.Orange(fmtDuration(elapsed))))
+		r.printPhaseDetail(fmt.Sprintf("Result: %s | Elapsed: %s",
+			decision, terminal.Orange(fmtDuration(elapsed))))
 	}
 
 	return results, nil
+}
+
+// summarizeContentTypes renders a compact, deterministic breakdown of the
+// content types observed across probed root pages, e.g. "html" or
+// "html ×2, json". Counts of one are left implicit. Returns "" when there is
+// nothing to summarize.
+func summarizeContentTypes(results map[string]*HeuristicsResult) string {
+	if len(results) == 0 {
+		return ""
+	}
+	counts := make(map[string]int, len(results))
+	for _, res := range results {
+		ct := res.ContentType
+		if ct == "" {
+			ct = "unknown"
+		}
+		counts[ct]++
+	}
+	types := make([]string, 0, len(counts))
+	for ct := range counts {
+		types = append(types, ct)
+	}
+	sort.Strings(types)
+	parts := make([]string, 0, len(types))
+	for _, ct := range types {
+		if counts[ct] > 1 {
+			parts = append(parts, fmt.Sprintf("%s ×%d", terminal.HiTeal(ct), counts[ct]))
+		} else {
+			parts = append(parts, terminal.HiTeal(ct))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // normalizeToRoot strips the path and query from a URL, returning scheme://host/.
@@ -103,41 +223,104 @@ func normalizeToRoot(target string) string {
 	return u.String()
 }
 
-// probeTarget sends a GET request to the root URL and classifies the response.
-func probeTarget(_ context.Context, requester *http.Requester, rootURL string, level string) *HeuristicsResult {
+// probeTarget fetches the root URL and classifies the response. pre, when
+// non-nil, is the preflight answer for the same URL: its bytes are classified
+// instead of sending the GET again, and an unanswered preflight is reported as
+// unreachable without a second attempt.
+func probeTarget(ctx context.Context, requester *http.Requester, rootURL string, level string, pre *preflightProbe) *HeuristicsResult {
 	result := &HeuristicsResult{
 		Target: rootURL,
 	}
 
+	var fullResp []byte
+	switch {
+	case pre != nil && pre.reached:
+		fullResp = pre.resp
+	case pre != nil:
+		markUnreachable(result, pre.class)
+		result.fromPreflight = true
+		return result
+	default:
+		resp, class, err := fetchRoot(ctx, requester, rootURL)
+		if err != nil {
+			if class == "" {
+				zap.L().Warn("HeuristicsCheck: failed to build request",
+					zap.String("url", rootURL), zap.Error(err))
+				result.ContentType = "error"
+				result.Reason = "failed to build request"
+				// Don't skip on errors — let phases try
+				return result
+			}
+			zap.L().Warn("HeuristicsCheck: request failed",
+				zap.String("url", rootURL), zap.String("class", class), zap.Error(err))
+			markUnreachable(result, class)
+			return result
+		}
+		fullResp = resp
+	}
+	result.Reachable = true
+	classifyRootResponse(requester, rootURL, level, fullResp, result)
+	return result
+}
+
+// markUnreachable records a root that did not answer. Spidering is not skipped
+// on it — a transient failure must not cost the later phases their chance.
+func markUnreachable(result *HeuristicsResult, class string) {
+	result.ContentType = "error"
+	result.ErrClass = class
+	result.Reason = "unreachable (" + http.DescribeTransportClass(class) + ")"
+}
+
+// fetchRoot sends the root GET. class is the transport error class when the
+// request was sent and failed, "" when it could not be built.
+func fetchRoot(ctx context.Context, requester *http.Requester, rootURL string) (resp []byte, class string, err error) {
 	rr, err := httpmsg.GetRawRequestFromURL(rootURL)
 	if err != nil {
-		zap.L().Warn("HeuristicsCheck: failed to build request",
-			zap.String("url", rootURL), zap.Error(err))
-		result.ContentType = "error"
-		result.Reason = "failed to build request"
-		// Don't skip on errors — let phases try
-		return result
+		return nil, "", err
 	}
-
-	respChain, _, err := requester.Execute(rr, http.Options{DisableCompression: true})
+	// NoRedirects: see preflight.go. Both paths into classifyRootResponse must
+	// reach the same verdict, or `--skip preflight` changes which phases run.
+	respChain, _, err := requester.ExecuteContext(ctx, rr, http.Options{
+		DisableCompression: true,
+		NoRedirects:        true,
+		// A plain GET learning whether the host answers: a timed-out attempt
+		// is safe to retry (timeouts stay unretried by default).
+		RetryTimeouts: true,
+	})
 	if err != nil {
-		zap.L().Warn("HeuristicsCheck: request failed",
-			zap.String("url", rootURL), zap.Error(err))
-		result.ContentType = "error"
-		result.Reason = "request failed"
-		// Don't skip on errors — let phases try
-		return result
+		return nil, http.ClassifyTransportError(err), err
 	}
+	defer respChain.Close()
+	return respChain.FullResponseBytes(), "", nil
+}
 
-	fullResp := respChain.FullResponseBytes()
+// classifyRootResponse classifies a root page's full response into result:
+// content type, status, and whether spidering is worthwhile. It may probe
+// secondary paths (confirmBlank) when the root is blank.
+func classifyRootResponse(requester *http.Requester, rootURL, level string, fullResp []byte, result *HeuristicsResult) {
 	if len(fullResp) == 0 {
 		result.ContentType = "blank"
 		result.SkipSpidering = true
 		result.Reason = "empty response"
-		return result
+		return
 	}
 
 	result.StatusCode = httpmsg.GetStatusCode(fullResp)
+
+	// The root probe never follows (see fetchRoot and preflight.go), so a 3xx here
+	// is the target's OWN answer rather than a hop that got away — the normal case
+	// for any redirecting root, not an edge one. The body of such a response is
+	// usually empty or a tiny stub, which the body-only classification below would
+	// mistake for a "blank/empty root page" and skip spidering — even though the
+	// redirect points at a live app (a classic off-host SSO/login redirect). A
+	// redirect inherently points at content worth crawling, so never skip on it;
+	// the spider follows the hop itself, under the scan's own redirect mode.
+	if result.StatusCode >= 300 && result.StatusCode < 400 {
+		result.ContentType = "redirect"
+		result.SkipSpidering = false
+		result.Reason = "root redirects (3xx) — spidering retained"
+		return
+	}
 
 	// Classify using GetStartType
 	startType := httpmsg.GetStartType(fullResp)
@@ -201,8 +384,6 @@ func probeTarget(_ context.Context, requester *http.Requester, rootURL string, l
 		body := fullResp[bodyOffset:]
 		classifyAdvanced(result, body)
 	}
-
-	return result
 }
 
 // htmlTagPrefixes lists lowercase HTML element prefixes that GetStartType
@@ -319,7 +500,11 @@ func confirmBlank(requester *http.Requester, rootURL string) bool {
 		if err != nil {
 			continue
 		}
+		// Closed inside the loop, not deferred: the pooled buffers must go back
+		// each iteration, and every path below leaves the loop body. The bytes
+		// are a copy, so they outlive the chain.
 		fullResp := respChain.FullResponseBytes()
+		respChain.Close()
 		if len(fullResp) == 0 {
 			continue
 		}
@@ -338,6 +523,40 @@ func confirmBlank(requester *http.Requester, rootURL string) bool {
 		}
 	}
 	return true
+}
+
+// contentClassByHostFromHeuristics projects the heuristics root-page
+// classification into a host → content-class map (modkit.ContentClass strings)
+// for seeding the executor's content-class registry. Only the determinate
+// document/data classes (html/json/xml/text) are carried; blank/redirect/error
+// roots are left unset so the gate fails open for those hosts. Returns nil when
+// no heuristics ran.
+func (r *Runner) contentClassByHostFromHeuristics() map[string]string {
+	if len(r.heuristicsResults) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(r.heuristicsResults))
+	for _, hr := range r.heuristicsResults {
+		if hr == nil {
+			continue
+		}
+		var class string
+		switch hr.ContentType {
+		case "html", "json", "xml", "text":
+			class = hr.ContentType
+		default:
+			continue
+		}
+		u, err := neturl.Parse(hr.Target)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		out[strings.ToLower(u.Host)] = class
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // filterTargetsByHeuristics returns only the targets that should proceed,

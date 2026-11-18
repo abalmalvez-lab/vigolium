@@ -24,6 +24,15 @@ const (
 	// session is rejected as "not Claude Code". We prepend it transparently
 	// so user-supplied system prompts continue to work.
 	claudeCodeOAuthPreamble = "You are Claude Code, Anthropic's official CLI for Claude."
+	// defaultAnthropicMaxTokens is the output ceiling when the caller does
+	// not set one. Sized for long agentic turns; every request here streams,
+	// so a large ceiling cannot trip an HTTP read timeout.
+	defaultAnthropicMaxTokens = 64000
+	// maxAnthropicMaxTokens is the highest ceiling any current Claude model
+	// accepts. A request above it is rejected outright, so a configured value
+	// beyond it is treated as "unset" rather than passed through to a 400 —
+	// agent.olium.max_tokens has shipped with a 1000000 default.
+	maxAnthropicMaxTokens = 128000
 )
 
 // Anthropic is the native Messages API provider. It streams Server-Sent
@@ -34,17 +43,23 @@ const (
 //   - oauthToken: `Authorization: Bearer …` plus the OAuth beta header,
 //     used for Claude Code OAuth tokens (`sk-ant-oat01-…`).
 //
-// Both fields are wrapped in a formatter-safe secret so a stray `%v` on
-// the provider value can't leak the raw credential.
+// Both credential fields are wrapped in a formatter-safe secret so a stray
+// `%v` on the provider value can't leak the raw credential. baseURL and
+// extraHeaders back the anthropic-compatible variant — a gateway or proxy that
+// mirrors POST /v1/messages — and default to the canonical Anthropic endpoint
+// with no extra headers for the api-key / oauth providers.
 type Anthropic struct {
-	apiKey     secret
-	oauthToken secret
-	client     *http.Client
+	apiKey       secret
+	oauthToken   secret
+	baseURL      string
+	extraHeaders map[string]string
+	name         string
+	client       *http.Client
 }
 
 // NewAnthropic constructs an Anthropic provider authenticated with an API key.
 func NewAnthropic(apiKey string) *Anthropic {
-	return &Anthropic{apiKey: secret(apiKey), client: newHTTPClient()}
+	return &Anthropic{apiKey: secret(apiKey), baseURL: anthropicMessagesURL, name: "anthropic", client: newHTTPClient()}
 }
 
 // NewAnthropicOAuth constructs an Anthropic provider authenticated with a
@@ -52,10 +67,35 @@ func NewAnthropic(apiKey string) *Anthropic {
 // through this provider include the `oauth-2025-04-20` beta header and the
 // Claude Code system-prompt preamble required by the OAuth grant.
 func NewAnthropicOAuth(token string) *Anthropic {
-	return &Anthropic{oauthToken: secret(token), client: newHTTPClient()}
+	return &Anthropic{oauthToken: secret(token), baseURL: anthropicMessagesURL, name: "anthropic", client: newHTTPClient()}
 }
 
-func (*Anthropic) Name() string { return "anthropic" }
+// NewAnthropicCompatible speaks the Anthropic Messages wire format against an
+// arbitrary base URL — a self-hosted gateway, a LiteLLM-style proxy, or any
+// endpoint that mirrors POST /v1/messages. baseURL accepts a full messages URL
+// (http://host/v1/messages), a /v1 root (http://host/v1 — /messages is
+// appended), or a bare host (http://host — /v1/messages is appended). An empty
+// apiKey suppresses the x-api-key header for unauthenticated local proxies;
+// extraHeaders are applied last so callers can switch to a Bearer scheme or
+// pin a specific anthropic-version.
+func NewAnthropicCompatible(baseURL, apiKey string, extraHeaders map[string]string) *Anthropic {
+	return &Anthropic{
+		apiKey:       secret(apiKey),
+		baseURL:      normalizeAnthropicBaseURL(baseURL),
+		extraHeaders: extraHeaders,
+		name:         "anthropic-compatible",
+		client:       newHTTPClient(),
+	}
+}
+
+func (a *Anthropic) Name() string { return a.name }
+
+// normalizeAnthropicBaseURL tolerates a full /v1/messages URL, a /v1 root, or
+// a bare host, resolving each to a complete messages endpoint. Trailing
+// slashes are trimmed so we never emit /v1//messages.
+func normalizeAnthropicBaseURL(raw string) string {
+	return normalizeProviderBaseURL(raw, anthropicMessagesEndpoint)
+}
 
 // CloseIdleConnections drops idle HTTP/2 conns on this provider's transport
 // so the next request opens a fresh one. Engine calls this between retry
@@ -67,8 +107,9 @@ func (a *Anthropic) CloseIdleConnections() {
 // --- Request body types ---
 
 type anthContentText struct {
-	Type string `json:"type"` // "text"
-	Text string `json:"text"`
+	Type         string            `json:"type"` // "text"
+	Text         string            `json:"text"`
+	CacheControl *anthCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthContentToolUse struct {
@@ -79,10 +120,11 @@ type anthContentToolUse struct {
 }
 
 type anthContentToolResult struct {
-	Type      string `json:"type"` // "tool_result"
-	ToolUseID string `json:"tool_use_id"`
-	Content   string `json:"content"`
-	IsError   bool   `json:"is_error,omitempty"`
+	Type         string            `json:"type"` // "tool_result"
+	ToolUseID    string            `json:"tool_use_id"`
+	Content      string            `json:"content"`
+	IsError      bool              `json:"is_error,omitempty"`
+	CacheControl *anthCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthMessage struct {
@@ -96,6 +138,10 @@ type anthMessage struct {
 type anthCacheControl struct {
 	Type string `json:"type"` // "ephemeral"
 }
+
+// ephemeralCache returns a prompt-cache breakpoint marker. "ephemeral" is
+// the only cache type the API supports, so it is spelled once here.
+func ephemeralCache() *anthCacheControl { return &anthCacheControl{Type: "ephemeral"} }
 
 // anthSystemBlock is the structured form of the system field — we only
 // switch to it when prompt caching is enabled, since "system as string"
@@ -114,13 +160,28 @@ type anthTool struct {
 	CacheControl *anthCacheControl `json:"cache_control,omitempty"`
 }
 
+// anthThinking configures extended thinking. Current Claude models take
+// {"type":"adaptive"} and size the reasoning themselves; the older
+// budget_tokens form is rejected on Opus 4.7 and later.
+type anthThinking struct {
+	Type string `json:"type"` // "adaptive"
+}
+
+// anthOutputConfig carries the effort dial, which is what replaces a
+// thinking token budget on adaptive-thinking models.
+type anthOutputConfig struct {
+	Effort string `json:"effort,omitempty"` // low | medium | high | xhigh | max
+}
+
 type anthRequest struct {
-	Model     string        `json:"model"`
-	System    any           `json:"system,omitempty"` // string or []anthSystemBlock
-	MaxTokens int           `json:"max_tokens"`
-	Messages  []anthMessage `json:"messages"`
-	Tools     []anthTool    `json:"tools,omitempty"`
-	Stream    bool          `json:"stream"`
+	Model        string            `json:"model"`
+	System       any               `json:"system,omitempty"` // string or []anthSystemBlock
+	MaxTokens    int               `json:"max_tokens"`
+	Messages     []anthMessage     `json:"messages"`
+	Tools        []anthTool        `json:"tools,omitempty"`
+	Stream       bool              `json:"stream"`
+	Thinking     *anthThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthOutputConfig `json:"output_config,omitempty"`
 }
 
 func (a *Anthropic) Stream(ctx context.Context, req Request) (<-chan stream.Event, error) {
@@ -133,27 +194,33 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (<-chan stream.Even
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicMessagesURL, bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 	if !a.oauthToken.IsZero() {
 		httpReq.Header.Set("authorization", "Bearer "+a.oauthToken.Reveal())
 		httpReq.Header.Set("anthropic-beta", claudeCodeOAuthBeta)
-	} else {
+	} else if !a.apiKey.IsZero() {
+		// Empty api key (anthropic-compatible against an unauthenticated local
+		// proxy) suppresses the header entirely, mirroring openai-compatible.
 		httpReq.Header.Set("x-api-key", a.apiKey.Reveal())
 	}
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 	httpReq.Header.Set("content-type", "application/json")
 	httpReq.Header.Set("accept", "text/event-stream")
+	// extraHeaders are applied last so a compatible gateway can override the
+	// auth scheme (e.g. Authorization: Bearer) or pin its own anthropic-version.
+	for k, v := range a.extraHeaders {
+		httpReq.Header.Set(k, v)
+	}
 
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		statusErr := statusErrorFrom("anthropic", resp)
 		// Auth failures (401/403) are the most common transient operator
 		// issue with this provider, especially for anthropic-oauth where
 		// the token from `claude setup-token` rotates every 90 days. Surface
@@ -165,9 +232,9 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (<-chan stream.Even
 			if !a.oauthToken.IsZero() {
 				hint = " — Claude Code OAuth token expired or revoked; refresh with `claude setup-token` and update agent.olium.oauth_token (or $ANTHROPIC_API_KEY)"
 			}
-			return nil, fmt.Errorf("anthropic %d: %s%s", resp.StatusCode, string(raw), hint)
+			return nil, statusErr.WithHint(hint)
 		}
-		return nil, fmt.Errorf("anthropic %d: %s", resp.StatusCode, string(raw))
+		return nil, statusErr
 	}
 
 	out := make(chan stream.Event, 32)
@@ -178,12 +245,73 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (<-chan stream.Even
 func buildAnthropicRequest(req Request) anthRequest {
 	body := anthRequest{
 		Model:     req.Model,
-		MaxTokens: 8192,
+		MaxTokens: anthropicMaxTokens(req),
 		Messages:  buildAnthropicMessages(req.Messages),
 		Stream:    true,
 	}
+	applyAnthropicThinking(&body, req)
 	applyAnthropicSystemAndTools(&body, req)
+	applyAnthropicMessageCache(body.Messages, req)
 	return body
+}
+
+// anthropicMaxTokens resolves the per-response output ceiling. The old
+// hard-coded 8192 truncated long turns on models that allow far more, and
+// on adaptive-thinking models reasoning tokens count against this budget
+// even when their text is never returned.
+func anthropicMaxTokens(req Request) int {
+	if req.MaxTokens > 0 && req.MaxTokens <= maxAnthropicMaxTokens {
+		return req.MaxTokens
+	}
+	return defaultAnthropicMaxTokens
+}
+
+// applyAnthropicThinking turns on adaptive thinking for Claude models that
+// support it, and forwards the configured reasoning effort. Omitting the
+// field leaves thinking off on Opus 4.7/4.8 — which is how an agent ends up
+// writing a tool call into its visible text instead of emitting a tool_use
+// block. Gated on the model id so an anthropic-compatible gateway fronting
+// some other model never sees a field it would reject.
+func applyAnthropicThinking(body *anthRequest, req Request) {
+	if !supportsAdaptiveThinking(req.Model) {
+		return
+	}
+	body.Thinking = &anthThinking{Type: "adaptive"}
+	// "minimal" is an OpenAI-only level (see clampReasoning); Anthropic's
+	// scale starts at "low", so send no effort at all rather than a 400.
+	if effort := strings.TrimSpace(req.ReasoningEff); effort != "" && effort != "minimal" {
+		body.OutputConfig = &anthOutputConfig{Effort: effort}
+	}
+}
+
+// adaptiveThinkingPrefixes lists the model families that accept
+// thinking:{type:"adaptive"} — Claude 4.6 and later. An allow-list rather
+// than a list of legacy exclusions: a deny-list silently opts every
+// unrecognised id in, so a 4.0-era id (claude-opus-4-20250514) or a model
+// behind an anthropic-compatible gateway would be sent a field it rejects
+// with a 400. Mirrors responsesReasoningPrefixes in openai_responses.go.
+var adaptiveThinkingPrefixes = []string{
+	"claude-opus-4-6",
+	"claude-opus-4-7",
+	"claude-opus-4-8",
+	"claude-opus-5",
+	"claude-sonnet-4-6",
+	"claude-sonnet-5",
+	"claude-fable-5",
+	"claude-mythos-5",
+}
+
+// supportsAdaptiveThinking reports whether a model id takes
+// thinking:{type:"adaptive"}. Anything else — an older Claude, a non-Claude
+// model behind an anthropic-compatible gateway — is left alone.
+func supportsAdaptiveThinking(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range adaptiveThinkingPrefixes {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildAnthropicMessages converts the provider-neutral message list into
@@ -258,7 +386,7 @@ func applyAnthropicSystemAndTools(body *anthRequest, req Request) {
 		body.System = []anthSystemBlock{{
 			Type:         "text",
 			Text:         req.System,
-			CacheControl: &anthCacheControl{Type: "ephemeral"},
+			CacheControl: ephemeralCache(),
 		}}
 	} else if req.System != "" {
 		body.System = req.System
@@ -278,8 +406,34 @@ func applyAnthropicSystemAndTools(body *anthRequest, req Request) {
 		// last tool effectively caches the entire tool list (which is
 		// stable across an autopilot run).
 		if req.CacheControl {
-			body.Tools[len(body.Tools)-1].CacheControl = &anthCacheControl{Type: "ephemeral"}
+			body.Tools[len(body.Tools)-1].CacheControl = ephemeralCache()
 		}
+	}
+}
+
+// applyAnthropicMessageCache marks the tail of the conversation as a cache
+// breakpoint. Caching the system prompt and the tool list only ever covers a
+// fixed prefix, so a long agent loop re-pays full input price for a
+// transcript that grows every turn. History is append-only here, so marking
+// the last block means turn N+1 reads the prefix turn N wrote.
+//
+// Three breakpoints total (system, last tool, here) stays inside Anthropic's
+// limit of four. Only a tool_result tail is marked: a text tail is either
+// turn one (whose prefix is system+tools, already marked) or a single-shot
+// caller that never issues a second request, so a breakpoint there buys a
+// cache write nobody reads back.
+func applyAnthropicMessageCache(msgs []anthMessage, req Request) {
+	if !req.CacheControl || len(msgs) == 0 {
+		return
+	}
+	last := &msgs[len(msgs)-1]
+	if len(last.Content) == 0 {
+		return
+	}
+	i := len(last.Content) - 1
+	if block, ok := last.Content[i].(anthContentToolResult); ok {
+		block.CacheControl = ephemeralCache()
+		last.Content[i] = block
 	}
 }
 
@@ -309,14 +463,13 @@ func consumeAnthropicSSE(ctx context.Context, body io.ReadCloser, out chan<- str
 			out <- stream.Event{Type: stream.EventError, Err: err.Error()}
 			return
 		}
-		if evt.Data == "" {
-			continue
+		for _, piece := range evt.JSONPayloads() {
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(piece), &parsed); err != nil {
+				continue
+			}
+			state.handle(evt.Event, parsed, out)
 		}
-		var parsed map[string]any
-		if err := json.Unmarshal([]byte(evt.Data), &parsed); err != nil {
-			continue
-		}
-		state.handle(evt.Event, parsed, out)
 	}
 }
 
@@ -392,14 +545,12 @@ func (s *anthropicState) handle(evtName string, ev map[string]any, out chan<- st
 		case "text":
 			out <- stream.Event{Type: stream.EventTextEnd}
 		case "tool_use":
-			args := map[string]any{}
-			if s.toolJSON != "" {
-				debugToolArgErr("anthropic", json.Unmarshal([]byte(s.toolJSON), &args))
-			}
+			args, argsErr := toolArgs("anthropic", s.toolJSON)
 			out <- stream.Event{Type: stream.EventToolCallEnd, ToolCall: &stream.ToolCall{
 				ID:        s.toolID,
 				Name:      s.toolName,
 				Arguments: args,
+				ArgsError: argsErr,
 			}}
 			s.toolID, s.toolName, s.toolJSON = "", "", ""
 		case "thinking":

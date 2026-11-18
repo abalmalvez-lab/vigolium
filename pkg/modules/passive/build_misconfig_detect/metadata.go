@@ -9,26 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript, TypeScript, and JSON response bodies for build and deployment
-misconfigurations in modern frontend frameworks. Detects production source maps
-enabled (Next.js, Vite, webpack), development mode start scripts in production
-package.json, dangerous SVG handling in Next.js image optimization, and overly
-broad image remote patterns. These misconfigurations can leak source code,
-expose development tooling, or enable SSRF attacks.
+	ModuleDesc = `**What it means:** A frontend build config (next.config, vite.config, webpack.config, package.json) is left insecure for production. Detected issues: production source maps enabled, a dev-mode start script in production package.json, Next.js dangerouslyAllowSVG on, and an overly broad image remotePatterns wildcard hostname.
 
-## Notes
-- Passive only -- does not send any HTTP requests
-- Scans JS/TS/JSON responses and config file URLs
-- Detects: source maps in prod, dev mode in prod, SVG XSS risk, broad image remotePatterns
-- Deduplicates by host
+**How it's exploited:** Source maps let an attacker reconstruct source and find secrets; dev-mode servers expose verbose errors and debug endpoints; SVG through the image optimizer enables stored XSS; a wildcard image hostname enables SSRF.
 
-## References
-- https://nextjs.org/docs/app/api-reference/next-config-js/productionBrowserSourceMaps
-- https://vitejs.dev/config/build-options.html#build-sourcemap
-- https://webpack.js.org/configuration/devtool/
-- https://cwe.mitre.org/data/definitions/540.html
-- https://cwe.mitre.org/data/definitions/489.html`
+**Fix:** Disable source maps and dev settings in production builds, restrict image remotePatterns to trusted hostnames, and keep dangerouslyAllowSVG off.`
 
 	ModuleConfirmation = "Confirmed when response body contains build or deployment configuration patterns that indicate misconfigurations in production"
 	ModuleSeverity     = severity.High

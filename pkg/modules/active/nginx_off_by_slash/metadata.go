@@ -9,25 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for Nginx "off-by-slash" alias traversal misconfiguration. When an Nginx location block
-uses an alias directive without a matching trailing slash, attackers can traverse outside the
-intended directory. For example, "location /static { alias /var/www/assets/; }" allows
-requesting "/static../etc/passwd" to read files outside /var/www/assets/.
+	ModuleDesc = `**What it means:** The server has the Nginx off-by-slash alias traversal misconfiguration: a location uses alias without a matching trailing slash, so a request path breaks out of the intended directory and an attacker reads files outside it.
 
-## Notes
-- Operates on path segments, testing each first-level directory for alias traversal
-- Compares response body against baseline to confirm the traversal resolved to the same content
-- Skips media/JS URLs, non-GET requests, and very small baseline responses
+**How it's exploited:** An attacker appends a traversal marker after the location prefix (/static../config, /static..;/etc/passwd), confirmed as a stable file read differing from in-alias and random-suffix controls. This discloses adjacent source, configuration, and secrets served one directory up.
 
-## References
-- https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf
-- https://github.com/bayotop/off-by-slash
-- https://github.com/yandex/gixy
-- https://github.com/hakaioffsec/nginx-alias-traversal`
+**Fix:** Ensure every alias directive ends with a trailing slash matching its location prefix, or replace alias with root.`
 
-	ModuleConfirmation = "Confirmed when a path-traversal request using the off-by-slash pattern returns status 200 with a body matching a known valid suffix endpoint"
-	ModuleSeverity     = severity.High
+	ModuleConfirmation = "Confirmed when an off-by-slash traversal path returns a stable, non-wildcard 200 whose body differs from both the in-alias equivalent path and a random-suffix traversal — proving the response depends on the escaped path rather than a prefix-wide generic handler"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"nginx", "misconfiguration", "lfi", "moderate"}
 )

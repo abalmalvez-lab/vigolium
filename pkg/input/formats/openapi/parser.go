@@ -2,11 +2,13 @@ package openapi
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -213,6 +215,11 @@ func generateRequestsFromSchema(schema *openapi3.T, opts Options, callback Resul
 	// Normalize BaseURL: remove trailing slash to avoid double //
 	opts.BaseURL = strings.TrimSuffix(opts.BaseURL, "/")
 
+	if opts.Stats == nil {
+		opts.Stats = &ParseStats{}
+	}
+	defer reportParseStats(opts.Stats)
+
 	// Get global security parameters
 	globalParams := openapi3.NewParameters()
 	if len(schema.Security) > 0 && schema.Components != nil {
@@ -261,6 +268,7 @@ func generateRequestsFromSchema(schema *openapi3.T, opts Options, callback Resul
 					opts:         opts,
 					callback:     callback,
 				}); err != nil {
+					opts.Stats.SkippedOperations++
 					zap.L().Debug("Failed to generate request",
 						zap.String("method", pop.method),
 						zap.String("path", requestPath),
@@ -273,7 +281,7 @@ func generateRequestsFromSchema(schema *openapi3.T, opts Options, callback Resul
 
 	// BaseURL not provided - check if we should use spec servers
 	if !opts.UseSpecServers {
-		return fmt.Errorf("base URL required (-u/--target), or use --spec-url to use servers from spec")
+		return fmt.Errorf("base URL required: pass -t/--target, or --spec-url to use the servers declared in the spec")
 	}
 
 	// Collect server URLs from spec
@@ -325,6 +333,7 @@ func generateRequestsFromSchema(schema *openapi3.T, opts Options, callback Resul
 				opts:         opts,
 				callback:     callback,
 			}); err != nil {
+				opts.Stats.SkippedOperations++
 				zap.L().Debug("Failed to generate request",
 					zap.String("method", pop.method),
 					zap.String("path", requestPath),
@@ -420,7 +429,7 @@ func getParameterExample(param *openapi3.Parameter) (any, bool) {
 
 // getMediaTypeExample extracts example value from media type.
 // Priority: MediaType.Example > MediaType.Examples > Schema
-func getMediaTypeExample(mediaType *openapi3.MediaType, fieldTypeDefaults map[string][]string) (any, error) {
+func getMediaTypeExample(mediaType *openapi3.MediaType, fieldTypeDefaults map[string][]string, requiredOnly bool) (any, error) {
 	if mediaType.Example != nil {
 		return mediaType.Example, nil
 	}
@@ -430,7 +439,7 @@ func getMediaTypeExample(mediaType *openapi3.MediaType, fieldTypeDefaults map[st
 		}
 	}
 	if mediaType.Schema != nil && mediaType.Schema.Value != nil {
-		return generateExampleFromSchema(mediaType.Schema.Value, fieldTypeDefaults)
+		return generateExampleFromSchemaOpts(mediaType.Schema.Value, fieldTypeDefaults, requiredOnly)
 	}
 	return map[string]any{}, nil
 }
@@ -470,8 +479,12 @@ func generateRequestsFromOp(opts *generateReqOptions) error {
 		value := parameter.Value
 		var paramValue any
 
-		// Priority: Variables > Parameter.Example > DefaultFallbackValue (for required) > Schema generated
-		if val, ok := opts.opts.Variables[value.Name]; ok {
+		// Priority: Variables > Parameter.Example > DefaultFallbackValue (for required) > Schema generated.
+		// A security-scheme parameter already carries its finished value (e.g.
+		// "Bearer <token>"); the raw variable it came from must not replace it.
+		if ex, ok := securityParamValue(value); ok {
+			paramValue = ex
+		} else if val, ok := opts.opts.Variables[value.Name]; ok {
 			paramValue = val
 		} else if ex, ok := getParameterExample(value); ok {
 			paramValue = ex
@@ -481,29 +494,28 @@ func generateRequestsFromOp(opts *generateReqOptions) error {
 			zap.L().Debug("Using default fallback for required param",
 				zap.String("param", value.Name),
 				zap.String("value", opts.opts.DefaultFallbackValue))
-		} else if value.Schema != nil && value.Schema.Value != nil {
-			// Generate example value from schema
-			exampleVal, err := generateExampleFromSchema(value.Schema.Value, opts.opts.FieldTypeDefaults)
-			if err != nil {
-				if value.Required {
-					zap.L().Debug("Skipping request due to missing required param",
-						zap.String("method", opts.method),
-						zap.String("path", opts.requestPath),
-						zap.String("param", value.Name))
-					return nil
-				}
-				opts.requestPath = strings.ReplaceAll(opts.requestPath, fmt.Sprintf("{%s}", value.Name), "")
-				continue
-			}
+		} else if !value.Required && opts.opts.RequiredOnly {
+			// --required-only: an optional parameter with no explicit value
+			// is left out rather than filled from its schema.
+			opts.requestPath = strings.ReplaceAll(opts.requestPath, fmt.Sprintf("{%s}", value.Name), "")
+			continue
+		} else if idVal, ok := idLikeParamValue(value); ok {
+			paramValue = idVal
+		} else if exampleVal, ok := schemaParamExample(value, opts.opts.FieldTypeDefaults); ok {
 			paramValue = exampleVal
+		} else if value.Required {
+			// A required parameter with nothing to go on used to drop the whole
+			// operation. Synthesize a type-shaped placeholder instead: the
+			// endpoint is still worth a request, and the active modules
+			// replace the value anyway.
+			paramValue = synthesizeParamValue(value)
+			opts.opts.Stats.SynthesizedParams++
+			zap.L().Debug("Synthesized value for required param without example",
+				zap.String("method", opts.method),
+				zap.String("path", opts.requestPath),
+				zap.String("param", value.Name),
+				zap.Any("value", paramValue))
 		} else {
-			if value.Required {
-				zap.L().Debug("Skipping request due to missing required param",
-					zap.String("method", opts.method),
-					zap.String("path", opts.requestPath),
-					zap.String("param", value.Name))
-				return nil
-			}
 			opts.requestPath = strings.ReplaceAll(opts.requestPath, fmt.Sprintf("{%s}", value.Name), "")
 			continue
 		}
@@ -514,14 +526,24 @@ func generateRequestsFromOp(opts *generateReqOptions) error {
 		case "header":
 			req.Header.Set(value.Name, toString(paramValue))
 		case "path":
-			opts.requestPath = strings.ReplaceAll(opts.requestPath, "{"+value.Name+"}", toString(paramValue))
+			// Escape the value as one path segment: a "/" in it must not
+			// become a path separator (a/b → a%2Fb).
+			opts.requestPath = strings.ReplaceAll(opts.requestPath, "{"+value.Name+"}", url.PathEscape(toString(paramValue)))
 		case "cookie":
 			req.AddCookie(&http.Cookie{Name: value.Name, Value: toString(paramValue)})
 		}
 	}
 
 	req.URL.RawQuery = query.Encode()
-	req.URL.Path = opts.requestPath
+	// requestPath is in escaped form (path values were PathEscaped). RawPath
+	// keeps an escaped "/" inside a segment through serialization; Path is
+	// its decoded twin.
+	if decoded, err := url.PathUnescape(opts.requestPath); err == nil {
+		req.URL.Path = decoded
+		req.URL.RawPath = opts.requestPath
+	} else {
+		req.URL.Path = opts.requestPath
+	}
 
 	// Add custom headers from options
 	for k, v := range opts.opts.Headers {
@@ -533,12 +555,17 @@ func generateRequestsFromOp(opts *generateReqOptions) error {
 		for contentType, mediaType := range opts.op.RequestBody.Value.Content {
 			cloned := req.Clone(req.Context())
 
-			val, err := getMediaTypeExample(mediaType, opts.opts.FieldTypeDefaults)
+			val, err := getMediaTypeExample(mediaType, opts.opts.FieldTypeDefaults, opts.opts.RequiredOnly)
 			if err != nil {
+				opts.opts.Stats.SkippedOperations++
+				zap.L().Debug("Failed to build request body example",
+					zap.String("method", opts.method), zap.String("path", opts.requestPath),
+					zap.String("contentType", contentType), zap.Error(err))
 				continue
 			}
 
 			if err := setRequestBody(cloned, contentType, val, mediaType.Schema); err != nil {
+				opts.opts.Stats.SkippedOperations++
 				zap.L().Debug("Failed to set request body", zap.String("contentType", contentType), zap.Error(err))
 				continue
 			}
@@ -555,7 +582,7 @@ func generateRequestsFromOp(opts *generateReqOptions) error {
 
 // setRequestBody sets the request body based on content type.
 func setRequestBody(req *http.Request, contentType string, val any, schemaRef *openapi3.SchemaRef) error {
-	switch contentType {
+	switch canonicalMediaType(contentType) {
 	case "application/json":
 		marshalled, err := marshalJSON(val)
 		if err != nil {
@@ -563,7 +590,7 @@ func setRequestBody(req *http.Request, contentType string, val any, schemaRef *o
 		}
 		req.Body = io.NopCloser(bytes.NewReader(marshalled))
 		req.ContentLength = int64(len(marshalled))
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", declaredOr(contentType, "application/json"))
 
 	case "application/xml":
 		xmlData, err := marshalXML(val)
@@ -572,7 +599,7 @@ func setRequestBody(req *http.Request, contentType string, val any, schemaRef *o
 		}
 		req.Body = io.NopCloser(bytes.NewReader(xmlData))
 		req.ContentLength = int64(len(xmlData))
-		req.Header.Set("Content-Type", "application/xml")
+		req.Header.Set("Content-Type", declaredOr(contentType, "application/xml"))
 
 	case "application/x-www-form-urlencoded":
 		if values, ok := val.(map[string]any); ok {
@@ -583,7 +610,7 @@ func setRequestBody(req *http.Request, contentType string, val any, schemaRef *o
 			encoded := form.Encode()
 			req.Body = io.NopCloser(strings.NewReader(encoded))
 			req.ContentLength = int64(len(encoded))
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Content-Type", declaredOr(contentType, "application/x-www-form-urlencoded"))
 		}
 
 	case "multipart/form-data":
@@ -612,7 +639,7 @@ func setRequestBody(req *http.Request, contentType string, val any, schemaRef *o
 		str := toString(val)
 		req.Body = io.NopCloser(strings.NewReader(str))
 		req.ContentLength = int64(len(str))
-		req.Header.Set("Content-Type", "text/plain")
+		req.Header.Set("Content-Type", declaredOr(contentType, "text/plain"))
 
 	case "application/octet-stream":
 		str := toString(val)
@@ -638,11 +665,68 @@ func setRequestBody(req *http.Request, contentType string, val any, schemaRef *o
 func callbackWithRequest(req *http.Request, opts *generateReqOptions) {
 	rr, err := httpmsg.FromStdRequest(req)
 	if err != nil {
+		opts.opts.Stats.SkippedOperations++
 		zap.L().Debug("Failed to convert request", zap.Error(err))
 		return
 	}
 
+	opts.opts.Stats.Emitted++
 	opts.callback(rr)
+}
+
+// reportParseStats logs, once per parse, what the spec could not produce as
+// written. Skipped operations are a warning (the scan covers less of the API
+// than the spec declares); synthesized values are informational.
+func reportParseStats(st *ParseStats) {
+	if st.SkippedOperations > 0 {
+		zap.L().Warn("openapi: some operations produced no request",
+			zap.Int("skipped_operations", st.SkippedOperations),
+			zap.Int("emitted", st.Emitted))
+	}
+	if st.SynthesizedParams > 0 {
+		zap.L().Info("openapi: filled required parameters that had no example with placeholders",
+			zap.Int("synthesized_params", st.SynthesizedParams))
+	}
+}
+
+// schemaParamExample generates a value for a parameter from its schema, or from
+// the schema of its content media type when it uses `content` instead.
+func schemaParamExample(param *openapi3.Parameter, fieldTypeDefaults map[string][]string) (any, bool) {
+	if param.Schema != nil && param.Schema.Value != nil {
+		if ex, err := generateExampleFromSchema(param.Schema.Value, fieldTypeDefaults); err == nil {
+			return ex, true
+		}
+	}
+	for _, mt := range param.Content {
+		if mt != nil && mt.Schema != nil && mt.Schema.Value != nil {
+			if ex, err := generateExampleFromSchema(mt.Schema.Value, fieldTypeDefaults); err == nil {
+				return ex, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// zeroUUID is the placeholder for a uuid-formatted parameter.
+const zeroUUID = "00000000-0000-0000-0000-000000000000"
+
+// synthesizeParamValue returns a placeholder shaped by the parameter's declared
+// type when nothing better exists: 1 for numbers, true for booleans, the zero
+// UUID for uuid strings, "1" otherwise (a value most ID-like slots accept).
+func synthesizeParamValue(param *openapi3.Parameter) any {
+	if param.Schema == nil || param.Schema.Value == nil {
+		return "1"
+	}
+	sc := param.Schema.Value
+	switch {
+	case sc.Type.Is("integer"), sc.Type.Is("number"):
+		return 1
+	case sc.Type.Is("boolean"):
+		return true
+	case strings.EqualFold(sc.Format, "uuid"):
+		return zeroUUID
+	}
+	return "1"
 }
 
 // getGlobalParamsForSecurityRequirement extracts parameters from security requirements.
@@ -660,7 +744,7 @@ func getGlobalParamsForSecurityRequirement(schema *openapi3.T, requirement *open
 				continue
 			}
 
-			param, err := generateParameterFromSecurityScheme(scheme, variables)
+			param, err := generateParameterFromSecurityScheme(name, scheme, variables)
 			if err != nil {
 				zap.L().Debug("Failed to generate security param", zap.String("scheme", name), zap.Error(err))
 				continue
@@ -674,46 +758,118 @@ func getGlobalParamsForSecurityRequirement(schema *openapi3.T, requirement *open
 	return globalParams, nil
 }
 
-// generateParameterFromSecurityScheme creates a parameter from a security scheme.
-func generateParameterFromSecurityScheme(scheme *openapi3.SecuritySchemeRef, variables map[string]string) (*openapi3.Parameter, error) {
+// securityParamExt marks a parameter built from a security scheme. Its example
+// is the finished credential ("Bearer <token>"), so the variable lookup in
+// generateRequestsFromOp must not swap the raw --spec-var value back in.
+const securityParamExt = "x-vigolium-security-param"
+
+// securityParamValue returns the finished value of a security-scheme parameter.
+func securityParamValue(p *openapi3.Parameter) (any, bool) {
+	if p.Extensions[securityParamExt] != true || p.Schema == nil || p.Schema.Value == nil {
+		return nil, false
+	}
+	return p.Schema.Value.Example, true
+}
+
+// lookupVar returns the first non-empty variable among keys.
+func lookupVar(variables map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if v := variables[k]; v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// withAuthScheme prefixes value with "<scheme> " unless it already carries it,
+// so both --spec-var bearer=<token> and --spec-var Authorization="Bearer
+// <token>" produce one prefix.
+func withAuthScheme(scheme, value string) string {
+	if len(value) > len(scheme) && strings.EqualFold(value[:len(scheme)+1], scheme+" ") {
+		return value
+	}
+	return scheme + " " + value
+}
+
+// basicAuthValue builds a Basic credential: "user:pass" is base64-encoded, an
+// already-encoded token or a full "Basic …" value is kept.
+func basicAuthValue(value string) string {
+	if len(value) > 6 && strings.EqualFold(value[:6], "basic ") {
+		return value
+	}
+	if strings.Contains(value, ":") {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(value))
+	}
+	return "Basic " + value
+}
+
+// generateParameterFromSecurityScheme creates a parameter from a security
+// scheme. name is the scheme's key under components.securitySchemes, which a
+// --spec-var may use as well as the generic keys:
+//
+//	http bearer, oauth2, openIdConnect: bearer=<token> | <name>=<token> | Authorization=<token>
+//	http basic:                         basic=user:pass | <name>=user:pass | Authorization=…
+//	apiKey:                             <param name>=<key> | <name>=<key>
+//
+// A value that already starts with its scheme ("Bearer …", "Basic …") is used
+// as-is, so nothing is double-prefixed. A scheme with no value adds nothing.
+func generateParameterFromSecurityScheme(name string, scheme *openapi3.SecuritySchemeRef, variables map[string]string) (*openapi3.Parameter, error) {
 	if scheme == nil || scheme.Value == nil {
 		return nil, nil
 	}
 
-	switch scheme.Value.Type {
-	case "http":
+	authHeader := func(value string) *openapi3.Parameter {
 		headerName := scheme.Value.Name
-		if headerName == "" {
+		if headerName == "" || scheme.Value.Type != "http" {
 			headerName = "Authorization"
 		}
-
-		// Check if we have a value for this auth
-		var authValue string
-		if val, ok := variables[headerName]; ok {
-			authValue = val
-		} else if val, ok := variables["Authorization"]; ok {
-			authValue = val
-		}
-
-		if authValue == "" {
-			zap.L().Debug("Missing auth value for HTTP security scheme", zap.String("scheme", scheme.Value.Scheme))
-			return nil, nil
-		}
-
 		param := openapi3.NewHeaderParameter(headerName)
 		param.Required = true
 		param.Schema = openapi3.NewStringSchema().NewRef()
-		param.Schema.Value.Example = authValue
-		return param, nil
+		param.Schema.Value.Example = value
+		param.Extensions = map[string]any{securityParamExt: true}
+		return param
+	}
+
+	switch scheme.Value.Type {
+	case "http":
+		switch strings.ToLower(scheme.Value.Scheme) {
+		case "bearer":
+			if v := lookupVar(variables, "bearer", name, "Authorization"); v != "" {
+				return authHeader(withAuthScheme("Bearer", v)), nil
+			}
+		case "basic":
+			if v := lookupVar(variables, "basic", name, "Authorization"); v != "" {
+				return authHeader(basicAuthValue(v)), nil
+			}
+		default:
+			// digest and other schemes: the value is the full credential.
+			if v := lookupVar(variables, scheme.Value.Name, name, "Authorization"); v != "" {
+				return authHeader(v), nil
+			}
+		}
+		zap.L().Debug("Missing auth value for HTTP security scheme",
+			zap.String("name", name), zap.String("scheme", scheme.Value.Scheme))
+		return nil, nil
+
+	case "oauth2", "openIdConnect":
+		// Both end in a bearer access token on the wire.
+		if v := lookupVar(variables, "bearer", name, "Authorization"); v != "" {
+			return authHeader(withAuthScheme("Bearer", v)), nil
+		}
+		zap.L().Debug("Missing token for security scheme", zap.String("name", name), zap.String("type", scheme.Value.Type))
+		return nil, nil
 
 	case "apiKey":
 		if scheme.Value.Name == "" {
 			return nil, nil
 		}
 
-		// Check if we have a value
-		authValue, ok := variables[scheme.Value.Name]
-		if !ok {
+		authValue := lookupVar(variables, scheme.Value.Name, name)
+		if authValue == "" {
 			zap.L().Debug("Missing value for apiKey", zap.String("name", scheme.Value.Name))
 			return nil, nil
 		}
@@ -733,6 +889,7 @@ func generateParameterFromSecurityScheme(scheme *openapi3.SecuritySchemeRef, var
 		param.Required = true
 		param.Schema = openapi3.NewStringSchema().NewRef()
 		param.Schema.Value.Example = authValue
+		param.Extensions = map[string]any{securityParamExt: true}
 		return param, nil
 	}
 
@@ -754,10 +911,29 @@ type cachedSchema struct {
 // generateExampleFromSchema creates an example value from an OpenAPI schema.
 // fieldTypeDefaults provides configurable default values per field type (may be nil).
 func generateExampleFromSchema(schema *openapi3.Schema, fieldTypeDefaults map[string][]string) (any, error) {
-	return openAPIExample(schema, make(map[*openapi3.Schema]*cachedSchema), fieldTypeDefaults)
+	return generateExampleFromSchemaOpts(schema, fieldTypeDefaults, false)
 }
 
-func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedSchema, fieldTypeDefaults map[string][]string) (out any, err error) {
+// generateExampleFromSchemaOpts is generateExampleFromSchema honouring
+// Options.RequiredOnly: when set, optional object properties are omitted.
+func generateExampleFromSchemaOpts(schema *openapi3.Schema, fieldTypeDefaults map[string][]string, requiredOnly bool) (any, error) {
+	return openAPIExample(schema, make(map[*openapi3.Schema]*cachedSchema), fieldTypeDefaults, requiredOnly)
+}
+
+// effectiveType returns the schema's first non-null declared type (OpenAPI
+// 3.1 allows `type: [string, "null"]`, and Types.Is is false for any
+// multi-type list, so such a property used to drop its whole operation), or
+// "" when untyped.
+func effectiveType(schema *openapi3.Schema) string {
+	for _, t := range schema.Type.Slice() {
+		if t != openapi3.TypeNull {
+			return t
+		}
+	}
+	return ""
+}
+
+func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedSchema, fieldTypeDefaults map[string][]string, requiredOnly bool) (out any, err error) {
 	if ex, ok := getSchemaExample(schema); ok {
 		return ex, nil
 	}
@@ -781,7 +957,7 @@ func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedS
 	if len(schema.OneOf) > 0 {
 		for _, candidate := range schema.OneOf {
 			if candidate.Value != nil {
-				ex, err := openAPIExample(candidate.Value, cache, fieldTypeDefaults)
+				ex, err := openAPIExample(candidate.Value, cache, fieldTypeDefaults, requiredOnly)
 				if err == nil {
 					return ex, nil
 				}
@@ -793,7 +969,7 @@ func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedS
 	if len(schema.AnyOf) > 0 {
 		for _, candidate := range schema.AnyOf {
 			if candidate.Value != nil {
-				ex, err := openAPIExample(candidate.Value, cache, fieldTypeDefaults)
+				ex, err := openAPIExample(candidate.Value, cache, fieldTypeDefaults, requiredOnly)
 				if err == nil {
 					return ex, nil
 				}
@@ -808,7 +984,7 @@ func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedS
 			if allOf.Value == nil {
 				continue
 			}
-			candidate, err := openAPIExample(allOf.Value, cache, fieldTypeDefaults)
+			candidate, err := openAPIExample(allOf.Value, cache, fieldTypeDefaults, requiredOnly)
 			if err != nil {
 				return nil, err
 			}
@@ -819,27 +995,35 @@ func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedS
 		return example, nil
 	}
 
+	typ := effectiveType(schema)
 	switch {
-	case schema.Type.Is("boolean"):
+	case typ == "boolean":
 		return true, nil
 
-	case schema.Type.Is("number"), schema.Type.Is("integer"):
+	case typ == "number", typ == "integer":
 		value := 0.0
 		if schema.Min != nil && *schema.Min > value {
 			value = *schema.Min
-			if schema.ExclusiveMin {
+			if schema.ExclusiveMin.IsTrue() {
 				value++
 			}
+		}
+		// OpenAPI 3.1 spells the exclusive bound as the number itself rather than
+		// as a boolean modifier on "minimum", so it raises the floor on its own -
+		// without this an example for `exclusiveMinimum: 5` would generate 0 and
+		// the target would reject the body we built to probe it.
+		if eb := schema.ExclusiveMin; eb.Value != nil && *eb.Value >= value {
+			value = *eb.Value + 1
 		}
 		if schema.Max != nil && *schema.Max < value {
 			value = *schema.Max
 		}
-		if schema.Type.Is("integer") {
+		if typ == "integer" {
 			return int(value), nil
 		}
 		return value, nil
 
-	case schema.Type.Is("string"):
+	case typ == "string":
 		if ex := stringFormatExample(schema.Format, fieldTypeDefaults); ex != "" {
 			return ex, nil
 		}
@@ -852,10 +1036,10 @@ func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedS
 		}
 		return example, nil
 
-	case schema.Type.Is("array"), schema.Items != nil:
+	case typ == "array", typ == "" && schema.Items != nil:
 		example := []any{}
 		if schema.Items != nil && schema.Items.Value != nil {
-			ex, err := openAPIExample(schema.Items.Value, cache, fieldTypeDefaults)
+			ex, err := openAPIExample(schema.Items.Value, cache, fieldTypeDefaults, requiredOnly)
 			if err != nil {
 				return nil, fmt.Errorf("can't get example for array item: %w", err)
 			}
@@ -866,13 +1050,16 @@ func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedS
 		}
 		return example, nil
 
-	case schema.Type.Is("object"), len(schema.Properties) > 0:
+	case typ == "object", typ == "" && len(schema.Properties) > 0:
 		example := map[string]any{}
 		for k, v := range schema.Properties {
 			if v.Value == nil || v.Value.ReadOnly {
 				continue
 			}
-			ex, err := openAPIExample(v.Value, cache, fieldTypeDefaults)
+			if requiredOnly && !slices.Contains(schema.Required, k) {
+				continue
+			}
+			ex, err := openAPIExample(v.Value, cache, fieldTypeDefaults, requiredOnly)
 			if errors.Is(err, errRecursive) {
 				if slices.Contains(schema.Required, k) {
 					return nil, fmt.Errorf("can't get example for '%s': %w", k, err)
@@ -887,13 +1074,23 @@ func openAPIExample(schema *openapi3.Schema, cache map[*openapi3.Schema]*cachedS
 		if schema.AdditionalProperties.Has != nil && schema.AdditionalProperties.Schema != nil {
 			addl := schema.AdditionalProperties.Schema.Value
 			if addl != nil && !addl.ReadOnly {
-				ex, err := openAPIExample(addl, cache, fieldTypeDefaults)
+				ex, err := openAPIExample(addl, cache, fieldTypeDefaults, requiredOnly)
 				if err == nil {
 					example["additionalPropertyName"] = ex
 				}
 			}
 		}
 		return example, nil
+
+	case typ == "":
+		// Untyped with nothing to infer from: any JSON value is allowed, and a
+		// short scalar is what most handlers accept. Dropping the operation
+		// (the old errNoExample) lost the endpoint entirely. A declared
+		// format still shapes it (format: uuid → a UUID).
+		if ex := stringFormatExample(schema.Format, fieldTypeDefaults); ex != "" {
+			return ex, nil
+		}
+		return "1", nil
 	}
 
 	return nil, errNoExample
@@ -938,4 +1135,87 @@ func CountOperations(data []byte, opts Options) (int64, error) {
 	}
 
 	return count, nil
+}
+
+// canonicalMediaType maps a declared request media type onto the body
+// encoding it implies: parameters are stripped and case folded
+// (mime.ParseMediaType), and structured-syntax suffixes resolve to their base
+// (application/vnd.api+json -> application/json, application/soap+xml ->
+// application/xml). Before this, anything but an exact "application/json"
+// fell through to Go's %v rendering of a map.
+func canonicalMediaType(declared string) string {
+	mt, _, err := mime.ParseMediaType(declared)
+	if err != nil {
+		mt = strings.ToLower(strings.TrimSpace(declared))
+		if i := strings.IndexByte(mt, ';'); i >= 0 {
+			mt = strings.TrimSpace(mt[:i])
+		}
+	}
+	switch {
+	case mt == "application/json", mt == "text/json", strings.HasSuffix(mt, "+json"),
+		strings.HasSuffix(mt, "/x-json"):
+		return "application/json"
+	case mt == "application/xml", mt == "text/xml", strings.HasSuffix(mt, "+xml"):
+		return "application/xml"
+	}
+	return mt
+}
+
+// declaredOr keeps the spec's declared media type on the wire (a server that
+// routes on application/vnd.api+json must receive exactly that) unless it is
+// a wildcard or empty.
+func declaredOr(declared, fallback string) string {
+	d := strings.TrimSpace(declared)
+	if d == "" || strings.Contains(d, "*") {
+		return fallback
+	}
+	return d
+}
+
+// idLikeParamValue returns a usable identifier for a path or query parameter
+// with no explicit example: integer path parameters (and integer query
+// parameters named like IDs) become max(1, minimum) because 0 is almost never
+// a valid row, and string parameters named "*id" with no format or pattern
+// become "1" rather than the literal "string". Values shaped like this let
+// by-ID operations reach the handler instead of a 404.
+func idLikeParamValue(param *openapi3.Parameter) (any, bool) {
+	if param.In != "path" && param.In != "query" {
+		return nil, false
+	}
+	if param.Schema == nil || param.Schema.Value == nil {
+		return nil, false
+	}
+	sc := param.Schema.Value
+	switch effectiveType(sc) {
+	case "integer", "number":
+		if param.In != "path" && !isIDName(param.Name) {
+			return nil, false
+		}
+		v := 1.0
+		if sc.Min != nil && *sc.Min > v {
+			v = *sc.Min
+			if sc.ExclusiveMin.IsTrue() {
+				v++
+			}
+		}
+		if eb := sc.ExclusiveMin; eb.Value != nil && *eb.Value >= v {
+			v = *eb.Value + 1
+		}
+		if sc.Max != nil && *sc.Max < v {
+			v = *sc.Max
+		}
+		return int(v), true
+	case "string":
+		if sc.Format != "" || sc.Pattern != "" || !isIDName(param.Name) {
+			return nil, false
+		}
+		return "1", true
+	}
+	return nil, false
+}
+
+// isIDName reports whether a parameter name names an identifier: "id", or a
+// name ending in "id" (userId, user_id, orderid).
+func isIDName(name string) bool {
+	return strings.HasSuffix(strings.ToLower(name), "id")
 }

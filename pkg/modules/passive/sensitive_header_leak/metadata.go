@@ -9,29 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Some applications stuff sensitive material - encryption keys, IVs, API
-tokens, signed-URL parameters - into custom response headers. Header-based
-disclosure is easy to miss in body-focused secret scanning. The nginx-ui
-GHSA-g9w5-qffc-6762 vulnerability is the canonical example: the ` + "`/api/backup`" + `
-endpoint disclosed the AES-256 ` + "`key:iv`" + ` pair in an ` + "`X-Backup-Security`" + `
-response header alongside the encrypted backup body.
+	ModuleDesc = `**What it means:** A non-cookie response header contains a recognized token format, a base64 key/IV pair, or a constrained high-entropy value under a credential-shaped header name. Public identifiers and redirect/authentication-flow artifacts remain observations; private formats are candidates.
 
-This module flags response headers whose names or values match well-known
-sensitive patterns:
+**How it's exploited:** Anyone who reads the response, including a network observer, cache, or proxy log, harvests the credential and replays it to authenticate as the application or call its API.
 
-- known sensitive header name list (` + "`X-Backup-Security`" + `, ` + "`X-AWS-*-Token`" + `,
-  ` + "`X-Auth-Token`" + `, ` + "`Set-Cookie`" + ` containing ` + "`secret=`" + ` etc.)
-- ` + "`base64:base64`" + ` shaped values (typical of ` + "`key:iv`" + ` disclosure)
-- AKIA / AIza / ghp_ / xoxb_ etc. token prefixes
-- high Shannon entropy in suspect header names (potential keys / signatures)
+**Fix:** Remove secrets, keys, and tokens from response headers and rotate any value already exposed.`
 
-## References
-- https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-g9w5-qffc-6762
-- CWE-200 Information Exposure`
-
-	ModuleConfirmation = "Confirmed when a non-standard response header carries a value matching known sensitive token formats or a high-entropy key-shaped string"
-	ModuleSeverity     = severity.High
+	ModuleConfirmation = "Candidate for private-token formats or constrained high-entropy custom headers; public identifiers, examples, redirects, challenges, and cookie values are not confirmed secret leaks"
+	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"info-disclosure", "secrets", "headers", "light"}
 )

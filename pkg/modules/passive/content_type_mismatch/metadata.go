@@ -9,21 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects mismatches between the Content-Type header and actual response body
-content, which can lead to MIME confusion attacks and XSS.
+	ModuleDesc = `**What it means:** The response declares one Content-Type but the body is a different format (JSON/XML served as text/html, or HTML served as application/json). This MIME misconfiguration confuses browsers; the finding reports whether X-Content-Type-Options: nosniff is present.
 
-## Notes
-- Compares declared Content-Type with detected body content signatures
-- Flags JSON/XML/HTML content served with incorrect Content-Type
-- Missing X-Content-Type-Options makes MIME sniffing exploitable
+**How it's exploited:** When the type is wrong and nosniff is missing, a browser may MIME-sniff the body as a more dangerous type (user-controlled content as HTML/script), turning a reflected payload into cross-site scripting. Mislabeled responses also break downstream content handling.
 
-## References
-- https://owasp.org/www-project-secure-headers/#x-content-type-options
-- https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Content-Type-Options`
+**Fix:** Set an accurate Content-Type matching the body and always send X-Content-Type-Options: nosniff on responses carrying untrusted or non-HTML content.`
 
 	ModuleConfirmation = "Confirmed when the Content-Type header does not match the actual content of the response body"
 	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"misconfiguration", "header-security", "light"}
+	ModuleTags         = []string{"misconfiguration", "header-security", "hygiene", "light"}
 )

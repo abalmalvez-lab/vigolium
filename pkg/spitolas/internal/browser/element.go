@@ -1,7 +1,10 @@
 package browser
 
 import (
+	"context"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
@@ -19,70 +22,128 @@ type Element struct {
 	selectorCached bool
 }
 
-// Click clicks the element with fresh timeout.
-// Uses config.ElementTimeout to reset context, preventing timeout inheritance from element search.
+// boundedElem returns the rod element capped at ElementTimeout for a one-shot CDP
+// call (DOM read/write, Runtime eval on the element), so it can't hang forever on
+// a wedged/unresponsive renderer. Mirrors the explicit caps on Click/Hover/etc.
+//
+// Do NOT use it for ops that RETURN a reusable rod element/page (e.g. Parent):
+// the returned object would inherit this short timeout context and expire
+// mid-use. Those take e.rodElem raw and re-adopt the result (see Page.adopt).
+func (e *Element) boundedElem() *rod.Element {
+	return e.rodElem.Timeout(firstPositiveDuration(e.page.config.ElementTimeout, 5*time.Second))
+}
+
+// repaintOp runs a rod element op that can block on a repaint, bounded by the
+// element's (crawl-bound) context and ElementTimeout.
+//
+// rod's scroll-into-view (reached from Click, Hover, Focus, Input, Select,
+// SelectAllText, WaitInteractable and ScrollIntoView) calls
+// Page.WaitRepaint, which awaits requestAnimationFrame on rod's root page
+// handle. That handle carries the tab's own long-lived context, not the
+// element's or the crawl's, so neither Timeout nor cancellation reaches it: on a
+// tab that stops rendering, the op blocks until the tab closes.
+func (e *Element) repaintOp(op string, fn func(*rod.Element) error) error {
+	return runRepaintBounded(e.rodElem.GetContext(),
+		firstPositiveDuration(e.page.config.ElementTimeout, 5*time.Second), op, e.rodElem, fn)
+}
+
+// runRepaintBounded runs fn on a clone of el bound to ctx and capped at
+// timeout. It returns when fn does, or when that bound ends, whichever comes
+// first. In the second case fn is abandoned in its goroutine; its bound context
+// is already done, so once the repaint arrives fn's next CDP call fails rather
+// than clicking late. The goroutine itself ends when the tab closes.
+func runRepaintBounded(ctx context.Context, timeout time.Duration, op string, el *rod.Element, fn func(*rod.Element) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	opCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	bound := el.Context(opCtx)
+	done := make(chan error, 1)
+	go func() {
+		done <- safeRod(op, func() error { return fn(bound) })
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-opCtx.Done():
+		return fmt.Errorf("%s: no repaint or response before the bound ended: %w", op, opCtx.Err())
+	}
+}
+
+// Click clicks the element with fresh timeout. The per-operation timeout only
+// bounds this call because the element was adopted onto the crawl context first
+// — see Page.adopt. It waits for a repaint, so it runs through repaintOp.
 func (e *Element) Click() error {
-	return e.rodElem.Timeout(e.page.config.ElementTimeout).Click(proto.InputMouseButtonLeft, 1)
+	return e.repaintOp("Click", func(el *rod.Element) error {
+		return el.Click(proto.InputMouseButtonLeft, 1)
+	})
 }
 
 // DoubleClick double-clicks the element with fresh timeout.
 func (e *Element) DoubleClick() error {
-	return e.rodElem.Timeout(e.page.config.ElementTimeout).Click(proto.InputMouseButtonLeft, 2)
+	return e.repaintOp("DoubleClick", func(el *rod.Element) error {
+		return el.Click(proto.InputMouseButtonLeft, 2)
+	})
 }
 
 // RightClick right-clicks the element with fresh timeout.
 func (e *Element) RightClick() error {
-	return e.rodElem.Timeout(e.page.config.ElementTimeout).Click(proto.InputMouseButtonRight, 1)
+	return e.repaintOp("RightClick", func(el *rod.Element) error {
+		return el.Click(proto.InputMouseButtonRight, 1)
+	})
 }
 
 // Hover hovers over the element with fresh timeout.
 func (e *Element) Hover() error {
-	return e.rodElem.Timeout(e.page.config.ElementTimeout).Hover()
+	return e.repaintOp("Hover", (*rod.Element).Hover)
 }
 
 // Focus focuses the element.
 func (e *Element) Focus() error {
-	return e.rodElem.Focus()
+	return e.repaintOp("Focus", (*rod.Element).Focus)
 }
 
 // Input types text into the element.
 func (e *Element) Input(text string) error {
-	return e.rodElem.Input(text)
+	return e.repaintOp("Input", func(el *rod.Element) error { return el.Input(text) })
 }
 
 // Clear clears the element value.
 func (e *Element) Clear() error {
-	return e.rodElem.SelectAllText()
+	return e.repaintOp("Clear", (*rod.Element).SelectAllText)
 }
 
 // SelectAllText selects all text in the element.
 func (e *Element) SelectAllText() error {
-	return e.rodElem.SelectAllText()
+	return e.repaintOp("SelectAllText", (*rod.Element).SelectAllText)
 }
 
 // Select selects options in a select element.
 func (e *Element) Select(values []string) error {
-	return e.rodElem.Select(values, true, rod.SelectorTypeText)
+	return e.repaintOp("Select", func(el *rod.Element) error {
+		return el.Select(values, true, rod.SelectorTypeText)
+	})
 }
 
 // SetFiles sets files for a file input element.
 func (e *Element) SetFiles(paths []string) error {
-	return e.rodElem.SetFiles(paths)
+	return e.boundedElem().SetFiles(paths)
 }
 
 // Text returns the text content of the element.
 func (e *Element) Text() (string, error) {
-	return e.rodElem.Text()
+	return e.boundedElem().Text()
 }
 
 // HTML returns the outer HTML of the element.
 func (e *Element) HTML() (string, error) {
-	return e.rodElem.HTML()
+	return e.boundedElem().HTML()
 }
 
 // Attribute returns an attribute value.
 func (e *Element) Attribute(name string) (string, error) {
-	val, err := e.rodElem.Attribute(name)
+	val, err := e.boundedElem().Attribute(name)
 	if err != nil {
 		return "", err
 	}
@@ -94,7 +155,7 @@ func (e *Element) Attribute(name string) (string, error) {
 
 // Property returns a property value.
 func (e *Element) Property(name string) (interface{}, error) {
-	result, err := e.rodElem.Property(name)
+	result, err := e.boundedElem().Property(name)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +164,7 @@ func (e *Element) Property(name string) (interface{}, error) {
 
 // TagName returns the tag name.
 func (e *Element) TagName() (string, error) {
-	result, err := e.rodElem.Eval(`() => this.tagName`)
+	result, err := e.boundedElem().Eval(`() => this.tagName`)
 	if err != nil {
 		return "", err
 	}
@@ -117,7 +178,7 @@ func (e *Element) TagName() (string, error) {
 
 // IsVisible returns true if the element is visible.
 func (e *Element) IsVisible() bool {
-	visible, err := e.rodElem.Visible()
+	visible, err := e.boundedElem().Visible()
 	if err != nil {
 		return false
 	}
@@ -126,7 +187,7 @@ func (e *Element) IsVisible() bool {
 
 // IsInteractable checks if element can be interacted with.
 func (e *Element) IsInteractable() bool {
-	_, err := e.rodElem.Interactable()
+	_, err := e.boundedElem().Interactable()
 	return err == nil
 }
 
@@ -145,13 +206,15 @@ func (e *Element) WaitEnabled() error {
 // WaitInteractable waits for the element to be interactable with safe timeout.
 // Uses config.ElementTimeout to prevent infinite waits.
 func (e *Element) WaitInteractable() error {
-	_, err := e.rodElem.Timeout(e.page.config.ElementTimeout).WaitInteractable()
-	return err
+	return e.repaintOp("WaitInteractable", func(el *rod.Element) error {
+		_, err := el.WaitInteractable()
+		return err
+	})
 }
 
 // ScrollIntoView scrolls the element into view.
 func (e *Element) ScrollIntoView() error {
-	return e.rodElem.ScrollIntoView()
+	return e.repaintOp("ScrollIntoView", (*rod.Element).ScrollIntoView)
 }
 
 // GetSelector generates a unique CSS selector for the element.
@@ -162,7 +225,7 @@ func (e *Element) GetSelector() (string, error) {
 		return e.cachedSelector, nil
 	}
 
-	result, err := e.rodElem.Eval(`() => {
+	result, err := e.boundedElem().Eval(`() => {
 		const el = this;
 		if (el.id) return '#' + el.id;
 
@@ -216,7 +279,7 @@ func (e *Element) GetXPath() (string, error) {
 		return e.cachedXPath, nil
 	}
 
-	result, err := e.rodElem.Eval(`() => {
+	result, err := e.boundedElem().Eval(`() => {
 		const el = this;
 		const parts = [];
 		let current = el;
@@ -259,7 +322,7 @@ func (e *Element) ClearCache() {
 
 // Matches checks if element matches a CSS selector.
 func (e *Element) Matches(selector string) bool {
-	result, err := e.rodElem.Eval(`(selector) => this.matches(selector)`, selector)
+	result, err := e.boundedElem().Eval(`(selector) => this.matches(selector)`, selector)
 	if err != nil {
 		return false
 	}
@@ -268,13 +331,13 @@ func (e *Element) Matches(selector string) bool {
 
 // Eval evaluates JavaScript on the element without returning the result.
 func (e *Element) Eval(script string) error {
-	_, err := e.rodElem.Eval(script)
+	_, err := e.boundedElem().Eval(script)
 	return err
 }
 
 // EvalWithResult evaluates JavaScript on the element and returns the result.
 func (e *Element) EvalWithResult(script string) (interface{}, error) {
-	result, err := e.rodElem.Eval(script)
+	result, err := e.boundedElem().Eval(script)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +356,7 @@ func (e *Element) RodElement() *rod.Element {
 
 // BoundingBox returns the element's bounding box.
 func (e *Element) BoundingBox() (*Box, error) {
-	shape, err := e.rodElem.Shape()
+	shape, err := e.boundedElem().Shape()
 	if err != nil {
 		return nil, err
 	}
@@ -314,13 +377,16 @@ type Box struct {
 	Height float64
 }
 
-// Parent returns the parent element.
+// Parent returns the parent element. Intentionally uses the raw e.rodElem (not
+// boundedElem), and re-adopts the result rather than letting it inherit e's own
+// context: an ancestor walk that inherited a lookup deadline is exactly how
+// exclusion checks go quiet partway through a candidate list. See Page.adopt.
 func (e *Element) Parent() (*Element, error) {
 	rodElem, err := e.rodElem.Parent()
 	if err != nil {
 		return nil, err
 	}
-	return &Element{rodElem: rodElem, page: e.page}, nil
+	return e.page.adopt(rodElem), nil
 }
 
 // Children returns child elements with safe timeout.
@@ -334,7 +400,7 @@ func (e *Element) Children() ([]*Element, error) {
 
 	children := make([]*Element, 0, len(rodChildren))
 	for _, rodChild := range rodChildren {
-		children = append(children, &Element{rodElem: rodChild, page: e.page})
+		children = append(children, e.page.adopt(rodChild))
 	}
 
 	return children, nil
@@ -342,7 +408,7 @@ func (e *Element) Children() ([]*Element, error) {
 
 // HasClass checks if element has a CSS class.
 func (e *Element) HasClass(className string) bool {
-	result, err := e.rodElem.Eval(`(cls) => this.classList.contains(cls)`, className)
+	result, err := e.boundedElem().Eval(`(cls) => this.classList.contains(cls)`, className)
 	if err != nil {
 		return false
 	}
@@ -351,7 +417,7 @@ func (e *Element) HasClass(className string) bool {
 
 // GetClasses returns all CSS classes.
 func (e *Element) GetClasses() ([]string, error) {
-	result, err := e.rodElem.Eval(`() => Array.from(this.classList)`)
+	result, err := e.boundedElem().Eval(`() => Array.from(this.classList)`)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +434,7 @@ func (e *Element) GetClasses() ([]string, error) {
 // which is used in CandidateElement.getUniqueString() for ClickOnce detection.
 // Returns empty string if element has no attributes or on error.
 func (e *Element) GetAllAttributes() string {
-	result, err := e.rodElem.Eval(`() => {
+	result, err := e.boundedElem().Eval(`() => {
 		const el = this;
 		const attrs = [];
 		for (let i = 0; i < el.attributes.length; i++) {

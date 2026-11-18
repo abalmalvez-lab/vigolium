@@ -18,8 +18,26 @@ import (
 // sharedBaseRequest holds a read-only request buffer shared across insertion points
 // from a single CreateAllInsertionPoints call. BuildRequest() never mutates baseRequest
 // (it allocates a new result slice), so sharing without synchronization is safe.
+//
+// It also carries the request's Content-Length rewrite layout, which depends only
+// on raw and is therefore identical for every insertion point built from it.
+// Computing it per point meant re-scanning the header block once per parameter and
+// once per nested child — three passes over the headers plus a string allocation
+// per header line, each time (~3 µs / 4.9 KB / 28 allocs on a 10-header request).
 type sharedBaseRequest struct {
 	raw []byte
+	cl  clRewrite
+}
+
+// newSharedBaseRequest wraps raw (retained by reference, never mutated) and
+// precomputes the layout shared by every insertion point derived from it.
+//
+// Always construct through this rather than a struct literal: a zero cl is a
+// valid value meaning "not eligible for the in-place rewrite", so a literal would
+// silently push every derived insertion point onto the UpdateContentLength slow
+// path instead of failing.
+func newSharedBaseRequest(raw []byte) *sharedBaseRequest {
+	return &sharedBaseRequest{raw: raw, cl: computeCLRewriteRaw(raw)}
 }
 
 // ==================== PARAMETER INSERTION POINT ====================
@@ -36,6 +54,79 @@ type ParameterInsertionPoint struct {
 	parameter     *Param             // b: parameter object
 	baseRequest   []byte             // original request (for rebuilding)
 	insertionType InsertionPointType // cached insertion point type
+	cl            clRewrite          // cached Content-Length patch layout (hot path)
+}
+
+// clRewrite caches the Content-Length rewrite layout for a body-style insertion
+// point so BuildRequest can patch the length in place instead of calling
+// UpdateContentLength — which re-parses every header (ExtractAllHeaders +
+// BuildHttpMessage) on every payload. It is computed once at construction.
+//
+// fast is true only for the common case: the parameter requires a
+// Content-Length update, the request has exactly one Content-Length header, and
+// that header precedes the body. Anything else (no header, duplicate headers)
+// falls back to UpdateContentLength, preserving the original behaviour exactly.
+type clRewrite struct {
+	fast       bool
+	valueStart int // offset of the Content-Length value in baseRequest
+	valueEnd   int // offset just past the Content-Length value (before CR)
+	bodyOffset int // body offset in baseRequest (after the CRLFCRLF separator)
+}
+
+// computeCLRewrite precomputes the in-place Content-Length patch layout for an
+// insertion point. Eligibility is restricted to the common body/form/xml POST
+// case; ineligible insertion points return a zero clRewrite and fall back to
+// UpdateContentLength in BuildRequest.
+func computeCLRewrite(baseRequest []byte, param *Param) clRewrite {
+	if !param.RequiresContentLengthUpdate() {
+		return clRewrite{}
+	}
+	return computeCLRewriteRaw(baseRequest)
+}
+
+// computeCLRewriteRaw locates the in-place Content-Length rewrite for raw: the
+// body offset plus the single Content-Length value's offsets, when raw has a
+// clean header block with exactly one Content-Length whose value precedes the
+// body. It returns clRewrite{fast:false} otherwise (no body marker, zero or
+// duplicate Content-Length, or the value past the body) so the caller takes its
+// slow path. It is the shared eligibility check behind both computeCLRewrite
+// (parameter splice) and replaceBodyWithCL (whole-body replace).
+func computeCLRewriteRaw(raw []byte) clRewrite {
+	bodyOffset := findBodyOffsetStrict(raw, 0)
+	if bodyOffset == -1 {
+		return clRewrite{}
+	}
+	// Exactly one Content-Length header: 0 means UpdateContentLength would add
+	// one, >1 means it would collapse duplicates — both need the slow path.
+	if countHeaderOccurrences(raw, "Content-Length") != 1 {
+		return clRewrite{}
+	}
+	offsets := GetHeaderOffsets(raw, "Content-Length")
+	if offsets == nil {
+		return clRewrite{}
+	}
+	valueStart, valueEnd := offsets[1], offsets[2]
+	// The Content-Length value must lie within the header block (before body).
+	if valueEnd > bodyOffset {
+		return clRewrite{}
+	}
+	return clRewrite{fast: true, valueStart: valueStart, valueEnd: valueEnd, bodyOffset: bodyOffset}
+}
+
+// countHeaderOccurrences counts case-insensitive header-name matches in the
+// header block of an HTTP message. Used once at insertion-point construction.
+func countHeaderOccurrences(message []byte, name string) int {
+	headers, _, _, err := ExtractAllHeaders(message)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for i := 1; i < len(headers); i++ { // index 0 is the request line
+		if EqualsCaseInsensitive(extractHeaderName(headers[i]), name) {
+			count++
+		}
+	}
+	return count
 }
 
 // NewParameterInsertionPoint creates a new parameter-aware insertion point.
@@ -58,6 +149,7 @@ func NewParameterInsertionPoint(request []byte, param *Param) *ParameterInsertio
 		parameter:     param,
 		baseRequest:   requestCopy,
 		insertionType: ipType,
+		cl:            computeCLRewrite(requestCopy, param),
 	}
 }
 
@@ -68,11 +160,17 @@ func newParameterInsertionPointShared(shared *sharedBaseRequest, param *Param) *
 		panic("Parameter cannot be nil")
 	}
 	ipType := param.ToInsertionPointType()
-	return &ParameterInsertionPoint{
+	ip := &ParameterInsertionPoint{
 		parameter:     param,
 		baseRequest:   shared.raw, // shared reference, no copy
 		insertionType: ipType,
 	}
+	// Same gate as computeCLRewrite, against the layout resolved once for the
+	// whole request rather than re-derived per insertion point.
+	if param.RequiresContentLengthUpdate() {
+		ip.cl = shared.cl
+	}
+	return ip
 }
 
 // Name returns the parameter name.
@@ -98,26 +196,48 @@ func (p *ParameterInsertionPoint) BuildRequest(payload []byte) []byte {
 	}
 
 	// Encode payload based on parameter type
-	encoded := p.encodePayload(payload)
+	return p.buildEncoded(p.encodePayload(payload))
+}
 
-	// Build request by replacing parameter value
+// BuildRequestPreEncoded injects a payload that is ALREADY percent-encoded the
+// way it must reach the server ("%00", "%252e%252e%252f", "%0d%0a"): only the
+// bytes that cannot appear literally in a request line or body are escaped
+// (control bytes, space, '#', bytes >= 0x80) and '%' is kept, so the module's
+// encoding arrives as written. BuildRequest escapes '%' itself, which turned
+// every such payload into a double-encoded no-op.
+//
+// Applies to URL-encoded parameters (query, path, form body, cookie); other
+// parameter types (JSON, XML) have no percent layer and fall back to
+// BuildRequest.
+func (p *ParameterInsertionPoint) BuildRequestPreEncoded(payload []byte) []byte {
+	if payload == nil {
+		panic("Payload cannot be nil")
+	}
+	t := p.parameter.Type()
+	if t != ParamPathFolder && t != ParamPathFilename && !p.parameter.CanURLEncode() {
+		return p.BuildRequest(payload)
+	}
+	return p.buildEncoded(appendMinimalEncoded(make([]byte, 0, len(payload)+8), payload))
+}
+
+// buildEncoded splices an already-encoded value into the base request.
+func (p *ParameterInsertionPoint) buildEncoded(encoded []byte) []byte {
 	startOffset := p.parameter.ValueStart()
 	endOffset := p.parameter.ValueEnd()
 
-	// Calculate result size
-	resultSize := len(p.baseRequest) - (endOffset - startOffset) + len(encoded)
-	result := make([]byte, resultSize)
+	// Fast path: splice the payload and patch Content-Length in a single
+	// allocation, avoiding a full header re-parse on every payload. This is the
+	// hot path for body/form/xml fuzzing. valueEnd <= startOffset guarantees the
+	// Content-Length value precedes the mutated parameter (always true for body
+	// parameters, checked defensively).
+	if p.cl.fast && p.cl.valueEnd <= startOffset {
+		return p.buildWithContentLength(encoded, startOffset, endOffset)
+	}
 
-	// Copy prefix
-	copy(result[0:], p.baseRequest[0:startOffset])
+	result := p.splice(encoded, startOffset, endOffset)
 
-	// Copy encoded payload
-	copy(result[startOffset:], encoded)
-
-	// Copy suffix
-	copy(result[startOffset+len(encoded):], p.baseRequest[endOffset:])
-
-	// Update Content-Length if parameter type requires it
+	// Slow path: parameter needs a Content-Length update but wasn't eligible for
+	// the in-place patch (e.g. no existing header, or duplicate headers).
 	if p.parameter.RequiresContentLengthUpdate() {
 		updated, err := UpdateContentLength(result)
 		if err != nil {
@@ -126,6 +246,47 @@ func (p *ParameterInsertionPoint) BuildRequest(payload []byte) []byte {
 		result = updated
 	}
 
+	return result
+}
+
+// splice replaces the parameter value with encoded in a freshly allocated slice.
+func (p *ParameterInsertionPoint) splice(encoded []byte, startOffset, endOffset int) []byte {
+	return spliceBytes(p.baseRequest, startOffset, endOffset, encoded)
+}
+
+// spliceBytes returns base with base[start:end] replaced by repl, in a single
+// freshly allocated slice. Shared by the parameter and header insertion-point
+// fast paths.
+func spliceBytes(base []byte, start, end int, repl []byte) []byte {
+	result := make([]byte, len(base)-(end-start)+len(repl))
+	n := copy(result, base[:start])
+	n += copy(result[n:], repl)
+	copy(result[n:], base[end:])
+	return result
+}
+
+// buildWithContentLength splices the payload and patches the Content-Length
+// value in one allocation, leaving the header in its original position. The new
+// body length is derived analytically from the value-length delta, so the
+// result is byte-identical to splice()+UpdateContentLength() whenever the
+// Content-Length header is the last header (the common case), and otherwise
+// differs only in that Content-Length keeps its original position instead of
+// being moved to the end — an HTTP-semantically irrelevant difference.
+func (p *ParameterInsertionPoint) buildWithContentLength(encoded []byte, startOffset, endOffset int) []byte {
+	base := p.baseRequest
+	cl := p.cl
+
+	// Body length is independent of the Content-Length header's own width.
+	newBodyLen := (len(base) - cl.bodyOffset) + (len(encoded) - (endOffset - startOffset))
+	clStr := intToString(newBodyLen)
+
+	resultSize := cl.valueStart + len(clStr) + (startOffset - cl.valueEnd) + len(encoded) + (len(base) - endOffset)
+	result := make([]byte, resultSize)
+	n := copy(result, base[:cl.valueStart])              // up to old Content-Length value
+	n += copy(result[n:], clStr)                         // new Content-Length value
+	n += copy(result[n:], base[cl.valueEnd:startOffset]) // rest of headers + body prefix
+	n += copy(result[n:], encoded)                       // new parameter value
+	copy(result[n:], base[endOffset:])                   // body suffix
 	return result
 }
 
@@ -215,13 +376,11 @@ func (p *ParameterInsertionPoint) encodePayload(payload []byte) []byte {
 	// Use path-specific encoding for path parameters (RFC 3986)
 	// Path encoding: space → %20 (not +), literal + preserved
 	if p.parameter.Type() == ParamPathFolder || p.parameter.Type() == ParamPathFilename {
-		encoded := EncodePathValue(string(payload))
-		return []byte(encoded)
+		return EncodePathValueBytes(payload)
 	}
 
 	if p.parameter.CanURLEncode() {
-		encoded := EncodeQueryValue(string(payload))
-		return []byte(encoded)
+		return EncodeQueryValueBytes(payload)
 	}
 
 	// Apply type-aware encoding for JSON parameters
@@ -344,43 +503,57 @@ type EncodedInsertionPoint struct {
 	insertionType InsertionPointType // h: insertion point type
 }
 
-// NewEncodedInsertionPoint creates a new encoded insertion point.
+// NewEncodedInsertionPoint creates a new encoded insertion point over a private
+// copy of request, so a caller-owned slice cannot be mutated underneath it.
 func NewEncodedInsertionPoint(name string, request []byte, startOffset, endOffset int, encoder Encoder, prefix []byte, ipType InsertionPointType) *EncodedInsertionPoint {
-	if name == "" {
-		panic("Name cannot be empty")
-	}
 	if request == nil {
 		panic("Base request cannot be nil")
 	}
-	if startOffset < 0 || endOffset > len(request) || endOffset < startOffset {
+
+	// Validation happens inside, against the clone — same length, same panics.
+	ip := newEncodedInsertionPointShared(name, bytes.Clone(request), startOffset, endOffset, encoder, ipType)
+	if prefix != nil {
+		ip.prefix = bytes.Clone(prefix)
+	}
+	return ip
+}
+
+// newEncodedInsertionPointShared is NewEncodedInsertionPoint without the base
+// buffer clone: buf is retained by reference and must never be mutated after
+// this call. It is the child-side counterpart to newParameterInsertionPointShared.
+//
+// Nested discovery materializes the decoded parent value itself and hands the
+// same buffer to every child of that parent, none of which writes to it
+// (BuildRequest allocates a fresh result slice in buildRequestWithPayload).
+// Cloning per child made retained memory quadratic in the child count — a 98 KB
+// request with 2,000 nested children retained ~188 MiB, and those slices are what
+// the executor's insertion-point LRU holds.
+//
+// Unexported deliberately: sharing is only sound when the caller owns the buffer
+// and guarantees immutability for the lifetime of every derived insertion point.
+func newEncodedInsertionPointShared(name string, buf []byte, startOffset, endOffset int, encoder Encoder, ipType InsertionPointType) *EncodedInsertionPoint {
+	if name == "" {
+		panic("Name cannot be empty")
+	}
+	if buf == nil {
+		panic("Base request cannot be nil")
+	}
+	if startOffset < 0 || endOffset > len(buf) || endOffset < startOffset {
 		panic("Invalid offsets")
 	}
 	if encoder == nil {
 		panic("Encoder cannot be nil")
 	}
 
-	// Clone request to ensure thread safety
-	requestCopy := make([]byte, len(request))
-	copy(requestCopy, request)
-
-	// Extract and decode base value
-	baseBytes := request[startOffset:endOffset]
-	decodedBaseValue := encoder.Decode(baseBytes)
-
-	// Clone prefix if provided
-	var prefixCopy []byte
-	if prefix != nil {
-		prefixCopy = make([]byte, len(prefix))
-		copy(prefixCopy, prefix)
-	}
+	decodedBaseValue := encoder.Decode(buf[startOffset:endOffset])
 
 	return &EncodedInsertionPoint{
 		name:          name,
-		baseRequest:   requestCopy,
+		baseRequest:   buf, // shared reference, no copy
 		startOffset:   startOffset,
 		endOffset:     endOffset,
 		baseValue:     string(decodedBaseValue),
-		prefix:        prefixCopy,
+		prefix:        nil,
 		encoder:       encoder,
 		insertionType: ipType,
 	}
@@ -509,6 +682,10 @@ type NestedInsertionPoint struct {
 	childParam   InsertionPoint        // n: inner insertion point
 	buildState   int                   // o: depth counter for nested traversal
 	baseRequest  []byte                // base request bytes
+	// layers are the encodings wrapped around the child document inside the
+	// parent value (e.g. base64), applied innermost-first to the child's built
+	// document before the parent encodes it. Set at discovery.
+	layers []Encoder
 }
 
 // NewNestedInsertionPoint creates a new nested insertion point.
@@ -581,9 +758,14 @@ func (n *NestedInsertionPoint) PayloadOffsets(payload []byte) []int {
 	return n.parentParam.PayloadOffsets(childEncodedValue)
 }
 
-// getChildEncodedValue gets the encoded value from the child insertion point.
+// getChildEncodedValue gets the encoded value from the child insertion point,
+// re-wrapped in the layers the parent value carried it in (innermost first).
 func (n *NestedInsertionPoint) getChildEncodedValue(payload []byte) []byte {
-	return n.childParam.BuildRequest(payload)
+	v := n.childParam.BuildRequest(payload)
+	for _, layer := range n.layers {
+		v = layer.Encode(v, []int{0, len(v)})
+	}
+	return v
 }
 
 // EncodingChain returns the list of encoding transformations applied.
@@ -887,10 +1069,9 @@ func getInsertionPointOffsets(ip InsertionPoint) (start, end int) {
 func encodePayloadForIP(ip InsertionPoint, payload []byte) []byte {
 	switch v := ip.(type) {
 	case *ParameterInsertionPoint:
-		if v.parameter.CanURLEncode() {
-			return []byte(EncodeQueryValue(string(payload)))
-		}
-		return payload
+		// The same encoder BuildRequest uses (path, query, JSON-aware), so a
+		// batch build matches a single build.
+		return v.encodePayload(payload)
 	case *EncodedInsertionPoint:
 		payloadWithPrefix := payload
 		if len(v.prefix) > 0 {
@@ -905,53 +1086,73 @@ func encodePayloadForIP(ip InsertionPoint, payload []byte) []byte {
 	}
 }
 
-// batchReplaceByOffset performs batch replacement on a request.
+// batchReplaceByOffset performs batch replacement on a request, splicing every
+// spec's encoded payload into its [startOffset,endOffset) range.
+//
+// It does this in a SINGLE allocation: the previous implementation reallocated a
+// fresh full-size request slice per spec inside the loop (N specs → N
+// full-request allocations, each immediately discarded), which on the active-
+// fuzzing hot path was a dominant allocation source. Specs come from distinct
+// insertion points (distinct parameter value ranges), so they are
+// non-overlapping; we sort ascending and apply all splices in one forward pass
+// into one buffer sized from the precomputed total length delta. An overlapping
+// spec (a logic error that shouldn't occur for real insertion points) is skipped
+// rather than corrupting the walk.
 func batchReplaceByOffset(request []byte, specs []injectionSpec) ([]byte, []offsetDelta) {
 	if len(specs) == 0 {
 		return request, nil
 	}
 
 	sort.Slice(specs, func(i, j int) bool {
-		return specs[i].startOffset > specs[j].startOffset
+		return specs[i].startOffset < specs[j].startOffset
 	})
 
-	result := make([]byte, len(request))
-	copy(result, request)
-
+	// Pass 1: keep valid, non-overlapping specs; accumulate the total size delta,
+	// the per-spec deltas, and whether any spec needs a Content-Length update.
+	// adjustOffset (the sole consumer of deltas) sums by position, so the
+	// ascending order here is equivalent to the previous descending order. The
+	// kept specs are compacted in place into specs[:n] (specs is already sorted
+	// and owned by this call), avoiding a second slice allocation.
+	totalDelta := 0
 	needsContentLengthUpdate := false
 	var deltas []offsetDelta
-
+	prevEnd := 0
+	n := 0
 	for _, spec := range specs {
-		if spec.startOffset < 0 || spec.endOffset > len(result) || spec.startOffset > spec.endOffset {
+		if spec.startOffset < 0 || spec.endOffset > len(request) || spec.startOffset > spec.endOffset {
 			continue
 		}
-
-		oldLen := spec.endOffset - spec.startOffset
-		newLen := len(spec.encoded)
-		sizeDiff := newLen - oldLen
-
-		if sizeDiff != 0 {
-			deltas = append(deltas, offsetDelta{
-				position: spec.startOffset,
-				delta:    sizeDiff,
-			})
+		if spec.startOffset < prevEnd {
+			continue // overlapping spec — skip to keep the single-pass walk well-defined
 		}
+		prevEnd = spec.endOffset
 
-		newResult := make([]byte, len(result)+sizeDiff)
-		copy(newResult[0:spec.startOffset], result[0:spec.startOffset])
-		copy(newResult[spec.startOffset:spec.startOffset+newLen], spec.encoded)
-		copy(newResult[spec.startOffset+newLen:], result[spec.endOffset:])
-
-		result = newResult
-
+		sizeDiff := len(spec.encoded) - (spec.endOffset - spec.startOffset)
+		totalDelta += sizeDiff
+		if sizeDiff != 0 {
+			deltas = append(deltas, offsetDelta{position: spec.startOffset, delta: sizeDiff})
+		}
 		if spec.needsCL {
 			needsContentLengthUpdate = true
 		}
+		specs[n] = spec
+		n++
 	}
+	valid := specs[:n]
+
+	// Pass 2: one allocation, one forward copy of [original prefix | encoded]*
+	// segments followed by the trailing remainder.
+	result := make([]byte, len(request)+totalDelta)
+	w, r := 0, 0
+	for _, spec := range valid {
+		w += copy(result[w:], request[r:spec.startOffset])
+		w += copy(result[w:], spec.encoded)
+		r = spec.endOffset
+	}
+	copy(result[w:], request[r:])
 
 	if needsContentLengthUpdate {
-		updated, err := UpdateContentLength(result)
-		if err == nil {
+		if updated, err := UpdateContentLength(result); err == nil {
 			result = updated
 		}
 	}

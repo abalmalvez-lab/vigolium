@@ -16,7 +16,7 @@ var probes = []probe{
 	{
 		path:        "/health",
 		name:        "Health Check Endpoint",
-		markers:     []string{"Healthy", "Unhealthy", "Degraded", "status", "entries"},
+		markers:     []string{"Healthy", "Unhealthy", "Degraded"},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Low,
 		desc:        "ASP.NET health check endpoint exposed, potentially revealing component health status and infrastructure details",
@@ -24,7 +24,7 @@ var probes = []probe{
 	{
 		path:        "/healthz",
 		name:        "Health Check (K8s-style)",
-		markers:     []string{"Healthy", "Unhealthy", "Degraded", "status", "entries"},
+		markers:     []string{"Healthy", "Unhealthy", "Degraded"},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Low,
 		desc:        "Kubernetes-style health check endpoint exposed with potential infrastructure status details",
@@ -32,7 +32,7 @@ var probes = []probe{
 	{
 		path:        "/health/ready",
 		name:        "Readiness Probe",
-		markers:     []string{"Healthy", "Unhealthy", "Degraded", "ready"},
+		markers:     []string{"Healthy", "Unhealthy", "Degraded"},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Low,
 		desc:        "Readiness probe endpoint exposed, revealing service dependency status",
@@ -40,7 +40,7 @@ var probes = []probe{
 	{
 		path:        "/health/live",
 		name:        "Liveness Probe",
-		markers:     []string{"Healthy", "Unhealthy", "Degraded", "alive"},
+		markers:     []string{"Healthy", "Unhealthy", "Degraded"},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Low,
 		desc:        "Liveness probe endpoint exposed, confirming application operational status",
@@ -55,9 +55,11 @@ var probes = []probe{
 		desc:        "ASP.NET Health Checks UI dashboard exposed without authentication, revealing detailed infrastructure health with database, cache, and external service status",
 	},
 	{
-		path:        "/healthchecks-api",
-		name:        "Health Checks API",
-		markers:     []string{"entries", "status", "duration", "description"},
+		path: "/healthchecks-api",
+		name: "Health Checks API",
+		// The HealthChecks UI API JSON always carries a health-state value; the
+		// bare "status"/"entries"/"duration" keys matched any generic JSON API.
+		markers:     []string{"Healthy", "Unhealthy", "Degraded"},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.Medium,
 		desc:        "Health Checks API endpoint exposed, returning detailed JSON health data for all registered checks",
@@ -84,7 +86,7 @@ var probes = []probe{
 	{
 		path:        "/dashboard",
 		name:        "Aspire Dashboard",
-		markers:     []string{"Aspire", "aspire", "FluentUI", "Resources"},
+		markers:     []string{"Aspire", "aspire", "FluentUI"},
 		antiMarkers: []string{"404", "Not Found", "login", "Login", "Sign in"},
 		sev:         severity.High,
 		desc:        ".NET Aspire dashboard exposed without authentication, revealing distributed application topology and telemetry",
@@ -93,7 +95,7 @@ var probes = []probe{
 	{
 		path:        "/environment",
 		name:        "Environment Info",
-		markers:     []string{"ASPNETCORE_ENVIRONMENT", "DOTNET_ENVIRONMENT", "Production", "Development", "ContentRootPath"},
+		markers:     []string{"ASPNETCORE_ENVIRONMENT", "DOTNET_ENVIRONMENT", "ContentRootPath"},
 		antiMarkers: []string{"404", "Not Found", "<html", "<!DOCTYPE"},
 		sev:         severity.High,
 		desc:        "ASP.NET environment information endpoint exposed, revealing runtime configuration and environment variables",

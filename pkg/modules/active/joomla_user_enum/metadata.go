@@ -9,24 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for Joomla user enumeration and admin exposure through multiple vectors:
-1. Registration form: accessible /index.php?option=com_users&view=registration
-2. Web Services API (J4+): /api/index.php/v1/users returns user data
-3. Administrator login: /administrator/ publicly accessible without WAF/IP restrictions
+	ModuleDesc = `**What it means:** Credential-free probes observed a Joomla registration form, structurally parsed public API user objects, or a marker-confirmed administrator login. These are distinct attack-surface features, not automatic enumeration flaws.
 
-## Notes
-- Runs once per host
-- Tests registration form accessibility and API user listing
-- Checks administrator login exposure
-- Non-destructive: only performs GET requests
+**How it's exploited:** Public user objects may aid reconnaissance, but a form or login page alone does not prove account creation, username-error differentials, private login identities, weak credentials, or administrative access.
 
-## References
-- https://docs.joomla.org/Security_Checklist
-- https://developer.joomla.org/security-centre.html`
+**Fix:** Disable public registration if unneeded, tighten Web Services API permissions, and protect /administrator/ with IP allowlisting, a WAF, or HTTP auth.`
 
-	ModuleConfirmation = "Confirmed when user registration form is accessible, API exposes user data, or admin login is unprotected"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Observed only after grouped Joomla form/login markers or parsed users resources; no account creation, login weakness, or private identity is inferred"
+	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"joomla", "php", "info-disclosure", "probe", "moderate"}
 )

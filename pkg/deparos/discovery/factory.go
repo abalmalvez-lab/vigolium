@@ -6,7 +6,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/deparos/config"
 	"github.com/vigolium/vigolium/pkg/deparos/discovery/module"
 	"github.com/vigolium/vigolium/pkg/deparos/discovery/payload"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
 	"go.uber.org/zap"
 )
 
@@ -16,6 +16,29 @@ import (
 type Factory struct {
 	config        *config.Config
 	wordlistCache *payload.WordlistCache
+	// caseMode reports the case sensitivity detected so far for files
+	// (dir=false) or directories (dir=true); nil = the configured mode only.
+	// The engine wires it to its CaseSensitivityManager.
+	caseMode func(dir bool) config.CaseSensitivityMode
+}
+
+// SetCaseModeSource injects the detected case-sensitivity mode.
+func (f *Factory) SetCaseModeSource(fn func(dir bool) config.CaseSensitivityMode) {
+	f.caseMode = fn
+}
+
+// keepsCase reports whether wordlist entries keep their original case: only a
+// host known to be case-INSENSITIVE gets the lowercased (folded) list. A
+// case-sensitive or not-yet-detected host gets the list as written (exact
+// dedup), so WEB-INF and Makefile are actually sent.
+func (f *Factory) keepsCase(dir bool) bool {
+	mode := f.config.Engine.CaseSensitivity
+	if f.caseMode != nil {
+		if detected := f.caseMode(dir); detected != config.CaseAutoDetect && detected != "" {
+			mode = detected
+		}
+	}
+	return mode != config.CaseInsensitive
 }
 
 // NewFactory creates a new task factory.
@@ -58,36 +81,37 @@ func (f *Factory) createFileTasks(schemeHost, path []byte, depth uint16, listTyp
 		}))
 	}
 
-	if f.config.Extensions.TestCustom && len(f.config.Extensions.CustomList) > 0 {
-		for _, ext := range f.config.Extensions.CustomList {
-			provider, err := f.getBuiltInProvider(listType, wordlistPath, caseSensitive)
-			if err != nil {
-				return nil, err
-			}
-			tasks = append(tasks, NewWordlistTask(&WordlistTaskConfig{
-				TaskType:   customExtType,
-				Provider:   provider,
-				Extension:  ext,
-				SchemeHost: schemeHost,
-				Path:       path,
-				Depth:      depth,
-			}))
+	// Static custom-extension fuzzing. EffectiveCustomList is empty under
+	// ConfirmRequired: in that mode extensions are only swept once confirmed as a
+	// valid route, via the observed-extension task paths driven by confirmExtension.
+	for _, ext := range f.config.Extensions.EffectiveCustomList() {
+		provider, err := f.getBuiltInProvider(listType, wordlistPath, caseSensitive)
+		if err != nil {
+			return nil, err
 		}
+		tasks = append(tasks, NewWordlistTask(&WordlistTaskConfig{
+			TaskType:   customExtType,
+			Provider:   provider,
+			Extension:  ext,
+			SchemeHost: schemeHost,
+			Path:       path,
+			Depth:      depth,
+		}))
 	}
 
 	return tasks, nil
 }
 
-// isFileCaseSensitive returns true if files should be treated as case-sensitive.
-// For auto_detect mode, defaults to false (case-insensitive) until detection completes.
+// isFileCaseSensitive returns true if file wordlists keep their original case
+// (see keepsCase): sensitive or not yet detected.
 func (f *Factory) isFileCaseSensitive() bool {
-	return f.config.Engine.CaseSensitivity == config.CaseSensitive
+	return f.keepsCase(false)
 }
 
-// isDirCaseSensitive returns true if directories should be treated as case-sensitive.
-// For auto_detect mode, defaults to false (case-insensitive) until detection completes.
+// isDirCaseSensitive returns true if directory wordlists keep their original
+// case (see keepsCase): sensitive or not yet detected.
 func (f *Factory) isDirCaseSensitive() bool {
-	return f.config.Engine.CaseSensitivity == config.CaseSensitive
+	return f.keepsCase(true)
 }
 
 // createDirTask creates a directory task for a given wordlist (short or long).
@@ -130,18 +154,18 @@ func (f *Factory) buildObservedFileTasks(
 		}))
 	}
 
-	// Priority 2: Observed names with custom extensions (one task per extension)
-	if f.config.Extensions.TestCustom && len(f.config.Extensions.CustomList) > 0 {
-		for _, ext := range f.config.Extensions.CustomList {
-			tasks = append(tasks, NewObservedTask(&ObservedTaskConfig{
-				TaskType:  ObservedFilesCustomExt,
-				Provider:  payload.NewLazyObservedProvider(observedNames),
-				Extension: ext,
-				BaseURL:   baseURL,
-				DirPath:   dirPath,
-				Depth:     depth,
-			}))
-		}
+	// Priority 2: Observed names with custom extensions (one task per extension).
+	// EffectiveCustomList is empty under ConfirmRequired (extensions flow through
+	// confirmExtension → the observed-extension task path below).
+	for _, ext := range f.config.Extensions.EffectiveCustomList() {
+		tasks = append(tasks, NewObservedTask(&ObservedTaskConfig{
+			TaskType:  ObservedFilesCustomExt,
+			Provider:  payload.NewLazyObservedProvider(observedNames),
+			Extension: ext,
+			BaseURL:   baseURL,
+			DirPath:   dirPath,
+			Depth:     depth,
+		}))
 	}
 
 	// Priority 2: Observed full filenames (literal) - no extension manipulation
@@ -405,21 +429,14 @@ func (f *Factory) CreateDynamicExtensionTasks(
 	startSchemeHost := []byte(extractSchemeHost(f.config.Target.StartURL))
 	startPath := []byte(extractPathFromURL(f.config.Target.StartURL))
 
-	// Priority 6: Short wordlist + this extension (base path only)
-	if f.config.Filenames.Wordlists.HasShortFiles() && f.config.Extensions.TestObserved {
-		shortProvider, err := f.getBuiltInProvider(
-			payload.ShortFileList,
-			f.config.Filenames.Wordlists.ShortFilePath,
-			f.isFileCaseSensitive())
-		if err == nil {
-			tasks = append(tasks, NewWordlistTask(&WordlistTaskConfig{
-				TaskType:   ShortFilesObservedExt,
-				Provider:   shortProvider,
-				Extension:  extension,
-				SchemeHost: startSchemeHost,
-				Path:       startPath,
-				Depth:      depth,
-			}))
+	// Priority 6: Short wordlist + this extension, for EVERY known directory
+	// (the start path is in directoryURLs). Recursion under ConfirmRequired
+	// otherwise only ever tried extensionless names, so /admin/upload.php was
+	// never guessed.
+	if f.config.Extensions.TestObserved {
+		for _, dirURL := range directoryURLs {
+			tasks = append(tasks, f.CreateShortFileExtensionTasks(
+				[]byte(extractSchemeHost(dirURL)), []byte(extractPathFromURL(dirURL)), depth, []string{extension})...)
 		}
 	}
 
@@ -449,6 +466,38 @@ func (f *Factory) CreateDynamicExtensionTasks(
 		zap.Int("task_count", len(tasks)),
 		zap.Int("directories_tested", len(directoryURLs)))
 
+	return tasks
+}
+
+// CreateShortFileExtensionTasks creates short-file-list × extension tasks for
+// one directory (one task per extension). The long list × extension stays at
+// the start path only (CreateDynamicExtensionTasks). The task type and fields
+// match CreateDynamicExtensionTasks' so the queue dedups the two paths.
+func (f *Factory) CreateShortFileExtensionTasks(schemeHost, dirPath []byte, depth uint16, extensions []string) []Task {
+	if !f.config.Filenames.Wordlists.HasShortFiles() || len(extensions) == 0 {
+		return nil
+	}
+	tasks := make([]Task, 0, len(extensions))
+	for _, ext := range extensions {
+		if ext == "" {
+			continue
+		}
+		provider, err := f.getBuiltInProvider(
+			payload.ShortFileList,
+			f.config.Filenames.Wordlists.ShortFilePath,
+			f.isFileCaseSensitive())
+		if err != nil {
+			return tasks
+		}
+		tasks = append(tasks, NewWordlistTask(&WordlistTaskConfig{
+			TaskType:   ShortFilesObservedExt,
+			Provider:   provider,
+			Extension:  ext,
+			SchemeHost: schemeHost,
+			Path:       dirPath,
+			Depth:      depth,
+		}))
+	}
 	return tasks
 }
 
@@ -694,17 +743,23 @@ func (f *Factory) getProviderForSource(
 // for a specific directory.
 func (f *Factory) CreateJSExtractedRequestTask(
 	dirURL *url.URL,
-	getExtractedRequests func() []jsscan.ExtractedRequest,
+	getExtractedRequests func() []jstangle.ExtractedRequest,
 	depth uint16,
+	getRequestTemplates ...func() []ExtractedRequestTemplate,
 ) Task {
 	if dirURL == nil || getExtractedRequests == nil {
 		return nil
 	}
 
+	var typedGetter func() []ExtractedRequestTemplate
+	if len(getRequestTemplates) > 0 {
+		typedGetter = getRequestTemplates[0]
+	}
 	return NewJSExtractedRequestTask(&JSExtractedRequestTaskConfig{
 		DirURL:               dirURL,
 		Depth:                depth,
 		GetExtractedRequests: getExtractedRequests,
+		GetRequestTemplates:  typedGetter,
 	})
 }
 
@@ -728,7 +783,7 @@ func (f *Factory) CreateMalformedPathProbeTask(schemeHost, path []byte, depth ui
 		pathStr += "/"
 	}
 
-	urlTemplate := string(schemeHost) + pathStr + "FUZZ"
+	urlTemplate := string(schemeHost) + pathStr + fuzzMarker
 	provider := payload.NewStaticProvider(f.config.Filenames.MalformedPathProbePayloads)
 
 	return NewMalformedPathProbeTask(&MalformedPathProbeTaskConfig{
@@ -738,15 +793,16 @@ func (f *Factory) CreateMalformedPathProbeTask(schemeHost, path []byte, depth ui
 	})
 }
 
-// CreateFuzzTask creates a task that replaces FUZZ in the URL template with words from a wordlist.
-// urlTemplate is the full URL with FUZZ marker (e.g., "http://example.com/FUZZ").
-func (f *Factory) CreateFuzzTask(urlTemplate string, wordlistPath string, depth uint16) (Task, error) {
-	cached, err := f.wordlistCache.GetCustom(wordlistPath)
+// CreateFuzzTask creates a task that replaces FUZZ in the URL template with words from
+// one or more wordlists. urlTemplate is the full URL with FUZZ marker (e.g.,
+// "http://example.com/FUZZ"). The files are streamed in order rather than loaded,
+// and each word is tried once across all of them, deduplicated through seen (the
+// engine passes an on-disk set; nil falls back to an in-memory one).
+func (f *Factory) CreateFuzzTask(urlTemplate string, wordlistPaths []string, seen payload.SeenSet, depth uint16) (Task, error) {
+	provider, err := payload.NewStreamingFilesProvider("fuzz", wordlistPaths, seen)
 	if err != nil {
 		return nil, err
 	}
-
-	provider := payload.NewLazyCustomProvider(cached, "fuzz")
 
 	return NewFuzzTask(&FuzzTaskConfig{
 		URLTemplate: urlTemplate,
@@ -786,22 +842,9 @@ func extractSchemeHost(urlStr string) string {
 	return urlStr
 }
 
-// extractPathFromURL extracts the path portion from a URL string.
-// Example: "http://example.com/api/v1/" → "/api/v1/"
-// If input is already a path, returns it unchanged.
+// extractPathFromURL extracts the path portion from a URL string, delegating to
+// the canonical payload.ExtractPathFromURL so the escaped-wire-path handling
+// (critical for "/%23/../" bypass templates) lives in exactly one place.
 func extractPathFromURL(urlStr string) string {
-	if urlStr == "" {
-		return "/"
-	}
-	parsed, err := url.Parse(urlStr)
-	if err != nil {
-		return urlStr
-	}
-	if parsed.Scheme != "" && parsed.Host != "" {
-		if parsed.Path == "" {
-			return "/"
-		}
-		return parsed.Path
-	}
-	return urlStr
+	return payload.ExtractPathFromURL(urlStr)
 }

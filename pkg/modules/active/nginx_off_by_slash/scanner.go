@@ -99,11 +99,9 @@ func (m *Module) ScanPerRequest(
 				continue
 			}
 
-			fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-			if err != nil {
-				continue
-			}
-			fuzzedReq = fuzzedReq.WithService(ctx.Service())
+			// modifiedRaw is internally built (well-formed), so wrap directly
+			// instead of re-parsing on this hot path.
+			fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 			resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 			if err != nil {
@@ -114,6 +112,7 @@ func (m *Module) ScanPerRequest(
 			}
 
 			statusCode := resp.Response().StatusCode
+			contentType := resp.Response().Header.Get("Content-Type")
 			// Copy the body before Close: resp.Body().Bytes() aliases the pooled
 			// *bytes.Buffer that Close() returns to a process-global pool. `body`
 			// (a string) is already a copy, but bodyBytes is later passed to
@@ -128,9 +127,81 @@ func (m *Module) ScanPerRequest(
 				continue
 			}
 
+			// A binary / static-asset response (image, font, media, octet-stream)
+			// is the static handler simply serving a file, not an alias traversal
+			// we can reason about by body differential — and on a re-optimizing
+			// image CDN (Scene7/Akamai) those bytes are not stable between
+			// requests, which would defeat the differential/reproduce gates and
+			// fabricate a hit. The URL-extension filter (IsValidForInjectionVulns)
+			// misses an extensionless image/JS CDN URL; this response Content-Type
+			// gate catches it.
+			if modkit.IsStaticAssetContentType(contentType) {
+				continue
+			}
+
 			// Reject responses that look exactly like the wildcard shell —
 			// e.g., an SPA index.html served for any path.
 			if wildcard.MatchesBody(statusCode, bodyBytes) {
+				continue
+			}
+
+			// Catch-all / SPA-shell guard. The single wildcard probe above
+			// disables itself whenever a WAF/CDN throttles it to a non-2xx, and
+			// every per-suffix differential control below fails CLOSED toward
+			// "escaped" on the same throttling — the combination that fabricates
+			// a /api../source-style report on a wildcard SPA host where /, /api,
+			// /api../source and /api../<random> all return one identical Angular
+			// index.html. Confirm the shell POSITIVELY from independent samples;
+			// when the hit is that shell, no suffix under this request can be a
+			// real escape, so stop probing the whole request.
+			if modkit.ResemblesCatchAllShell(scanCtx, ctx, httpClient, body) {
+				return results, nil
+			}
+
+			// Strict drop-on-fail: re-fetch the same traversal path twice more and
+			// require it to keep returning a stable, non-wildcard 200. A one-shot
+			// 200 from a transient race / load-balancer flap / caching edge will
+			// not reproduce and is dropped.
+			if !confirmStableOffBySlash(httpClient, ctx.Service(), modifiedRaw, body, wildcard) {
+				continue
+			}
+
+			// Differential confirmation — the dominant off-by-slash false positive.
+			// A genuine alias traversal serves a SPECIFIC resource from OUTSIDE the
+			// alias directory, so its body must differ from the in-alias equivalent
+			// path /{segment}/{suffix}. When they match, the backend simply
+			// routed/normalized /{segment}{injection}/{suffix} the same as
+			// /{segment}/{suffix} — e.g. a prefixed auth middleware / API gateway
+			// that returns one generic body (`{"message":"User not logged in"}`,
+			// an SPA shell, a 404-as-200) for the entire /{segment} path space. The
+			// ".." escaped nothing. Because `segment` is fixed for this request, a
+			// suffix-independent generic prefix means no other suffix can be a real
+			// escape either, so stop probing this request entirely.
+			normalizedPath := "/" + segment + "/" + suffix
+			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, normalizedPath, body) {
+				return results, nil
+			}
+
+			// A real file read is suffix-specific. Confirm the hit body actually
+			// depends on the suffix by traversing to a random, non-existent suffix
+			// under the same escaped prefix; if that returns the same 2xx body the
+			// handler is suffix-invariant (a catch-all under /{segment}{injection}/,
+			// not a file read). Drop this hit but keep trying other suffixes — a
+			// distinct one may still be a genuine escape under the same parent.
+			randomPath := "/" + segment + injection + "/" + modkit.FreshCanary()
+			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, randomPath, body) {
+				continue
+			}
+
+			// Clean-canonical control: the off-by-slash payload resolves to
+			// /{suffix} at the alias parent / web root. If that plain,
+			// un-escaped path already serves the same body, the resource is
+			// publicly reachable WITHOUT the traversal and nothing was escaped —
+			// the front-end simply normalized /{segment}{injection}/{suffix} down
+			// to /{suffix}. Drop this suffix (a sibling suffix may still be a real
+			// escape, so keep probing rather than return).
+			cleanCanonical := "/" + suffix
+			if bodySimilarToControl(httpClient, ctx.Service(), rawHttp, cleanCanonical, body) {
 				continue
 			}
 
@@ -150,6 +221,60 @@ func (m *Module) ScanPerRequest(
 	}
 
 	return results, nil
+}
+
+// confirmStableOffBySlash re-issues the traversal request two more times and
+// reports whether the off-by-slash hit reproduces: every round must return a 200
+// that is not the wildcard shell and whose body stays textually equivalent to the
+// first hit (QuickRatio >= UpperRatioBound). It fails OPEN on an inconclusive
+// transient error so a real finding is not suppressed by a flaky re-fetch.
+func confirmStableOffBySlash(
+	httpClient *http.Requester,
+	service *httpmsg.Service,
+	modifiedRaw []byte,
+	firstBody string,
+	wildcard *modkit.WildcardEntry,
+) bool {
+	for i := 0; i < 2; i++ {
+		status, body, ok := modkit.ExecuteRaw(httpClient, service, modifiedRaw, http.Options{NoRedirects: true, NoClustering: true})
+		if !ok {
+			return true
+		}
+		if status != 200 {
+			return false
+		}
+		if wildcard.MatchesBody(status, []byte(body)) {
+			return false
+		}
+		if !modkit.BodiesSimilar(firstBody, body) {
+			return false
+		}
+	}
+	return true
+}
+
+// bodySimilarToControl fetches controlPath on the same service and reports
+// whether its 2xx response body is textually similar to refBody (the traversal
+// hit). It is the core of the off-by-slash differential gate: a control whose
+// body matches the hit means the hit was NOT actually produced by the
+// traversal. It fails CLOSED toward "not similar" — any transport/parse error
+// or a non-2xx control returns false so that a flaky, failed, or 404 control
+// can never suppress a real finding; only a genuine matching 2xx body does.
+func bodySimilarToControl(
+	client *http.Requester,
+	service *httpmsg.Service,
+	rawHttp []byte,
+	controlPath, refBody string,
+) bool {
+	modified, err := httpmsg.SetPath(rawHttp, controlPath)
+	if err != nil {
+		return false
+	}
+	status, body, ok := modkit.ExecuteRaw(client, service, modified, http.Options{NoRedirects: true, NoClustering: true})
+	if !ok || status < 200 || status >= 300 {
+		return false
+	}
+	return modkit.BodiesSimilar(refBody, body)
 }
 
 // firstPathSegment extracts the first non-empty path segment from a URL path.

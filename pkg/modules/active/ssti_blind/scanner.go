@@ -10,6 +10,7 @@ import (
 	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
+	"github.com/vigolium/vigolium/pkg/oast/oastclass"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
@@ -95,19 +96,18 @@ func (m *Module) ScanPerInsertionPoint(
 		requestHash := ctx.Request().ID()
 
 		for _, p := range oastPayloads {
-			oastURL := oast.GenerateURL(urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
+			oastURL := modkit.OASTURLFor(oast, oastclass.SSTI, urlx.String(), ip.Name(), "parameter", ModuleID, requestHash)
 			if oastURL == "" {
 				continue
 			}
 
 			payload := fmt.Sprintf(p.template, oastURL)
+			oast.RecordPayload(oastURL, payload)
 			fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-			fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-			if err != nil {
-				continue
-			}
-			fuzzedReq = fuzzedReq.WithService(ctx.Service())
+			// BuildRequest produces well-formed raw, so wrap directly instead
+			// of re-parsing on this hot path.
+			fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
 			resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 			if err != nil {
@@ -250,16 +250,16 @@ func (m *Module) sendTimedPayload(
 ) (time.Duration, error) {
 	fuzzedRaw := ip.BuildRequest([]byte(payload))
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(fuzzedRaw))
-	if err != nil {
-		return 0, err
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest produces well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(fuzzedRaw, ctx.Service())
 
-	start := time.Now()
-	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
-	elapsed := time.Since(start)
-
+	// SendTimed times the send, not the rate/slot queue. NoClustering: this is a timing oracle. The slow/fast payloads are each re-sent
+	// across confirmation rounds; the 500ms request-cluster cache keys on raw request
+	// bytes, so a clustered re-send of the slow payload returns the first response's
+	// cached copy in ~0ms — below slowMinDuration — and blind SSTI can essentially
+	// never be confirmed (a false negative). Every send must be a genuine round-trip.
+	resp, elapsed, err := modkit.SendTimed(httpClient, fuzzedReq, http.Options{})
 	if err != nil {
 		return 0, err
 	}

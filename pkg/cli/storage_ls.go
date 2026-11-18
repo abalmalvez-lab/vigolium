@@ -2,9 +2,7 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -23,7 +21,6 @@ var storageLsCmd = &cobra.Command{
 
 func init() {
 	storageLsCmd.Flags().String("prefix", "", "Limit results to keys under this prefix")
-	storageLsCmd.Flags().Bool("json", false, "Output as JSON")
 	storageLsCmd.Flags().Bool("tree", false, "Render objects as a directory tree")
 	storageCmd.AddCommand(storageLsCmd)
 }
@@ -35,12 +32,7 @@ func runStorageLs(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	if sc == nil {
-		return nil
-	}
-
 	prefix, _ := cmd.Flags().GetString("prefix")
-	jsonOut, _ := cmd.Flags().GetBool("json")
 	treeOut, _ := cmd.Flags().GetBool("tree")
 
 	objects, err := sc.List(context.Background(), projectUUID, prefix)
@@ -48,13 +40,11 @@ func runStorageLs(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to list storage objects: %w", err)
 	}
 
-	if jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if objects == nil {
-			return enc.Encode([]struct{}{})
-		}
-		return enc.Encode(objects)
+	if globalJSON {
+		// The global -j: the local --json this command used to define shadowed
+		// it, so `storage ls -j` failed outright and --json printed a bare array.
+		return emitRead(cmd, "", objects, int64(len(objects)), 0, len(objects),
+			withProjectScope(projectUUID), withExtra("prefix", prefix))
 	}
 
 	if len(objects) == 0 {
@@ -87,7 +77,7 @@ func runStorageLs(cmd *cobra.Command, _ []string) error {
 		}
 		tbl.AddRow(
 			terminal.Cyan(obj.Key),
-			humanBytes(obj.Size),
+			terminal.HumanBytes(obj.Size),
 			obj.LastModified.Format("2006-01-02 15:04"),
 			terminal.Gray(ct),
 		)
@@ -161,7 +151,7 @@ func printStorageTree(n *storageTreeNode, prefix string) {
 		}
 		line := prefix + connector + label
 		if c.isLeaf {
-			line += "  " + terminal.Gray(humanBytes(c.size))
+			line += "  " + terminal.Gray(terminal.HumanBytes(c.size))
 		}
 		fmt.Println(line)
 		if len(c.children) > 0 {

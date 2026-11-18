@@ -76,10 +76,7 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -100,7 +97,7 @@ func (m *Module) ScanPerRequest(
 
 	var results []*output.ResultEvent
 	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p); result != nil {
+		if result := m.probeEndpoint(ctx, httpClient, scanCtx, p); result != nil {
 			results = append(results, result)
 		}
 	}
@@ -111,6 +108,7 @@ func (m *Module) ScanPerRequest(
 func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	p probe,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), p.method)
@@ -135,11 +133,8 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -148,6 +143,20 @@ func (m *Module) probeEndpoint(
 	defer resp.Close()
 
 	if resp.Response() == nil {
+		return nil
+	}
+
+	// Status discipline against the universal catch-all / echo host. A genuine
+	// Werkzeug traceback / interactive debugger page is rendered only on an error —
+	// a 404 for the random probe path or a 500 from the malformed-JSON probe — so it
+	// carries a 4xx/5xx status, NEVER a 2xx. A catch-all / echo host instead answers
+	// LITERALLY ANY path with a 200 text/html shell; when a gzip + bogus
+	// Content-Length:0 transport quirk truncates the captured body to a tail
+	// fragment, a reflected "Traceback (most recent call last)" / "Werkzeug Debugger"
+	// token can survive in the tail and forge a finding. The soft-404 body
+	// fingerprint below cannot catch a REFLECTING catch-all (distinct head per path),
+	// but the surviving HTTP status can — drop any 2xx here.
+	if status := resp.Response().StatusCode; status >= 200 && status < 300 {
 		return nil
 	}
 
@@ -160,6 +169,15 @@ func (m *Module) probeEndpoint(
 		}
 	}
 	if len(matchedMarkers) == 0 {
+		return nil
+	}
+
+	// Strict drop-on-fail: reject a debugger marker that is merely part of the
+	// host's catch-all / SPA shell (the same 200 body served for a random path).
+	// Real Werkzeug detections come from a 500 error page, whose status differs
+	// from the (2xx) wildcard shell, so they are never matched by this gate.
+	location := resp.Response().Header.Get("Location")
+	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, resp.Response().StatusCode, []byte(body), location) {
 		return nil
 	}
 

@@ -9,24 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests file upload endpoints for unrestricted file upload vulnerabilities by attempting
-to upload files with various bypass techniques. If upload succeeds, attempts to verify
-execution of the uploaded file.
+	ModuleDesc = `**What it means:** The file upload endpoint accepts a dangerous file (PHP script, .htaccess, SVG, or HTML) and stores it where it can be retrieved. The attacker controls the content and URL.
 
-## Notes
-- Only triggers on multipart/form-data requests with a filename parameter
-- Tests 7 probe types: direct extension, double extension, null byte, case variation, magic bytes, SVG XXE, and HTML XSS
-- Each probe uses a unique marker for verification
-- Reconstructs multipart body preserving non-file fields (CSRF tokens, hidden fields)
-- Early abort if first probe returns 400/403/415 (strict validation)
-- Attempts to verify upload by fetching common upload directories
+**How it's exploited:** An attacker uploads via an extension bypass (double extension, null byte, .phtml, .phar), then fetches it back. If the retrieved file returns a computed arithmetic value rather than its source, the server executed it — remote code execution; otherwise it is a stored, retrievable arbitrary file.
 
-## References
-- https://owasp.org/www-community/vulnerabilities/Unrestricted_File_Upload
-- https://portswigger.net/web-security/file-upload`
+**Fix:** Allowlist safe extensions and content types, store uploads outside the web root, and randomize filenames.`
 
-	ModuleConfirmation = "Confirmed when an uploaded file is accessible and contains the unique scan marker, indicating arbitrary file upload and potential code execution"
+	ModuleConfirmation = "Confirmed when a retrieved upload returns the computed arithmetic execution signature (code execution) or is retrievable with the unique marker (arbitrary upload), or an uploaded file triggers an out-of-band interaction"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Certain
 	ModuleTags         = []string{"rce", "injection", "heavy"}

@@ -15,11 +15,20 @@ import (
 
 // stackTraceSubstrings are literal substrings that only appear in real Node.js
 // stack traces or debug dumps. Generic tokens like "at " or ".js:" are excluded
-// because they match ordinary prose and URLs.
+// because they match ordinary prose and URLs. A bare "node_modules/" was removed
+// too: it appears in benign asset URLs, webpack sourcemap comments, and bundle
+// paths, so it is matched only as a real file path (nodeModulesPathRegex below).
 var stackTraceSubstrings = []string{
 	"/usr/src/app/",
-	"node_modules/",
 }
+
+// nodeModulesPathRegex matches a node_modules source file with a stack-frame
+// line:column suffix ("node_modules/express/lib/router/layer.js:95:5") — the form
+// that appears in a genuine Node.js stack frame, including the relative-path frame
+// that nodeStackTraceRegex (which requires a leading slash after "at (") misses. A
+// bare "node_modules/" mention or a static asset URL (no :line:col) is excluded,
+// since those appear in benign bundles, sourcemaps, and asset references.
+var nodeModulesPathRegex = regexp.MustCompile(`node_modules/[A-Za-z0-9_.@/-]+\.(?:js|ts|mjs|cjs):\d+:\d+`)
 
 // nodeStackTraceRegex matches a real Node.js stack frame:
 //
@@ -88,8 +97,7 @@ func (m *Module) ScanPerRequest(
 	host := service.Host()
 
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -114,7 +122,12 @@ func (m *Module) ScanPerRequest(
 		results = append(results, rs...)
 	}
 
-	return results, nil
+	// All three probes prove the SAME signal — this host leaks debug info — so
+	// collapse them into one finding (one http_record per host); the other probes
+	// ride along as inline evidence instead of each writing their own record.
+	return modkit.CollapseFindings(results, modkit.CollapseSpec{
+		Key: func(*output.ResultEvent) string { return host },
+	}), nil
 }
 
 // probeRandomEndpoint sends a GET to a non-existent path to trigger the default error handler.
@@ -123,7 +136,7 @@ func probeRandomEndpoint(
 	httpClient *http.Requester,
 	target, host, notFoundHash string,
 ) *output.ResultEvent {
-	probePath := "/vgn-express-debug-test"
+	probePath := "/vigolium-express-debug-test"
 
 	probeRaw, err := httpmsg.SetPath(ctx.Request().Raw(), probePath)
 	if err != nil {
@@ -131,11 +144,8 @@ func probeRandomEndpoint(
 	}
 	probeRaw, _ = httpmsg.SetMethod(probeRaw, "GET")
 
-	probeReq, err := httpmsg.ParseRawRequest(string(probeRaw))
-	if err != nil {
-		return nil
-	}
-	probeReq = probeReq.WithService(ctx.Service())
+	// probeRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	probeReq := httpmsg.NewRequestResponseRaw(probeRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(probeReq, http.Options{})
 	if err != nil {
@@ -148,13 +158,18 @@ func probeRandomEndpoint(
 	}
 
 	body := resp.Body().String()
-	evidence := analyzeErrorResponse(body)
-	if len(evidence) == 0 {
+
+	// Skip if the probe returned the host's generic 404 page (a catch-all shell):
+	// a debug marker inside the standard 404 is page noise, not a probe-specific
+	// leak. Checked BEFORE evidence analysis, mirroring the other two probes — the
+	// previous `&& len(evidence) == 0` made this guard dead code (evidence is
+	// already non-empty here), so a catch-all shell carrying a marker still emitted.
+	if notFoundHash != "" && utils.Sha1(body) == notFoundHash {
 		return nil
 	}
 
-	// Skip if body hash matches known 404 page without debug info
-	if notFoundHash != "" && utils.Sha1(body) == notFoundHash && len(evidence) == 0 {
+	evidence := analyzeErrorResponse(body)
+	if len(evidence) == 0 {
 		return nil
 	}
 
@@ -176,11 +191,8 @@ func probeMalformedJSON(
 	probeRaw, _ = httpmsg.SetBody(probeRaw, []byte("{"))
 	probeRaw, _ = httpmsg.AddOrReplaceHeader(probeRaw, "Content-Type", "application/json")
 
-	probeReq, err := httpmsg.ParseRawRequest(string(probeRaw))
-	if err != nil {
-		return nil
-	}
-	probeReq = probeReq.WithService(ctx.Service())
+	// probeRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	probeReq := httpmsg.NewRequestResponseRaw(probeRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(probeReq, http.Options{})
 	if err != nil {
@@ -239,11 +251,8 @@ func probeTypeMismatch(
 	}
 	probeRaw, _ = httpmsg.SetMethod(probeRaw, "GET")
 
-	probeReq, err := httpmsg.ParseRawRequest(string(probeRaw))
-	if err != nil {
-		return nil
-	}
-	probeReq = probeReq.WithService(ctx.Service())
+	// probeRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	probeReq := httpmsg.NewRequestResponseRaw(probeRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(probeReq, http.Options{})
 	if err != nil {
@@ -291,6 +300,11 @@ func analyzeErrorResponse(body string) []string {
 		}
 	}
 
+	// A node_modules path naming a real source file (stack frame / module-resolution error).
+	if m := nodeModulesPathRegex.FindString(body); m != "" {
+		evidence = append(evidence, fmt.Sprintf("node_modules path disclosed: %s", m))
+	}
+
 	// Real Node.js stack frame with line:column suffix.
 	if m := nodeStackTraceRegex.FindString(body); m != "" {
 		evidence = append(evidence, fmt.Sprintf("Node.js stack frame: %s", m))
@@ -318,11 +332,8 @@ func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) st
 	}
 	raw, _ = httpmsg.SetMethod(raw, "GET")
 
-	req, err := httpmsg.ParseRawRequest(string(raw))
-	if err != nil {
-		return ""
-	}
-	req = req.WithService(ctx.Service())
+	// raw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(req, http.Options{})
 	if err != nil {

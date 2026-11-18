@@ -9,22 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively audits the Strict-Transport-Security (HSTS) header on HTTPS responses
-to verify preload readiness: sufficient max-age, includeSubDomains directive,
-and preload directive.
+	ModuleDesc = `**What it means:** HTTPS responses lack the Strict-Transport-Security header or it is too weak for browser preload. Gaps include header absent, max-age missing or below one year (31536000), or no includeSubDomains/preload directive, so browsers are not forced onto HTTPS for the host and subdomains.
 
-## Notes
-- Only checks HTTPS HTML responses
-- Requires max-age >= 31536000 (1 year) for preload eligibility
-- Runs per-host to avoid duplicate findings
+**How it's exploited:** A network attacker (rogue Wi-Fi, ARP spoofing, proxy) intercepts a first or non-HTTPS request and strips TLS or serves a forged certificate, downgrading to plaintext to read or modify traffic including session cookies.
 
-## References
-- https://hstspreload.org/
-- https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Strict-Transport-Security`
+**Fix:** Send Strict-Transport-Security: max-age=31536000; includeSubDomains; preload on all HTTPS responses and submit the domain to the preload list.`
 
 	ModuleConfirmation = "Confirmed when HSTS header is missing, incomplete, or not preload-ready"
 	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Certain
-	ModuleTags         = []string{"header-security", "cryptography", "light"}
+	ModuleTags         = []string{"header-security", "cryptography", "hygiene", "light"}
 )

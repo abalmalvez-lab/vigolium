@@ -9,19 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects SQL statements and keywords in HTTP request parameter values,
-which may indicate SQL injection attempts or unsafe parameter handling.
+	ModuleDesc = `**What it means:** An HTTP request parameter value contains raw SQL syntax (for example UNION SELECT or a WHERE/AND/OR clause). Informational passive observation: it does not prove SQL injection exists, only that SQL-shaped input reached the application, often an in-progress attempt or SQL passed through parameters.
 
-## Notes
-- Matches SQL statements: SELECT..FROM, INSERT INTO, UPDATE..SET, DELETE FROM, UNION SELECT, etc.
-- Secondary check for SQL keyword pairs: WHERE/AND/OR with comparison operators
-- URL-decodes parameter values before checking
-- Minimum value length of 8 characters to reduce false positives
+**How it's exploited:** If the app concatenates such values into queries instead of parameterizing, an attacker can inject SQL to read, modify, or delete data or bypass authentication. Marks the parameter for active SQL injection testing.
 
-## References
-- https://owasp.org/www-community/attacks/SQL_Injection
-- https://cwe.mitre.org/data/definitions/89.html`
+**Fix:** Use parameterized queries or prepared statements for all database access and never build SQL from untrusted parameters.`
 
 	ModuleConfirmation = "Indicated when request parameter values contain SQL statement patterns"
 	ModuleSeverity     = severity.Info

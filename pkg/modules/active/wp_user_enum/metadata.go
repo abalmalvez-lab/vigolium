@@ -9,25 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for WordPress user enumeration through two vectors:
-1. Author archive redirects: /?author=N redirects to /author/<username>/
-2. REST API user listing: /wp-json/wp/v2/users returns user objects with slugs
+	ModuleDesc = `**What it means:** Credential-free controls found distinct WordPress author slugs through canonical author redirects or the public REST author collection. These slugs often identify content authors by design.
 
-Enumerated usernames can be used for password brute-force attacks.
+**How it's exploited:** Author slugs may help password spraying if they equal login names, but this module does not prove that mapping, identify private accounts, or test login controls. Results therefore remain observations.
 
-## Notes
-- Runs once per host
-- Tests author IDs 1 through 5
-- Checks REST API with and without per_page parameter
-- Non-destructive: only performs GET requests
+**Fix:** Block author-scan redirects, restrict the REST users endpoint to authenticated requests, and enforce strong passwords plus login rate-limiting or 2FA.`
 
-## References
-- https://www.wpbeginner.com/plugins/how-to-discourage-brute-force-by-blocking-author-scans-in-wordpress/
-- https://developer.wordpress.org/rest-api/reference/users/`
-
-	ModuleConfirmation = "Confirmed when author archive redirects expose usernames or REST API returns user objects"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Observed when credential-free author-ID controls yield distinct non-catch-all slugs or structurally parsed REST author objects; login identity is not inferred"
+	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Certain
 	ModuleTags         = []string{"wordpress", "cms", "php", "authentication", "light"}
 )

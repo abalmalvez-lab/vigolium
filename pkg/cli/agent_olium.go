@@ -3,13 +3,13 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/agent"
 	"github.com/vigolium/vigolium/pkg/olium"
 )
 
@@ -23,6 +23,7 @@ var (
 	oliumProvider      string
 	oliumLLMAPIKey     string
 	oliumClaudeBin     string
+	oliumBridgeBin     string
 	oliumGCPProject    string
 	oliumGCPLocation   string
 	oliumBaseURL       string
@@ -38,14 +39,19 @@ Providers (vendor-first; the prefix tells you which credentials to provide):
   openai-api-key     — uses --llm-api-key / agent.olium.llm_api_key (or $OPENAI_API_KEY)
   anthropic-api-key  — uses --llm-api-key / agent.olium.llm_api_key (or $ANTHROPIC_API_KEY)
   anthropic-oauth    — uses --oauth-token / agent.olium.oauth_token (or $ANTHROPIC_API_KEY); for tokens minted by "claude setup-token"
-  anthropic-cli      — shells out to the local "claude" binary (no key needed here)
+  anthropic-cli      — shells out to the local "claude" binary (no key needed here). Alias: anthropic-claude-cli
+  anthropic-claude-sdk-bridge — drives Claude Code through the Agent SDK via the "vigolium-audit bridge" sidecar
+                       (uses --bridge-bin / agent.olium.bridge_binary, else the embedded blob, then PATH). No key
+                       needed — uses your logged-in Claude Code subscription; an explicit key/token is forwarded if set.
   anthropic-vertex   — uses --oauth-cred (GCP service-account JSON, or $GOOGLE_APPLICATION_CREDENTIALS) + --gcp-project / --gcp-location;
-                       routes claude-* model ids to publishers/anthropic on Vertex AI. Default model: claude-opus-4-6.
+                       routes claude-* model ids to publishers/anthropic on Vertex AI. Default model: claude-opus-5.
   google-vertex      — same GCP creds as anthropic-vertex; routes gemini-* model ids to publishers/google on Vertex AI.
                        Default model: gemini-2.5-pro.
   openai-compatible  — any OpenAI Chat Completions-compatible endpoint (Ollama, OpenRouter, LM Studio, vLLM,
                        Together, Groq, LocalAI, custom proxies). Uses --base-url / agent.olium.custom_provider.base_url,
-                       --llm-api-key / custom_provider.api_key (optional), and --model / custom_provider.model_id.`,
+                       --llm-api-key / custom_provider.api_key (optional), and --model / custom_provider.model_id.
+
+` + agentSetupHelpLine,
 	DisableFlagsInUseLine: true,
 	RunE:                  runAgentOlium,
 }
@@ -63,14 +69,23 @@ var oliumCmd = &cobra.Command{
 }
 
 func runAgentOlium(cmd *cobra.Command, args []string) error {
+	// The bash tool's children run against this process's binary, database,
+	// project and config (agent_child_env.go).
+	installAgentChildEnv()
 	// Load settings so yaml-level olium defaults (agent.olium.*) can back
 	// the CLI flags. A load failure is non-fatal: flags alone still work,
 	// matching the pre-config behavior.
 	var oliumCfg config.OliumConfig
-	if settings, err := config.LoadSettings(globalConfig); err == nil {
+	var sessionsDir string
+	if settings := settingsOrDefaults(); settings != nil {
 		oliumCfg = settings.Agent.Olium
+		sessionsDir = settings.Agent.EffectiveSessionsDir()
 	}
 
+	effectiveExtraBody, err := oliumCfg.CustomProvider.EffectiveExtraBody()
+	if err != nil {
+		return fmt.Errorf("olium custom_provider: %w", err)
+	}
 	opts := olium.Options{
 		Provider:            firstNonEmptyString(oliumProvider, oliumCfg.Provider),
 		OAuthCredPath:       firstNonEmptyString(oliumOAuthCredPath, oliumCfg.OAuthCredPath),
@@ -79,9 +94,11 @@ func runAgentOlium(cmd *cobra.Command, args []string) error {
 		GoogleCloudProject:  firstNonEmptyString(oliumGCPProject, oliumCfg.GoogleCloudProject),
 		GoogleCloudLocation: firstNonEmptyString(oliumGCPLocation, oliumCfg.GoogleCloudLocation),
 		ClaudeBinary:        oliumClaudeBin,
+		BridgeBinary:        firstNonEmptyString(oliumBridgeBin, oliumCfg.BridgeBinary),
 		Model:               firstNonEmptyString(oliumModel, oliumCfg.Model),
 		SystemPrompt:        firstNonEmptyString(oliumSystem, oliumCfg.SystemPrompt),
 		ReasoningEffort:     oliumCfg.ReasoningEffort,
+		MaxTokens:           oliumCfg.MaxTokens,
 		Version:             getVersion(),
 		// openai-compatible — --base-url / --llm-api-key / --model fall back
 		// to custom_provider.* in YAML. ExtraHeaders has no CLI flag; set
@@ -90,9 +107,25 @@ func runAgentOlium(cmd *cobra.Command, args []string) error {
 		CustomModelID:      oliumCfg.CustomProvider.ModelID,
 		CustomAPIKey:       firstNonEmptyString(oliumLLMAPIKey, oliumCfg.CustomProvider.APIKey, oliumCfg.LLMAPIKey),
 		CustomExtraHeaders: oliumCfg.CustomProvider.ExtraHeadersMap(),
+		CustomExtraBody:    effectiveExtraBody,
 	}
 
-	fmt.Fprint(os.Stderr, GetOliumBanner())
+	// Record a Pi-style JSONL transcript (transcript.jsonl) under the agent
+	// sessions dir so an interactive or -p run is debuggable after the fact,
+	// mirroring the agentic-scan session layout. Best-effort: a failure to
+	// mint the session dir simply disables recording. Applied to opts before
+	// both the headless and TUI branches so either path records.
+	if sessionsDir != "" {
+		runUUID := pinnedOrNewUUID(globalScanUUID)
+		if sessionDir, sdErr := agent.EnsureSessionDir(sessionsDir, runUUID); sdErr == nil {
+			opts.SessionDir = sessionDir
+		}
+	}
+
+	// Through emitBanner, so the once-guard covers this and the root hook
+	// together — this was the last raw Fprint, and it printed a second mascot
+	// under the root one on every `vigolium ol` run.
+	emitBanner(GetOliumBanner())
 
 	// -p / --prompt runs one prompt non-interactively and streams to stdout.
 	// Why: a single-shot prompt has no use for the TUI, so -p doubles as the
@@ -100,13 +133,13 @@ func runAgentOlium(cmd *cobra.Command, args []string) error {
 	// Positional args (with no -p) still seed an interactive session.
 	if prompt := strings.TrimSpace(oliumPrompt); prompt != "" {
 		if prompt == "-" {
-			raw, err := io.ReadAll(os.Stdin)
+			raw, err := readStdin()
 			if err != nil {
 				return fmt.Errorf("read stdin: %w", err)
 			}
 			prompt = strings.TrimSpace(string(raw))
 			if prompt == "" {
-				return fmt.Errorf("olium: -p - requires a non-empty prompt on stdin")
+				return usageErrorf("olium: -p - requires a non-empty prompt on stdin")
 			}
 		}
 		// Verbose tool previews + a per-turn usage line follow the global
@@ -124,7 +157,7 @@ func runAgentOlium(cmd *cobra.Command, args []string) error {
 	// Stdin is auto-detected when piped (not a tty).
 	initial := strings.TrimSpace(strings.Join(args, " "))
 	if initial == "" && (oliumStdin || isStdinPiped()) {
-		raw, err := io.ReadAll(os.Stdin)
+		raw, err := readStdin()
 		if err != nil {
 			return fmt.Errorf("read stdin: %w", err)
 		}
@@ -133,6 +166,9 @@ func runAgentOlium(cmd *cobra.Command, args []string) error {
 
 	// Interactive TUI — may be seeded with an initial prompt that
 	// gets auto-submitted on startup.
+	if err := requireInteractiveTTY("the olium TUI", `vigolium olium -p "<prompt>" (or -p - to read it from stdin)`); err != nil {
+		return err
+	}
 	opts.InitialPrompt = initial
 	return olium.RunTUI(opts)
 }
@@ -142,12 +178,13 @@ func runAgentOlium(cmd *cobra.Command, args []string) error {
 // read from the same state regardless of which entry point is invoked.
 func registerOliumFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
-	f.StringVar(&oliumProvider, "provider", "", "Provider: openai-codex-oauth | openai-api-key | anthropic-api-key | anthropic-oauth | anthropic-cli | anthropic-vertex | google-vertex | openai-compatible (falls back to agent.olium.provider; default openai-compatible)")
+	registerOliumProviderFlag(f, &oliumProvider, oliumProviderFlagUsage+"; default openai-compatible")
 	f.StringVar(&oliumModel, "model", "", "Model id (provider-specific default if empty)")
 	f.StringVar(&oliumOAuthCredPath, "oauth-cred", "", "Path to OAuth/SA credential file (openai-codex-oauth: ~/.codex/auth.json; anthropic-vertex/google-vertex: SA JSON or $GOOGLE_APPLICATION_CREDENTIALS)")
 	f.StringVar(&oliumOAuthToken, "oauth-token", "", "Anthropic OAuth bearer token (anthropic-oauth; falls back to agent.olium.oauth_token or $ANTHROPIC_API_KEY)")
 	f.StringVar(&oliumLLMAPIKey, "llm-api-key", "", "API key for key-based providers (anthropic-api-key, openai-api-key); else uses ANTHROPIC_API_KEY / OPENAI_API_KEY env")
-	f.StringVar(&oliumClaudeBin, "claude-bin", "", "Path to the `claude` binary (anthropic-cli provider)")
+	f.StringVar(&oliumClaudeBin, "claude-bin", "", "Path to the 'claude' binary (anthropic-cli provider)")
+	f.StringVar(&oliumBridgeBin, "bridge-bin", "", "Path to the 'vigolium-audit' binary hosting the SDK bridge (anthropic-claude-sdk-bridge provider; default: embedded blob, then PATH)")
 	f.StringVar(&oliumGCPProject, "gcp-project", "", "GCP project for Vertex providers (else $GOOGLE_CLOUD_PROJECT, then YAML, then SA file's project_id)")
 	f.StringVar(&oliumGCPLocation, "gcp-location", "", "GCP region for Vertex providers (else $GOOGLE_CLOUD_LOCATION, then YAML, then us-central1)")
 	f.StringVar(&oliumBaseURL, "base-url", "", "Endpoint URL for openai-compatible provider (e.g. http://localhost:11434/v1 for Ollama); falls back to agent.olium.custom_provider.base_url")

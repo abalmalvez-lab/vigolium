@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -89,12 +90,31 @@ type HostStats struct {
 	FindingCount int64  `json:"finding_count"`
 }
 
+// databaseInfo fills the source-identity block of a stats report: which file
+// this is and how big it is.
+//
+// Both fields were declared and never assigned, so every `db stats -j` reported
+// `"path": "", "size": 0`. Size counts the -wal and -shm siblings along with the
+// main file: on a WAL database the main file alone can be a fraction of what the
+// store actually occupies, and a caller checking disk use against that number
+// would be told the wrong thing right when it matters.
+func databaseInfo(db *DB) DatabaseInfo {
+	info := DatabaseInfo{Driver: db.driver, Path: db.Path()}
+	if info.Path == "" || info.Path == ":memory:" {
+		return info
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if st, err := os.Stat(info.Path + suffix); err == nil {
+			info.Size += st.Size()
+		}
+	}
+	return info
+}
+
 // GetStats retrieves database statistics
 func (db *DB) GetStats(ctx context.Context, filters QueryFilters) (*DatabaseStats, error) {
 	stats := &DatabaseStats{
-		Database: DatabaseInfo{
-			Driver: db.driver,
-		},
+		Database:    databaseInfo(db),
 		HTTPMethods: make(map[string]int64),
 		Findings: FindingsStats{
 			BySeverity: make(map[string]int64),
@@ -137,14 +157,14 @@ func (db *DB) getRecordCounts(ctx context.Context, stats *DatabaseStats, filters
 	if err != nil {
 		return err
 	}
-	stats.Records.HTTPRecords = int64(count)
+	stats.Records.HTTPRecords = count
 
 	// Count records with response
 	count, err = db.scopedRecordsQuery(filters).Where("has_response = ?", true).Count(ctx)
 	if err != nil {
 		return err
 	}
-	stats.Records.WithResponse = int64(count)
+	stats.Records.WithResponse = count
 
 	// Calculate response percentage
 	if stats.Records.HTTPRecords > 0 {
@@ -156,7 +176,7 @@ func (db *DB) getRecordCounts(ctx context.Context, stats *DatabaseStats, filters
 	if err != nil {
 		return err
 	}
-	stats.Records.Findings = int64(count)
+	stats.Records.Findings = count
 
 	return nil
 }
@@ -270,16 +290,19 @@ func (db *DB) getPerformanceStats(ctx context.Context, stats *DatabaseStats, fil
 	stats.Performance.MinResponseTime = result.Min
 	stats.Performance.MaxResponseTime = result.Max
 
-	// Single-pass percentile calculation using ROW_NUMBER window function
+	// Single-pass percentile calculation: rank the with-response set once with a
+	// ROW_NUMBER window and pluck all three percentile rows in one query, instead
+	// of three separate `ORDER BY ... LIMIT 1 OFFSET n` full sorts of the same
+	// (unindexed) column.
 	withResp := stats.Records.WithResponse
 	if withResp > 0 {
-		p50Idx := withResp / 2
-		p95Idx := withResp * 95 / 100
-		p99Idx := withResp * 99 / 100
-
-		stats.Performance.P50ResponseTime = db.responseTimeAt(ctx, filters, int(p50Idx))
-		stats.Performance.P95ResponseTime = db.responseTimeAt(ctx, filters, int(p95Idx))
-		stats.Performance.P99ResponseTime = db.responseTimeAt(ctx, filters, int(p99Idx))
+		p50, p95, p99, err := db.responseTimePercentiles(ctx, filters, int(withResp))
+		if err != nil {
+			return err
+		}
+		stats.Performance.P50ResponseTime = p50
+		stats.Performance.P95ResponseTime = p95
+		stats.Performance.P99ResponseTime = p99
 	}
 
 	return nil
@@ -324,6 +347,12 @@ func (db *DB) getScanSessionStats(ctx context.Context, stats *DatabaseStats, fil
 	if filters.ScanUUID != "" {
 		query.Where("uuid = ?", filters.ScanUUID)
 	}
+	if filters.DateFrom != nil {
+		query.Where("created_at >= ?", *filters.DateFrom)
+	}
+	if filters.DateTo != nil {
+		query.Where("created_at <= ?", *filters.DateTo)
+	}
 	err := query.Scan(ctx)
 	if err != nil {
 		return err
@@ -342,7 +371,10 @@ func (db *DB) getScanSessionStats(ctx context.Context, stats *DatabaseStats, fil
 	return nil
 }
 
-// GetTopHosts retrieves top hosts by request count with finding counts in a single query.
+// GetTopHosts retrieves top hosts by request count with per-host finding counts.
+// It uses a constant TWO queries — one for the top hosts, one grouped
+// finding-count query — instead of the previous 1 + N (a per-host count query),
+// so its cost no longer grows with the requested host limit.
 func (db *DB) GetTopHosts(ctx context.Context, filters QueryFilters, limit int) ([]HostStats, error) {
 	type hostRow struct {
 		Scheme       string `bun:"scheme"`
@@ -357,26 +389,57 @@ func (db *DB) GetTopHosts(ctx context.Context, filters QueryFilters, limit int) 
 		ColumnExpr("COUNT(*) AS request_count").
 		Group("scheme", "hostname", "port").
 		OrderExpr("request_count DESC").
-		Limit(limit).
+		Limit(int64(limit)).
 		Scan(ctx, &rows)
 	if err != nil {
 		return nil, err
 	}
 
+	// Finding counts per ORIGIN (scheme, hostname, port) in ONE grouped query, so
+	// the key matches the request-count rows above. Grouping by hostname alone
+	// assigned the same hostname-wide count to every origin sharing the hostname
+	// (e.g. :80 and :443, or :8080 and :3000), over-attributing findings. Clear any
+	// incoming HostPattern so every origin is counted at once. COUNT(DISTINCT f.id)
+	// counts a finding once per origin even when linked to several of that origin's
+	// records.
+	fcFilters := filters
+	fcFilters.HostPattern = ""
+	type fcRow struct {
+		Scheme   string `bun:"scheme"`
+		Hostname string `bun:"hostname"`
+		Port     int    `bun:"port"`
+		Count    int64  `bun:"fc"`
+	}
+	var fcRows []fcRow
+	if err := db.scopedFindingsQuery(fcFilters).
+		Join("INNER JOIN finding_records AS fr ON fr.finding_id = f.id").
+		Join("INNER JOIN http_records AS r ON r.uuid = fr.record_uuid").
+		ColumnExpr("r.scheme AS scheme").
+		ColumnExpr("r.hostname AS hostname").
+		ColumnExpr("r.port AS port").
+		ColumnExpr("COUNT(DISTINCT f.id) AS fc").
+		GroupExpr("r.scheme, r.hostname, r.port").
+		Scan(ctx, &fcRows); err != nil {
+		return nil, err
+	}
+	type hostOrigin struct {
+		Scheme   string
+		Hostname string
+		Port     int
+	}
+	fcByOrigin := make(map[hostOrigin]int64, len(fcRows))
+	for _, fr := range fcRows {
+		fcByOrigin[hostOrigin{fr.Scheme, fr.Hostname, fr.Port}] = fr.Count
+	}
+
 	hostStats := make([]HostStats, 0, len(rows))
 	for _, r := range rows {
-		findingFilters := filters
-		findingFilters.HostPattern = r.Hostname
-		findingCount, err := db.countScopedFindings(ctx, findingFilters)
-		if err != nil {
-			return nil, err
-		}
 		hostStats = append(hostStats, HostStats{
 			Scheme:       r.Scheme,
 			Hostname:     r.Hostname,
 			Port:         r.Port,
 			RequestCount: r.RequestCount,
-			FindingCount: int64(findingCount),
+			FindingCount: fcByOrigin[hostOrigin{r.Scheme, r.Hostname, r.Port}],
 		})
 	}
 
@@ -397,28 +460,49 @@ func (db *DB) scopedFindingsQuery(filters QueryFilters) *bun.SelectQuery {
 	return query
 }
 
-func (db *DB) countScopedFindings(ctx context.Context, filters QueryFilters) (int, error) {
+func (db *DB) countScopedFindings(ctx context.Context, filters QueryFilters) (int64, error) {
 	return db.scopedFindingsQuery(filters).
 		ColumnExpr("DISTINCT f.id").
 		Count(ctx)
 }
 
-func (db *DB) responseTimeAt(ctx context.Context, filters QueryFilters, offset int) int64 {
-	if offset < 1 {
-		offset = 1
+// responseTimePercentiles computes P50/P95/P99 of response_time_ms over the
+// scoped with-response set in a single query. It ranks rows once with
+// ROW_NUMBER() (1-based ascending) inside a CTE, then selects the three ranked
+// rows, avoiding the three independent full sorts the previous OFFSET approach
+// incurred on the unindexed column. The rank indices mirror the old 1-based
+// offsets (clamped to >= 1).
+func (db *DB) responseTimePercentiles(ctx context.Context, filters QueryFilters, withResp int) (p50, p95, p99 int64, err error) {
+	rank := func(pct int) int {
+		idx := withResp * pct / 100
+		if idx < 1 {
+			idx = 1
+		}
+		return idx
 	}
-	var value int64
-	err := db.scopedRecordsQuery(filters).
-		Column("response_time_ms").
-		Where("has_response = ?", true).
-		Order("response_time_ms ASC").
-		Limit(1).
-		Offset(offset-1).
-		Scan(ctx, &value)
+	p50Rank, p95Rank, p99Rank := rank(50), rank(95), rank(99)
+
+	ordered := db.scopedRecordsQuery(filters).
+		ColumnExpr("response_time_ms AS rt").
+		ColumnExpr("ROW_NUMBER() OVER (ORDER BY response_time_ms ASC) AS rn").
+		Where("has_response = ?", true)
+
+	var res struct {
+		P50 int64
+		P95 int64
+		P99 int64
+	}
+	err = db.NewSelect().
+		With("pctl_ordered", ordered).
+		TableExpr("pctl_ordered").
+		ColumnExpr("COALESCE(MAX(CASE WHEN rn = ? THEN rt END), 0) AS p50", p50Rank).
+		ColumnExpr("COALESCE(MAX(CASE WHEN rn = ? THEN rt END), 0) AS p95", p95Rank).
+		ColumnExpr("COALESCE(MAX(CASE WHEN rn = ? THEN rt END), 0) AS p99", p99Rank).
+		Scan(ctx, &res)
 	if err != nil {
-		return 0
+		return 0, 0, 0, err
 	}
-	return value
+	return res.P50, res.P95, res.P99, nil
 }
 
 // FormatStats formats statistics as a human-readable string
@@ -431,7 +515,16 @@ func FormatStats(stats *DatabaseStats) string {
 	sb.WriteString(terminal.Gray("═══════════════════════════════════════════════════════════════"))
 	sb.WriteString("\n\n")
 
-	fmt.Fprintf(&sb, "Driver: %s\n\n", terminal.Cyan(stats.Database.Driver))
+	fmt.Fprintf(&sb, "Driver: %s\n", terminal.Cyan(stats.Database.Driver))
+	// Naming the file is the point of running this against a specific --db: the
+	// default store is one shared file, so "which database am I looking at" is
+	// the question the counts below are useless without.
+	if stats.Database.Path != "" {
+		fmt.Fprintf(&sb, "Source: %s %s\n",
+			terminal.Cyan(terminal.ShortenHome(stats.Database.Path)),
+			terminal.Gray(fmt.Sprintf("(%s)", terminal.HumanBytes(stats.Database.Size))))
+	}
+	sb.WriteString("\n")
 
 	// Record counts
 	fmt.Fprintf(&sb, "%s %s\n",

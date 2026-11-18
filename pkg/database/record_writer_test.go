@@ -18,7 +18,7 @@ import (
 )
 
 // newTestDB creates an in-memory SQLite database with schema for testing.
-func newTestDB(t *testing.T) *DB {
+func newTestDB(t testing.TB) *DB {
 	t.Helper()
 
 	sqldb, err := sql.Open(sqliteshim.ShimName, ":memory:?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
@@ -51,15 +51,64 @@ func makeTestRequest(i int) *httpmsg.HttpRequestResponse {
 	return rr
 }
 
+// TestRecordWriter_SaveRecordBatch_TrueBatch guards the batching fix: a single
+// producer submitting a batch must not pay one flush interval per record. With
+// the old loop-over-Write, N records cost ~N×FlushInterval (each Write blocks
+// until its own record flushes). The true batch enqueues everything first, so it
+// coalesces into roughly one flush. It also checks per-input result alignment.
+func TestRecordWriter_SaveRecordBatch_TrueBatch(t *testing.T) {
+	db := newTestDB(t)
+	repo := NewRepository(db)
+	writer := NewRecordWriter(repo, RecordWriterConfig{
+		BatchSize: 128,
+	})
+	defer writer.Close()
+	ctx := context.Background()
+
+	const n = 30
+	records := make([]*httpmsg.HttpRequestResponse, n)
+	for i := range records {
+		records[i] = makeTestRequest(i)
+	}
+	// Make two entries identical so we also exercise in-batch dedup alignment.
+	records[6] = makeTestRequest(5)
+
+	start := time.Now()
+	uuids, err := writer.SaveRecordBatch(ctx, records, "test", DefaultProjectUUID)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("SaveRecordBatch: %v", err)
+	}
+
+	// Old behavior would be ~30×50ms = 1.5s; the true batch is ~1 flush interval.
+	// A generous ceiling still catches a regression to per-record flushing.
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("batch took %s — expected ~one flush interval, not one per record", elapsed)
+	}
+
+	// Results are positionally aligned and complete.
+	if len(uuids) != n {
+		t.Fatalf("got %d uuids, want %d (aligned with input)", len(uuids), n)
+	}
+	for i, u := range uuids {
+		if u == "" {
+			t.Fatalf("uuids[%d] is empty; every valid record must get a UUID", i)
+		}
+	}
+	// The duplicate (index 6 == index 5) collapses to the same UUID.
+	if uuids[5] != uuids[6] {
+		t.Errorf("duplicate records should share a UUID: uuids[5]=%s uuids[6]=%s", uuids[5], uuids[6])
+	}
+}
+
 func TestRecordWriter_10000ConcurrentWrites(t *testing.T) {
 	db := newTestDB(t)
 	repo := NewRepository(db)
 
 	writer := NewRecordWriter(repo, RecordWriterConfig{
-		BufferSize:    8192,
-		BatchSize:     200,
-		FlushInterval: 25 * time.Millisecond,
-		Shards:        1, // Single shard for in-memory SQLite test
+		BufferSize: 8192,
+		BatchSize:  200,
+		Shards:     1, // Single shard for in-memory SQLite test
 	})
 	defer writer.Close()
 
@@ -184,10 +233,9 @@ func TestRecordWriter_DirectRepoComparison(t *testing.T) {
 
 	// --- Phase 2: RecordWriter (the new way) ---
 	writer := NewRecordWriter(repo, RecordWriterConfig{
-		BufferSize:    4096,
-		BatchSize:     100,
-		FlushInterval: 25 * time.Millisecond,
-		Shards:        1, // Single shard for in-memory SQLite test
+		BufferSize: 4096,
+		BatchSize:  100,
+		Shards:     1, // Single shard for in-memory SQLite test
 	})
 
 	var writerErrors atomic.Int64
@@ -218,7 +266,7 @@ func TestRecordWriter_DirectRepoComparison(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Count query failed: %v", err)
 	}
-	expectedMin := total // at least the RecordWriter records should be there
+	expectedMin := int64(total) // at least the RecordWriter records should be there
 	if count < expectedMin {
 		t.Errorf("Expected at least %d records, got %d", expectedMin, count)
 	}
@@ -230,50 +278,63 @@ func TestRecordWriter_GracefulShutdown(t *testing.T) {
 	repo := NewRepository(db)
 
 	writer := NewRecordWriter(repo, RecordWriterConfig{
-		BufferSize:    4096,
-		BatchSize:     500,              // large batch — most records will be pending at shutdown
-		FlushInterval: 10 * time.Second, // long interval — only shutdown flush matters
-		Shards:        1,                // Single shard for in-memory SQLite test
+		BufferSize: 4096,
+		BatchSize:  500, // large batch — most records will be pending at shutdown
+		Shards:     1,   // Single shard for in-memory SQLite test
 	})
 
 	const total = 1000
+	const admitBarrier = 200 // close only after this many writes have been admitted
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
-	var errors atomic.Int64
+	var succeeded atomic.Int64
 
 	for i := 0; i < total; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			rr := makeTestRequest(idx)
-			if _, err := writer.Write(ctx, rr, "shutdown-test", ""); err != nil {
-				errors.Add(1)
+			// Distinct records (path/idx) so none collapse via dedup — the DB row
+			// count then equals the number of successful writes exactly.
+			if _, err := writer.Write(ctx, makeTestRequest(idx), "shutdown-test", ""); err == nil {
+				succeeded.Add(1)
 			}
 		}(i)
 	}
 
-	// Close while writes are in-flight — should flush all buffered records
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		writer.Close()
-	}()
+	// Barrier instead of a fixed sleep: wait until writes have actually been
+	// admitted to the writer before closing. A sleep is unreliable under race
+	// instrumentation (it can elapse before any goroutine is even scheduled, so
+	// Close() would reject every write and nothing drains). Admitted writes must
+	// survive the shutdown drain.
+	deadline := time.Now().Add(10 * time.Second)
+	for writer.Metrics().Enqueued < admitBarrier {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d writes to be admitted (got %d)",
+				admitBarrier, writer.Metrics().Enqueued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	writer.Close()
 
 	wg.Wait()
-
-	if errors.Load() > 0 {
-		t.Logf("Note: %d writes returned errors (expected if closed before send)", errors.Load())
-	}
 
 	count, err := db.NewSelect().Model((*HTTPRecord)(nil)).Count(ctx)
 	if err != nil {
 		t.Fatalf("Count query failed: %v", err)
 	}
-	t.Logf("Records persisted after shutdown: %d / %d", count, total)
+	t.Logf("admitted=%d succeeded=%d persisted=%d", writer.Metrics().Enqueued, succeeded.Load(), count)
 
-	// Even with early close, the majority should be persisted
-	if count == 0 {
-		t.Fatal("No records persisted — shutdown drain is broken")
+	// The shutdown drain must flush a meaningful amount of admitted work, not
+	// reject everything.
+	if succeeded.Load() == 0 {
+		t.Fatal("no writes succeeded — shutdown drain is broken")
+	}
+	// Contract: a write returns nil only after its record is flushed, so the exact
+	// number of successful writes must be persisted (records are distinct, so no
+	// dedup collapse). No accepted record may silently vanish.
+	if int64(count) != succeeded.Load() {
+		t.Fatalf("drain lost accepted writes: persisted %d != successful writes %d", count, succeeded.Load())
 	}
 }
 
@@ -282,10 +343,9 @@ func TestRecordWriter_WriteAfterClose(t *testing.T) {
 	repo := NewRepository(db)
 
 	writer := NewRecordWriter(repo, RecordWriterConfig{
-		BufferSize:    32,
-		BatchSize:     8,
-		FlushInterval: 10 * time.Millisecond,
-		Shards:        1,
+		BufferSize: 32,
+		BatchSize:  8,
+		Shards:     1,
 	})
 	writer.Close()
 
@@ -304,10 +364,9 @@ func TestRecordWriter_SmallBatchConfig(t *testing.T) {
 
 	// Tiny batches to stress the flush path
 	writer := NewRecordWriter(repo, RecordWriterConfig{
-		BufferSize:    64,
-		BatchSize:     5,
-		FlushInterval: 5 * time.Millisecond,
-		Shards:        1, // Single shard for in-memory SQLite test
+		BufferSize: 64,
+		BatchSize:  5,
+		Shards:     1, // Single shard for in-memory SQLite test
 	})
 	defer writer.Close()
 
@@ -424,10 +483,9 @@ func TestRecordWriter_WithFileDB(t *testing.T) {
 
 	repo := NewRepository(db)
 	writer := NewRecordWriter(repo, RecordWriterConfig{
-		BufferSize:    8192,
-		BatchSize:     200,
-		FlushInterval: 25 * time.Millisecond,
-		Shards:        1, // Single shard for in-memory SQLite test
+		BufferSize: 8192,
+		BatchSize:  200,
+		Shards:     1, // Single shard for in-memory SQLite test
 	})
 	defer writer.Close()
 

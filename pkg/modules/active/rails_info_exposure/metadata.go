@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Rails development-oriented endpoints that are commonly left exposed in
-production deployments. Checks for informational pages (/rails/info), mailer previews
-(/rails/mailers), Action Mailbox conductor UI, and health endpoints that leak metadata.
+	ModuleDesc = `**What it means:** Ruby on Rails development and debug endpoints are reachable in production, exposing the Rails/Ruby version, environment config, the full route map, Action Mailer previews, or the Action Mailbox conductor UI - pages meant only for local development.
 
-## Notes
-- Sends GET requests to known Rails development endpoints
-- Fingerprints 404 responses to avoid false positives from custom error pages
-- Checks for Rails-specific content markers in response bodies
-- Reports exposed endpoints with appropriate severity levels
+**How it's exploited:** An attacker browses /rails/info, /rails/info/routes, /rails/mailers, or /rails/conductor/action_mailbox/inbound_emails and reads the data. Version strings pin known CVEs, the route listing maps the attack surface including hidden admin and API endpoints, and mailer previews can reveal templates and embedded tokens.
 
-## References
-- https://guides.rubyonrails.org/configuring.html
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Run the app in production mode, restrict or remove these endpoints, and block /rails/* at the proxy.`
 
 	ModuleConfirmation = "Confirmed when Rails development endpoints return 200 with framework-specific content markers"
 	ModuleSeverity     = severity.High

@@ -1,32 +1,20 @@
 package main
 
 import (
-	"fmt"
-	"os"
-
 	"github.com/vigolium/vigolium/pkg/cli"
 )
 
+// main does nothing but hand off. It used to print the startup banner here,
+// before cobra had parsed anything, by scanning os.Args for "--json"/"-j" and
+// comparing os.Args[1] against a hand-written command list. That decided stdout
+// framing from raw argv, so `--json=true`, an alias, or a global placed before
+// the command all defeated it — and any command whose stdout is data but which
+// was missing from the list (completion, js, storage download) got a mascot
+// glued to the front of its output.
+//
+// The banner is presentation and now lives on stderr, emitted from the root
+// PersistentPreRunE once the command and its flags are actually known. See
+// pkg/cli/banner.go.
 func main() {
-	if !hasFlag("--json", "-j") && (len(os.Args) < 2 || os.Args[1] != "version") && !isSubcommand("config") && !isSubcommand("agent") && !isSubcommand("traffic") && !isSubcommand("finding") && !isSubcommand("findings") && !isSubcommand("db") && !isSubcommand("scan") && !isSubcommand("run") && !isSubcommand("r") && !isSubcommand("import") && !isSubcommand("log") && !isSubcommand("olium") && !isSubcommand("ol") {
-		fmt.Print(cli.GetBanner())
-	}
 	cli.Execute()
-}
-
-// hasFlag returns true if any of the given flags appear in os.Args.
-func hasFlag(flags ...string) bool {
-	for _, arg := range os.Args[1:] {
-		for _, f := range flags {
-			if arg == f {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// isSubcommand returns true if the first argument matches the given command name.
-func isSubcommand(name string) bool {
-	return len(os.Args) >= 2 && os.Args[1] == name
 }

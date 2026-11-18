@@ -9,28 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript and TypeScript response bodies for Next.js Server Actions that accept
-user input (FormData or function arguments) without runtime schema validation. Server
-Actions rely on TypeScript types for compile-time safety, but these types are erased at
-runtime. Without runtime validation (zod, yup, joi, valibot, etc.), attackers can submit
-arbitrary data types, unexpected fields, or injection payloads.
+	ModuleDesc = `**What it means:** A source-like JS/TS file contains server-action, input-access, and database-operation patterns without a recognized schema-library token. This is file-level proximity, not proven source-to-sink flow.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects "use server" directive combined with FormData/argument usage
-- Flags when no validation library patterns are found (z.parse, z.safeParse, schema.validate, etc.)
-- Complements server_action_auth which checks for missing authorization
-- Deduplicates by host+path
-- CWE-20: Improper Input Validation
+**How it's exploited:** Exploitation requires attacker input to reach a sensitive operation without imported or manual validation. The module neither resolves helpers nor executes payloads, so it reports a candidate.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/data-fetching/server-actions-and-mutations
-- https://nextjs.org/blog/security-nextjs-server-components-actions
-- https://cwe.mitre.org/data/definitions/20.html`
+**Fix:** Validate and coerce every Server Action input at runtime with a schema library before any database operation.`
 
-	ModuleConfirmation = "Confirmed when a Server Action processes input without any runtime validation library"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Candidate when source-like code co-locates action, input, and write patterns without recognized validation; connected flow or dynamic impact is required"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"nextjs", "javascript", "injection", "light"}
 )

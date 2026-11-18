@@ -47,6 +47,35 @@ type notFoundFingerprint struct {
 	contentType string
 }
 
+// catchAllRounds is how many distinct random `*.php`/PATH_INFO control probes the
+// blanket catch-all check issues. Multiple rounds turn a single flaky
+// WAF/CDN/cache response into a majority vote, and — crucially — key the verdict
+// on status alone, so it survives the gzip/Content-Length:0 body-truncation quirk
+// that defeats a body-similarity compare (the acme trace.acme.com echo server,
+// which returned 200 for every path but a differently-truncated body each time).
+const catchAllRounds = 3
+
+// catchAllProbe records the aggregate result of several random, definitely-non-
+// existent `*.php`/PATH_INFO control probes. count200 is how many of rounds
+// returned 200. A majority means the host serves a generic body for ANY script-
+// shaped path (an SPA/catch-all router, a blanket rewrite, a reflecting/echo
+// server), so a 200 on the real PATH_INFO tests proves nothing about
+// cgi.fix_pathinfo routing. body is one representative 200 body, kept for the
+// similarity-tolerant per-test compare on hosts that are not blanket catch-alls.
+type catchAllProbe struct {
+	rounds   int
+	count200 int
+	body     string
+}
+
+// blanket reports whether a majority of the control rounds returned 200 — the
+// host answers every script-shaped path, so no PATH_INFO test can distinguish a
+// real cgi.fix_pathinfo acceptance from the catch-all. Status-only, so it is
+// robust to per-request body truncation/reflection.
+func (c *catchAllProbe) blanket() bool {
+	return c != nil && c.rounds > 0 && c.count200*2 > c.rounds
+}
+
 // Module implements the PHP PATH_INFO Misconfiguration active scanner.
 type Module struct {
 	modkit.BaseActiveModule
@@ -95,24 +124,74 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
 	// Fingerprint 404 page
 	fp := m.fingerprint404(ctx, httpClient)
 
+	// Probe several random script-shaped paths to learn whether the host blanket-
+	// serves 200 for any `*.php`/PATH_INFO URL (a catch-all that no PATH_INFO test
+	// can distinguish from a real cgi.fix_pathinfo routing acceptance). When a
+	// majority answer 200, the whole host is a catch-all — abandon every test.
+	catchAll := m.probeCatchAll(ctx, httpClient)
+	if catchAll.blanket() {
+		return nil, nil
+	}
+
 	var results []*output.ResultEvent
 	for _, test := range tests {
-		if result := m.runTest(ctx, httpClient, test, fp); result != nil {
+		if result := m.runTest(ctx, httpClient, test, fp, catchAll); result != nil {
 			results = append(results, result)
 		}
 	}
 	return results, nil
+}
+
+// probeCatchAll requests catchAllRounds distinct random, definitely-non-existent
+// `*.php` scripts each WITH a random PATH_INFO segment, and tallies how many
+// return 200. On a genuine cgi.fix_pathinfo host, a non-existent `*.php` is
+// rejected (FPM "No input file specified" / 404), so a 200 across a majority of
+// these controls is the signature of a host that returns a generic body for any
+// script-shaped path. The first 200 body is retained as a representative for the
+// similarity-tolerant per-test compare. Each round uses a fresh random path and
+// NoClustering so a per-path response cache cannot alias the rounds together.
+func (m *Module) probeCatchAll(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+) *catchAllProbe {
+	baseRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
+	if err != nil {
+		return &catchAllProbe{}
+	}
+
+	res := &catchAllProbe{}
+	for i := 0; i < catchAllRounds; i++ {
+		randomPath := "/vigolium-pathinfo-catchall-" + utils.RandomString(8) + ".php/" + utils.RandomString(8)
+		modifiedRaw, err := httpmsg.SetPath(baseRaw, randomPath)
+		if err != nil {
+			continue
+		}
+		res.rounds++
+
+		// SetMethod/SetPath produce well-formed raw, so wrap directly instead of
+		// re-parsing on this hot path.
+		fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
+		resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoClustering: true})
+		if err != nil {
+			continue
+		}
+		if resp.Response() != nil && resp.Response().StatusCode == 200 {
+			res.count200++
+			if res.body == "" {
+				res.body = resp.Body().String()
+			}
+		}
+		resp.Close()
+	}
+	return res
 }
 
 // fingerprint404 fetches a non-existent path to learn what a 404 looks like.
@@ -131,11 +210,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -161,12 +238,25 @@ func (m *Module) fingerprint404(
 	}
 }
 
+// baseScriptPath returns the base PHP script of a PATH_INFO test path — the
+// substring up to and including the first ".php" — e.g. "/index.php" for
+// "/index.php/vigolium-pathinfo-test" or "/index.php%2Fvigolium-pathinfo-test".
+// Returns "" when the path carries no ".php".
+func baseScriptPath(p string) string {
+	idx := strings.Index(strings.ToLower(p), ".php")
+	if idx < 0 {
+		return ""
+	}
+	return p[:idx+len(".php")]
+}
+
 // runTest sends a PATH_INFO test request and validates the response.
 func (m *Module) runTest(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
 	test pathInfoTest,
 	fp *notFoundFingerprint,
+	catchAll *catchAllProbe,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
@@ -177,11 +267,9 @@ func (m *Module) runTest(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// BuildRequest/SetMethod/... produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -222,6 +310,33 @@ func (m *Module) runTest(
 	if !strings.Contains(test.path, "nonexistent") {
 		// For valid script + PATH_INFO, skip if the response looks like an error page
 		if strings.Contains(body, "404") || strings.Contains(body, "Not Found") {
+			return nil
+		}
+	}
+
+	// Catch-all guard: if a random non-existent `*.php`/PATH_INFO control also
+	// returned 200 with a body similar to this candidate, the host serves a
+	// generic body for any script-shaped path — the PATH_INFO "acceptance" is an
+	// artifact of that catch-all (an SPA router, a blanket rewrite, a prefixed
+	// handler), not a cgi.fix_pathinfo routing bug. Mirrors the off-by-slash
+	// suffix-invariance gate; uses similarity-tolerant comparison so per-request
+	// volatile content (timestamps, tokens) does not mask the match.
+	if catchAll != nil && catchAll.body != "" && modkit.BodiesSimilar(catchAll.body, body) {
+		return nil
+	}
+
+	// Clean-canonical (base-script) control: the PATH_INFO test path is the base
+	// PHP script with a trailing PATH_INFO segment. Fetch that base script plain
+	// (no PATH_INFO); if it returns 200 with a body similar to the candidate, the
+	// trailing path produced no observable routing change — the script is served
+	// regardless of the suffix and is already publicly reachable, so no
+	// cgi.fix_pathinfo routing boundary was demonstrably crossed (a front
+	// controller / Apache AcceptPathInfo serving the home page for /index.php and
+	// /index.php/anything alike). This is a no-op for the non-existent-script
+	// test, whose bare base script 404s, and for a genuine misconfig where the
+	// PATH_INFO response diverges from the base script.
+	if base := baseScriptPath(test.path); base != "" && base != test.path {
+		if bStatus, bBody, ok := modkit.FetchPath(ctx, httpClient, base); ok && bStatus == 200 && modkit.BodiesSimilar(bBody, body) {
 			return nil
 		}
 	}

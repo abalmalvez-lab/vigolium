@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for PHP source code disclosure caused by misconfigured web servers: .phps
-highlight handlers that expose syntax-highlighted source, alternate PHP extensions
-(.phtml, .php5, .php7) that may serve source as plaintext, and PHP files served
-as static content due to handler misconfiguration.
+	ModuleDesc = `**What it means:** The web server returns raw or syntax-highlighted PHP source instead of executing it - via .phps handlers, a broken handler mapping, accessible alternate extensions (.phtml, .php5), or .inc files served statically. The module probes paths like config.php and wp-config.php, confirmed by PHP source markers.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with PHP source code markers
-- Detects both highlighted source and raw PHP code exposure
-- Fingerprints 404 responses to detect custom error pages
+**How it's exploited:** An attacker reads the leaked source to recover hardcoded database credentials, API keys, and connection strings. Exposed wp-config.php hands over full database access.
 
-## References
-- https://www.php.net/manual/en/security.hiding.php
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Configure the server to execute every PHP-related extension, never serve .php, .phps, .phtml, or .inc statically.`
 
 	ModuleConfirmation = "Confirmed when probed endpoints return PHP source code markers in the response body"
 	ModuleSeverity     = severity.High

@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests cloud storage endpoints for public listing access. Attempts S3 ListObjectsV2,
-Azure container blob listing, and Azure account container listing requests.
+	ModuleDesc = `**What it means:** A cloud storage endpoint (an AWS S3 bucket or Azure Blob container) allows anonymous listing of its contents - confirmed by an XML response enumerating real objects or blobs. This exposes the full inventory of stored files, often including private data.
 
-## Notes
-- Only runs on hosts identified as cloud storage endpoints
-- S3: GET /?list-type=2 checking for ListBucketResult
-- Azure: GET /<container>?restype=container&comp=list checking for Blobs
-- Azure: GET /?comp=list checking for Containers
-- Runs once per host with deduplication
+**How it's exploited:** An attacker reads the listing to discover every object name and path, then downloads each, commonly leaking backups, source code, credentials, and customer records and revealing the layout for deeper attacks.
 
-## References
-- https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
-- https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs`
+**Fix:** Disable anonymous listing (block public access on the S3 bucket; set Azure container access to Private), and require authenticated, least-privilege access.`
 
 	ModuleConfirmation = "Confirmed when storage endpoint returns XML listing response with object/blob entries"
 	ModuleSeverity     = severity.High

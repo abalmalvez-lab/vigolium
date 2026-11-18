@@ -9,25 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects Express.js trust proxy misconfiguration by sending X-Forwarded-* header variants
-and comparing responses against a baseline to identify behavioral changes.
+	ModuleDesc = `**What it means:** The app trusts attacker-controlled X-Forwarded-* headers (Proto, Host, For, Port), typically because Express trust proxy is enabled without restricting to known proxies, letting any client override the protocol, hostname, client IP, or port.
 
-When Express.js has ` + "`trust proxy`" + ` enabled without proper validation, attackers can
-manipulate X-Forwarded-Proto, X-Forwarded-Host, X-Forwarded-For, and X-Forwarded-Port
-headers to cause protocol confusion, IP-based access control bypass, and port injection.
+**How it's exploited:** X-Forwarded-Host reflects into URLs and redirects (host-header injection, poisoned password-reset links, cache poisoning); X-Forwarded-For spoofs the client IP to bypass allowlists or rate limiting; X-Forwarded-Proto downgrades the scheme, stripping the Secure flag.
 
-## Notes
-- X-Forwarded-Proto can cause redirect loops or strip Secure flags from cookies
-- X-Forwarded-Host can be trusted for URL generation, leading to host-based attacks
-- X-Forwarded-For can bypass IP-based rate limiting or access controls
-- X-Forwarded-Port can inject unexpected ports into generated URLs and redirects
-- Compares each probe response against a baseline to detect behavioral changes
-
-## References
-- https://expressjs.com/en/guide/behind-proxies.html
-- https://expressjs.com/en/api.html#trust.proxy.options.table
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/17-Testing_for_Host_Header_Injection`
+**Fix:** Set Express trust proxy to explicit proxy IPs or a hop count, not a blanket true, and never use untrusted X-Forwarded-* values for URLs, redirects, or access decisions.`
 
 	ModuleConfirmation = "Confirmed when X-Forwarded-* header manipulation causes observable behavioral changes such as redirect differences, cookie Secure flag removal, access control bypass, or port injection in generated URLs"
 	ModuleSeverity     = severity.Medium

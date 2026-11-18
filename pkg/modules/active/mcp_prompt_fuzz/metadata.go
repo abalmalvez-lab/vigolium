@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Enumerates prompts via ` + "`prompts/list`" + ` and fuzzes each prompt's arguments
-through ` + "`prompts/get`" + `. Prompts are a high-impact surface because their
-output is normally fed verbatim back into a downstream LLM context, and the
-server frequently interpolates argument values into shell commands or
-template engines.
+	ModuleDesc = `**What it means:** An MCP (Model Context Protocol) server interpolates a prompts/get argument unsafely into a template engine, shell command, or text fed to a downstream LLM, processing it as code rather than inert data.
 
-## Detections
-- **SSTI**: ` + "`${7*7}`" + ` rendered as ` + "`49`" + ` in the prompt result.
-- **Command injection**: time-based ` + "`sleep`" + ` payloads.
-- **Reflective prompt injection**: a unique sentinel marker echoed back in
-  any of the prompt result messages.
+**How it's exploited:** An attacker crafts an argument to run template expressions, execute OS commands on the host, or smuggle instructions the downstream LLM obeys - yielding code execution, data exfiltration, or model hijacking.
 
-## References
-- https://modelcontextprotocol.io/specification/2025-11-25/server/prompts
-- https://owasp.org/www-project-top-10-for-large-language-model-applications/`
+**Fix:** Treat MCP prompt arguments as untrusted: never pass them to a shell or template evaluator, use parameterized rendering with strict escaping, and sanitize text before it reaches a model.`
 
 	ModuleConfirmation = "Confirmed when SSTI evaluates the math marker, when the response delays for the sleep payload, or when the unique sentinel is echoed in the prompt result"
 	ModuleSeverity     = severity.High

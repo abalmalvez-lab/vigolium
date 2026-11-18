@@ -9,19 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects information disclosure in HTTP responses including server version
-strings, framework identifiers, internal IP addresses, and stack traces.
+	ModuleDesc = `**What it means:** A response exposes a software version, valid private address, corroborated debug marker, or directory listing. Versions and addresses are observations; debug and listing patterns require independent anchors. Stack traces use a dedicated detector.
 
-## Notes
-- Scans response headers and bodies for disclosure patterns
-- Detects server software versions, internal paths, email addresses, and debug info
-- Runs per-request to catch endpoint-specific disclosures
+**How it's exploited:** Attackers map internal systems, identify version-specific exploits, or use debug context to sharpen later attacks.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/`
+**Fix:** Suppress unnecessary banners, disable debug mode and directory indexing, and return generic production errors.`
 
-	ModuleConfirmation = "Confirmed when response contains identifiable server versions, internal IPs, stack traces, or debug information"
+	ModuleConfirmation = "Observation for version/private-address markers; candidate only when independent debug or directory-listing anchors corroborate the pattern"
 	ModuleSeverity     = severity.Low
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"info-disclosure", "light"}

@@ -9,20 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects suspicious input transformations that may indicate vulnerabilities, including
-expression evaluation, quote consumption, and unicode normalization issues.
+	ModuleDesc = `**What it means:** The server transformed an injected probe in a way the input alone does not explain, then reflected it back (confirmed twice). Such transforms are classic tells: arithmetic or template syntax evaluated (SSTI), quotes consumed, or unicode normalized (filter-bypass). A behavioral signal, not a confirmed bug.
 
-## Notes
-- Tests for server-side expression evaluation (math, string operations)
-- Detects quote consumption that may indicate injection contexts
-- Identifies unicode normalization that could bypass security filters
+**How it's exploited:** If markup is computed server-side, an attacker can escalate to SSTI or expression-language injection and often remote code execution. Quote consumption and unicode rewriting smuggle payloads past WAF blocklists.
 
-## References
-- https://portswigger.net/bappstore/3123d5b5f25c4128894d97ea1571571c`
+**Fix:** Treat user input as inert data, never passing it into template or eval contexts, and validate after unicode normalization.`
 
 	ModuleConfirmation = "Indicated when injected expressions are evaluated, quotes are consumed, or unicode characters are normalized by the server"
 	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"behavior-analysis", "injection", "moderate"}
+	ModuleTags         = []string{"behavior-analysis", "injection", "heavy"}
 )

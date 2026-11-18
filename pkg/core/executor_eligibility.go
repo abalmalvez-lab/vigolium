@@ -5,7 +5,7 @@ import (
 
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules"
-	"github.com/vigolium/vigolium/pkg/utils"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 )
 
 // requestEligibility caches common CanProcess checks for a single request.
@@ -19,11 +19,12 @@ func computeEligibility(item *httpmsg.HttpRequestResponse) requestEligibility {
 	if item == nil || item.Request() == nil {
 		return requestEligibility{}
 	}
-	urlx, err := item.URL()
-	if err != nil {
+	if _, err := item.URL(); err != nil {
 		return requestEligibility{}
 	}
-	if utils.IsMediaAndJSURL(urlx.Path) {
+	// Seeds the per-request media memo so every module's base CanProcess reuses
+	// it instead of re-running the regex.
+	if item.Request().IsMediaPath() {
 		return requestEligibility{}
 	}
 	method := item.Request().Method()
@@ -80,6 +81,54 @@ func (e *Executor) passesTechFilter(m modules.Module, item *httpmsg.HttpRequestR
 	return e.scanCtx.TechStack.Allows(hostFromItem(item), required)
 }
 
+// passesContentClassFilter applies the content-class gate to a passive module:
+// a module that structurally requires a body shape (e.g. clickjacking needs an
+// HTML document) is skipped on a record whose response is a confirmed different
+// structured class. Fails open on unknown/text responses, on content-agnostic
+// modules, and when the tech filter is disabled (--no-tech-filter / deep). The
+// per-host heuristics class is consulted only when the record's own Content-Type
+// is indeterminate.
+func (e *Executor) passesContentClassFilter(m modules.Module, item *httpmsg.HttpRequestResponse) bool {
+	if e.cfg.TechFilterDisabled {
+		return true
+	}
+	required := e.requiredContentClassesFor(m)
+	if len(required) == 0 {
+		return true
+	}
+	class := modkit.ResponseContentClass(item)
+	if class == modkit.ContentClassUnknown && e.scanCtx != nil && e.scanCtx.ContentClass != nil {
+		// Record's own type is indeterminate — fall back to the host's root class.
+		class = e.scanCtx.ContentClass.Get(hostFromItem(item))
+	}
+	return modkit.ContentClassAllows(required, class)
+}
+
+// requiredContentClassesFor returns the module's required content-class list,
+// memoized on the executor. Prefers an explicit ContentClassAware implementation
+// and otherwise derives the requirement from the module's tags.
+func (e *Executor) requiredContentClassesFor(m modules.Module) []string {
+	id := m.ID()
+	if v, ok := e.caches.moduleContentClassReq.Load(id); ok {
+		if v == nil {
+			return nil
+		}
+		return v.([]string)
+	}
+	var derived []string
+	if aware, ok := m.(modules.ContentClassAware); ok {
+		derived = normalizeTechTags(aware.RequiredContentClasses())
+	} else {
+		derived = modules.DerivedContentClasses(m.Tags())
+	}
+	var stored any
+	if len(derived) > 0 {
+		stored = derived
+	}
+	e.caches.moduleContentClassReq.Store(id, stored)
+	return derived
+}
+
 // requiredTechsFor returns the module's required-tech allowlist. Results are
 // memoized on the executor and stored pre-normalized so the registry lookup
 // can skip per-call trim/lower work. Fingerprint modules (which populate the
@@ -123,19 +172,39 @@ func normalizeTechTags(in []string) []string {
 	return out
 }
 
-// hostFromItem extracts the host for tech-registry lookup. Prefers Service().Host()
-// (already includes port for non-default ports) and falls back to the URL host.
+// hostFromItem extracts the per-host key used for tech-registry and
+// content-class lookups. It delegates to modkit.RegistryHostKey, which is the
+// single owner of that key: fingerprint modules publish detections under it via
+// ScanContext.MarkTech, the surface_scoring module reads it back at flush, and
+// the content-class registry is seeded with it. A second derivation here is one
+// that can disagree, and the symptom of disagreeing is a detection that silently
+// never matches.
 func hostFromItem(item *httpmsg.HttpRequestResponse) string {
-	if item == nil {
-		return ""
+	return modkit.RegistryHostKey(item)
+}
+
+// methodPolicyAllows reports whether item's method may be actively tested
+// under the scan's traffic policy, counting a refusal as a method_policy
+// skip. The requester refuses such a request anyway (ErrMethodDenied); this
+// is the earlier, counted gate, so no module runs against a DELETE record
+// only to have every probe refused.
+func (e *Executor) methodPolicyAllows(item *httpmsg.HttpRequestResponse) bool {
+	if e == nil || item == nil || item.Request() == nil || e.cfg.Services == nil || e.cfg.Services.Options == nil {
+		return true
 	}
-	if svc := item.Service(); svc != nil {
-		if h := svc.Host(); h != "" {
-			return h
-		}
+	pol := e.cfg.Services.Options.TrafficPolicy
+	if pol.AllowsMethod(item.Request().Method()) {
+		return true
 	}
-	if u, err := item.URL(); err == nil && u != nil {
-		return u.Host
+	e.methodPolicySkips.Add(1)
+	return false
+}
+
+// MethodPolicySkips is how many records this executor kept out of the active
+// stage because the traffic policy refused their method.
+func (e *Executor) MethodPolicySkips() int64 {
+	if e == nil {
+		return 0
 	}
-	return ""
+	return e.methodPolicySkips.Load()
 }

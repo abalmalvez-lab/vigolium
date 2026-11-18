@@ -9,27 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript and TypeScript response bodies for Next.js client components that
-implement authentication guards purely on the client side using useEffect redirects.
-Client-side auth checks can be trivially bypassed by disabling JavaScript or
-manipulating the DOM, leaving protected routes accessible without authentication.
+	ModuleDesc = `**What it means:** A Next.js client component ("use client") performs an authentication redirect from a useEffect hook. This is an observation only: middleware, server components, route handlers, or backend APIs normally enforce authorization outside the client bundle and cannot be ruled out from this response.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects "use client" directive combined with useEffect-based auth redirects
-- Flags when no server-side auth indicators are found alongside client redirects
-- Covers router.push/replace to login/signin/auth and window.location redirects
-- Deduplicates by host+path
-- CWE-862: Missing Authorization
+**How it's exploited:** An attacker disables JavaScript, drops the redirect, or reads the response before useEffect fires to view the protected component and its data, reaching restricted content.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/authentication
-- https://cwe.mitre.org/data/definitions/862.html
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/05-Authorization_Testing/02-Testing_for_Bypassing_Authorization_Schema`
+**Fix:** Enforce auth on the server (middleware, a server component, or route handler); treat the client redirect only as a UX hint.`
 
-	ModuleConfirmation = "Confirmed when a client component implements auth redirect via useEffect without server-side auth"
-	ModuleSeverity     = severity.High
+	ModuleConfirmation = "Observation only; confirmation requires an anonymous runtime request or repository-wide server authorization trace"
+	ModuleSeverity     = severity.Info
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"authentication", "javascript", "light"}
 )

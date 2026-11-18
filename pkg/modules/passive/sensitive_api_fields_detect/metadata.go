@@ -9,24 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively analyzes JSON API responses for field names that indicate sensitive
-data exposure. Checks for password fields, API keys, access tokens, private
-keys, SSNs, and credit card numbers. Skips API documentation and JSON Schema
-responses to reduce false positives.
+	ModuleDesc = `**What it means:** A JSON API response contains field names tied to sensitive data (password, secret, api_key, access_token, private_key, ssn, credit_card). APIs often over-share by serializing whole backend objects, leaking credentials or PII to clients. Names are matched passively, so each hit needs review.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Only operates on application/json responses
-- Uses quoted field name matching to avoid false positives in prose
-- Skips OpenAPI/Swagger docs and JSON Schema responses
-- Deduplicates by host to avoid flooding with the same finding
+**How it's exploited:** An attacker who reaches the endpoint or intercepts a response harvests the values: stolen keys and tokens enable account takeover, while SSN and card fields enable fraud. This is classic excessive data exposure.
 
-## References
-- https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/`
+**Fix:** Restrict responses to only the fields each caller is authorized to see, removing credentials and PII unless required.`
 
 	ModuleConfirmation = "Confirmed when JSON response body contains sensitive field names"
-	ModuleSeverity     = severity.Medium
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"api", "info-disclosure", "light"}
 )

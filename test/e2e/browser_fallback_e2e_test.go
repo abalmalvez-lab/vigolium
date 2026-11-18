@@ -24,6 +24,16 @@ const (
 	browserFallbackCfTDockerfile        = "test/e2e/testdata/browser-fallback/Dockerfile.cft-download"
 	browserFallbackImageBase            = "vigolium-browser-fallback-test"
 	spideringTarget                     = "https://ginandjuice.shop/"
+
+	// dockerCmdWaitDelay bounds how long Cmd.Wait blocks after the context
+	// deadline fires and the docker CLI child is killed. `docker build`
+	// (buildkit) and `docker run` leave a docker-buildx / containerd-shim
+	// grandchild that inherits a copy of the stdout/stderr pipe, so without a
+	// WaitDelay the pipe-copy goroutines never see EOF and Cmd.Wait deadlocks
+	// forever — hanging the entire serial e2e suite. With WaitDelay set, Wait
+	// force-closes the inherited pipes after this grace period and returns the
+	// context error, turning a slow/timed-out build into a clean failure.
+	dockerCmdWaitDelay = 30 * time.Second
 )
 
 // TestBrowserFallback_SystemChromium verifies that vigolium spidering
@@ -156,6 +166,7 @@ func runSpidering(ctx context.Context, t *testing.T, imageName, platform string)
 	}
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.WaitDelay = dockerCmdWaitDelay
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -192,6 +203,25 @@ func crossPlatformAvailable(t *testing.T) bool {
 		return strings.Contains(output, "linux/arm64")
 	}
 	return false
+}
+
+// requireCfTPlatform guards the amd64-only Chrome for Testing tests. CfT
+// publishes no linux/arm64 build, so these tests pin linux/amd64; on a non-amd64
+// host that means running the image under QEMU emulation, which compiles the
+// whole binary in an emulated builder stage and routinely overruns the e2e time
+// budget. On a native amd64 host the tests run as normal; on any other host they
+// skip unless cross-arch emulation is explicitly opted into — mirroring the
+// VIGOLIUM_E2E_CROSS_ARCH convention used by TestBrowserFallback_SystemChromium.
+func requireCfTPlatform(t *testing.T) {
+	t.Helper()
+	if runtime.GOARCH == "amd64" {
+		return
+	}
+	if os.Getenv("VIGOLIUM_E2E_CROSS_ARCH") == "1" && crossPlatformAvailable(t) {
+		t.Logf("running amd64-only CfT test under emulation on %s host (VIGOLIUM_E2E_CROSS_ARCH=1); this is slow", runtime.GOARCH)
+		return
+	}
+	t.Skipf("CfT tests pin linux/amd64 (no arm64 CfT build); skipping on %s host — set VIGOLIUM_E2E_CROSS_ARCH=1 to run under emulation", runtime.GOARCH)
 }
 
 // findRepoRoot walks up from the working directory to find the repo root
@@ -266,6 +296,7 @@ func buildImageWithDockerfile(ctx context.Context, t *testing.T, repoRoot, image
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Dir = repoRoot
+	cmd.WaitDelay = dockerCmdWaitDelay
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -285,6 +316,7 @@ func TestCfTDownload_Doctor(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping CfT download e2e test in short mode")
 	}
+	requireCfTPlatform(t)
 
 	repoRoot := findRepoRoot(t)
 	platform := "linux/amd64"
@@ -324,6 +356,7 @@ func TestCfTDownload_Spidering(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping CfT spidering e2e test in short mode")
 	}
+	requireCfTPlatform(t)
 
 	repoRoot := findRepoRoot(t)
 	platform := "linux/amd64"
@@ -356,6 +389,7 @@ func TestCfTDownload_Spidering(t *testing.T) {
 		"vigolium", "doctor", "--fix",
 	}
 	cmd := exec.CommandContext(ctx, "docker", doctorArgs...)
+	cmd.WaitDelay = dockerCmdWaitDelay
 	var dBuf bytes.Buffer
 	cmd.Stdout = &dBuf
 	cmd.Stderr = &dBuf
@@ -373,6 +407,7 @@ func TestCfTDownload_Spidering(t *testing.T) {
 		"--debug",
 	}
 	cmd = exec.CommandContext(ctx, "docker", spiderArgs...)
+	cmd.WaitDelay = dockerCmdWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -401,6 +436,7 @@ func TestCfTDownload_SpideringAutoDownload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping CfT auto-download e2e test in short mode")
 	}
+	requireCfTPlatform(t)
 
 	repoRoot := findRepoRoot(t)
 	platform := "linux/amd64"
@@ -444,6 +480,7 @@ func runDocker(ctx context.Context, t *testing.T, imageName, platform string, co
 	args = append(args, command...)
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.WaitDelay = dockerCmdWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -457,4 +494,61 @@ func runDocker(ctx context.Context, t *testing.T, imageName, platform string, co
 // removeImage removes a Docker image (best-effort cleanup).
 func removeImage(imageName string) {
 	_ = exec.Command("docker", "rmi", "-f", imageName).Run()
+}
+
+// TestDockerCmdWaitDelay_BoundsInheritedPipeDeadlock is a fast regression guard
+// for the deadlock that the Cmd.WaitDelay assignments on the docker exec helpers
+// above protect against. `docker build` (buildkit) and `docker run` leave a
+// grandchild (docker-buildx / containerd-shim) that inherits a copy of the
+// stdout/stderr pipe. When the context deadline kills the direct child, the
+// pipe-copy goroutine started by Cmd.Start keeps reading and never sees EOF, so
+// Cmd.Wait blocks until the grandchild itself exits — which, for a slow docker
+// build, is long enough to hang the entire serial e2e suite.
+//
+// This reproduces that shape without Docker: a shell that backgrounds a long
+// sleep (the surviving grandchild that holds the inherited stdout pipe) and then
+// blocks in the foreground. The context kills the foreground shell almost
+// immediately, but the backgrounded sleep keeps the pipe open. With WaitDelay
+// set, Cmd.Run must still return promptly; without it, Run would block for the
+// full backgrounded-sleep duration.
+func TestDockerCmdWaitDelay_BoundsInheritedPipeDeadlock(t *testing.T) {
+	// Sanity-check that the production helpers use a non-zero WaitDelay; a zero
+	// value reintroduces the unbounded Cmd.Wait deadlock.
+	require.NotZero(t, dockerCmdWaitDelay, "docker exec helpers must set a non-zero Cmd.WaitDelay")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	const (
+		grandchildLifetime = 30 * time.Second // how long the inherited pipe stays open
+		testWaitDelay      = 1 * time.Second  // short stand-in for dockerCmdWaitDelay
+	)
+
+	// "sleep 30 & sleep 30": the backgrounded sleep inherits stdout and is NOT
+	// killed when CommandContext kills the foreground shell (Cmd.Cancel kills
+	// only the direct PID, not the process group) — exactly like docker-buildx.
+	cmd := exec.CommandContext(ctx, "sh", "-c",
+		fmt.Sprintf("sleep %d & sleep %d", int(grandchildLifetime.Seconds()), int(grandchildLifetime.Seconds())))
+	cmd.WaitDelay = testWaitDelay
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Run() }()
+
+	// Must return within the context deadline + WaitDelay (plus generous slack),
+	// well before the backgrounded grandchild's 30s lifetime.
+	deadline := time.NewTimer(grandchildLifetime - 5*time.Second)
+	defer deadline.Stop()
+	select {
+	case <-done:
+		elapsed := time.Since(start)
+		t.Logf("Cmd.Run returned in %s (grandchild holds pipe for %s)", elapsed, grandchildLifetime)
+		require.Less(t, elapsed, grandchildLifetime-5*time.Second,
+			"WaitDelay should bound the wait well below the inherited-pipe lifetime")
+	case <-deadline.C:
+		t.Fatal("Cmd.Run did not return — inherited-pipe deadlock is not bounded by WaitDelay")
+	}
 }

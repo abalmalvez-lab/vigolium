@@ -1,6 +1,7 @@
 package backup_file_discovery
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"math"
@@ -60,6 +61,12 @@ func (m *Module) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
 	return ctx.Response() != nil
 }
 
+// maxBackupContextBases caps how many base paths the backup walk probes (the web
+// root plus the shallowest context-path prefix). It is deliberately small:
+// generatePaths already emits hundreds of hostname-derived candidates, so each
+// extra base multiplies request volume.
+const maxBackupContextBases = 2
+
 // ScanPerHost probes the host for backup files.
 func (m *Module) ScanPerHost(
 	ctx *httpmsg.HttpRequestResponse,
@@ -74,8 +81,7 @@ func (m *Module) ScanPerHost(
 	host := service.Host()
 
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -83,12 +89,27 @@ func (m *Module) ScanPerHost(
 	fp := m.fingerprint404(ctx, httpClient)
 
 	paths := generatePaths(host)
+
+	// Probe the web root plus the shallowest non-static context-path prefix of the
+	// observed request (e.g. /app), so a backup dropped inside an app mounted under
+	// a sub-path is found too. Bounded to maxBackupContextBases: generatePaths
+	// already yields hundreds of hostname-derived candidates, so a wider walk would
+	// multiply request volume far beyond how webroot backups are typically laid out.
+	bases := []string{""}
+	if urlx, err := ctx.URL(); err == nil {
+		if cb := modkit.CandidateBasePaths(urlx.Path); len(cb) >= maxBackupContextBases {
+			bases = cb[:maxBackupContextBases]
+		}
+	}
+
 	var results []*output.ResultEvent
 
-	for _, path := range paths {
-		result := m.probePath(ctx, httpClient, path, fp)
-		if result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, path := range paths {
+			result := m.probePath(ctx, httpClient, scanCtx, base+path, fp)
+			if result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 
@@ -111,11 +132,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -163,6 +182,34 @@ var sqlMarkers = []string{
 	"PRAGMA", "sqlite",
 }
 
+// hasArchiveMagic reports whether the response body begins with a recognized
+// binary-archive signature. A genuine archive starts with one of these magic
+// byte sequences; a catch-all / error 200 served as application/octet-stream (a
+// common false-positive source) will not. This is the binary-archive equivalent
+// of the SQL content markers.
+func hasArchiveMagic(body string) bool {
+	b := []byte(body)
+	signatures := [][]byte{
+		{0x50, 0x4B, 0x03, 0x04},             // zip / jar / docx (local file header)
+		{0x50, 0x4B, 0x05, 0x06},             // empty zip (end of central directory)
+		{0x1F, 0x8B},                         // gzip
+		{0x42, 0x5A, 0x68},                   // bzip2 ("BZh")
+		{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}, // 7z
+		{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07}, // rar ("Rar!\x1a\x07")
+		{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00}, // xz
+	}
+	for _, sig := range signatures {
+		if bytes.HasPrefix(b, sig) {
+			return true
+		}
+	}
+	// POSIX tar: the "ustar" magic lives at byte offset 257.
+	if len(b) >= 262 && string(b[257:262]) == "ustar" {
+		return true
+	}
+	return false
+}
+
 // isSQLExtension returns true if the path ends with an SQL/dump-related extension.
 func isSQLExtension(path string) bool {
 	lower := strings.ToLower(path)
@@ -177,6 +224,7 @@ func isSQLExtension(path string) bool {
 func (m *Module) probePath(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	path string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
@@ -189,11 +237,9 @@ func (m *Module) probePath(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -240,8 +286,9 @@ func (m *Module) probePath(
 		return nil
 	}
 
-	// Validation differs for SQL/text dumps vs binary archives
-	confidence := severity.Tentative
+	// Validation differs for SQL/text dumps vs binary archives. Findings are
+	// reported at the capped Medium / Tentative level shared by the sensitive-file
+	// family regardless of how strongly the archive validates.
 	if isSQLExtension(path) {
 		// SQL dumps: require at least one marker
 		matched := false
@@ -254,7 +301,6 @@ func (m *Module) probePath(
 		if !matched {
 			return nil
 		}
-		confidence = severity.Firm
 	} else {
 		// Binary archives: validate Content-Type
 		validCT := false
@@ -268,11 +314,38 @@ func (m *Module) probePath(
 			return nil
 		}
 
-		// Additional signal: Content-Disposition header
-		cd := strings.ToLower(resp.Response().Header.Get("Content-Disposition"))
-		if strings.Contains(cd, "attachment") {
-			confidence = severity.Firm
+		// Strict drop-on-fail: require the body to actually begin with a known
+		// archive magic signature. An archive Content-Type alone is trivially
+		// spoofed by a catch-all / error 200 served as octet-stream; the magic
+		// bytes are the real content marker for a binary archive.
+		if !hasArchiveMagic(body) {
+			return nil
 		}
+	}
+
+	// Soft-404 / SPA-shell gate: reject a 200 that is just the host's wildcard
+	// response to a random path.
+	location := resp.Response().Header.Get("Location")
+	if !modkit.ConfirmNotSoft404(scanCtx, httpClient, ctx, status, []byte(body), location) {
+		return nil
+	}
+
+	// Round 2 — reproduce: re-fetch the same path with the cache bypassed; it must
+	// still return a 200 whose body is textually stable, so a one-shot or flapping
+	// response cannot forge a finding. The candidate body is compared against both
+	// the reproduce and decoy bodies, so its signature is built once and reused.
+	bodySig := modkit.BodySignature(body)
+	if repStatus, repBody, repOK := modkit.FetchPath(ctx, httpClient, path); !repOK || repStatus != 200 || !modkit.BodiesSimilarSig(bodySig, repBody) {
+		return nil
+	}
+
+	// Round 3 — decoy baseline: a same-extension random sibling under the same
+	// directory must NOT return an equivalent body. ConfirmNotSoft404 above probes
+	// a no-extension random path and so cannot see an extension-scoped catch-all (a
+	// wildcard that hands back the same archive/dump for every *.zip / *.sql); the
+	// same-extension decoy can.
+	if decoyStatus, decoyBody, served := modkit.DecoyFileBaseline(scanCtx, ctx, httpClient, path); served && decoyStatus == status && modkit.BodiesSimilarSig(bodySig, decoyBody) {
+		return nil
 	}
 
 	// Extract filename from path for display
@@ -292,8 +365,8 @@ func (m *Module) probePath(
 		Info: output.Info{
 			Name:        fmt.Sprintf("Backup File Exposed: %s", filename),
 			Description: fmt.Sprintf("Publicly accessible backup file found at %s. Backup archives may contain source code, database dumps, credentials, or other sensitive data.", path),
-			Severity:    severity.High,
-			Confidence:  confidence,
+			Severity:    severity.Suspect,
+			Confidence:  severity.Tentative,
 			Tags:        []string{"backup-file", "information-disclosure", "misconfiguration"},
 			Reference:   []string{"https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information"},
 		},

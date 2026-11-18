@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for common Rails ecosystem admin panels and background job dashboards that are
-frequently mounted at predictable paths. Checks for Sidekiq, GoodJob, Resque, Delayed Job,
-rack-mini-profiler, ActiveAdmin, and RailsAdmin.
+	ModuleDesc = `**What it means:** A Rails admin panel or background-job dashboard (Sidekiq, GoodJob, Resque, Delayed Job, rack-mini-profiler, ActiveAdmin, RailsAdmin) is reachable at a predictable path and returned a working page with framework-specific markers, not a login screen. These operator interfaces often ship without authentication.
 
-## Notes
-- Sends GET requests to known Rails dashboard paths
-- Checks for framework-specific content markers in response bodies
-- Reports both unauthenticated and auth-gated dashboards
-- Fingerprints 404 responses to avoid false positives
+**How it's exploited:** An attacker browses straight to the dashboard and reads or manipulates job queues and sensitive job arguments, SQL queries and timing traces, or full administrative CRUD over records - leaking internal data and allowing privileged state changes.
 
-## References
-- https://github.com/sidekiq/sidekiq/wiki/Monitoring
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Require authentication and authorization on every dashboard and admin mount, or disable it in production.`
 
 	ModuleConfirmation = "Confirmed when Rails dashboard endpoints return responses containing framework-specific UI markers"
 	ModuleSeverity     = severity.High

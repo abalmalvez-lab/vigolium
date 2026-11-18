@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects blind Server-Side Request Forgery (SSRF) vulnerabilities by injecting OAST callback
-URLs into URL-like parameters. Unlike in-band SSRF detection, this module detects cases where
-the server fetches the URL but does not reflect the response content back to the client.
+	ModuleDesc = `**What it means:** A URL-like parameter (url, uri, redirect, proxy, fetch) makes the server send an outbound request to a client-controlled destination without echoing the response back. This is blind Server-Side Request Forgery (SSRF).
 
-## Notes
-- Requires an interactsh server (configured via oast settings)
-- Targets parameters whose name or value suggests URL input
-- Injects multiple payload formats: direct HTTP/HTTPS, with path, with port, URL-encoded
-- Findings arrive asynchronously via the OAST polling callback
-- Deduplication via RHM and DiskSet to avoid redundant requests
-- OWASP Top 10 2021: A10 (SSRF)
+**How it's exploited:** Confirmed by injecting an out-of-band (OAST) callback URL and seeing the server make a DNS or HTTP request to it. An attacker swaps the callback for internal targets - cloud metadata (169.254.169.254), admin panels, internal services - to scan or pivot.
 
-## References
-- https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
-- https://portswigger.net/web-security/ssrf/blind`
+**Fix:** Allowlist outbound destinations, block private/link-local/loopback ranges and metadata IPs, and disable unneeded schemes and redirect following.`
 
 	ModuleConfirmation = "Confirmed when target server makes outbound DNS or HTTP request to OAST callback URL injected into a URL-like parameter"
 	ModuleSeverity     = severity.High

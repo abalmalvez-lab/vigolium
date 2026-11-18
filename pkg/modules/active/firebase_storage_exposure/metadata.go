@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Extracts Firebase Storage bucket names from crawled responses and probes
-them for public listing and access via the Firebase Storage REST API
-and Google Cloud Storage endpoints.
+	ModuleDesc = `**What it means:** A Firebase Cloud Storage bucket referenced by the app (a storageBucket config value or firebasestorage.googleapis.com URL) allows unauthenticated object listing. The check extracted the bucket name and listed its contents, so anyone can enumerate and likely read the files.
 
-## Notes
-- Extracts storageBucket from Firebase config in HTML/JS responses
-- Tests object listing via Firebase Storage REST API
-- Probes common prefixes: users/, uploads/, exports/, backups/
-- Tests Google Cloud Storage endpoint for alternative public access
-- Non-destructive: all probes are read-only GET requests
-- Deduplicates by bucket name to avoid redundant probing
+**How it's exploited:** An attacker queries the Storage or Google Cloud Storage API to list objects at the root or common prefixes (users/, uploads/, exports/, backups/) and download what is returned, exposing user uploads and backups.
 
-## References
-- https://firebase.google.com/docs/storage/web/start
-- https://firebase.google.com/docs/storage/security`
+**Fix:** Apply restrictive Storage security rules and Google Cloud Storage IAM requiring authentication and per-user authorization, and never leave buckets world-listable.`
 
 	ModuleConfirmation = "Confirmed when Firebase Storage listing endpoint returns HTTP 200 with items or prefixes in JSON response"
 	ModuleSeverity     = severity.High

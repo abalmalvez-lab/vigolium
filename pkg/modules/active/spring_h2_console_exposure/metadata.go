@@ -9,24 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed H2 database web consoles that are commonly enabled during
-development and accidentally left accessible in production Spring Boot deployments.
-The H2 console provides direct database access, enabling SQL execution, data
-exfiltration, and potential remote code execution.
+	ModuleDesc = `**What it means:** An isolated credential-free request reached an H2-specific connection interface and passed soft-404, sibling, and marker-group controls. This is a dangerous development surface, not proof of database access.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Checks common H2 console paths with content markers
-- Fingerprints 404 responses to reduce false positives
-- H2 console exposure in production is critical severity
+**How it's exploited:** If separate credentials or permissive console settings allow a connection, an attacker may execute SQL and potentially abuse H2 capabilities. Login-page reachability alone proves neither authentication bypass nor code execution.
 
-## References
-- https://www.h2database.com/html/tutorial.html
-- https://docs.spring.io/spring-boot/docs/current/reference/html/data.html#data.sql.h2-web-console`
+**Fix:** Disable the H2 console in production (spring.h2.console.enabled to false) or restrict it to localhost with authentication.`
 
-	ModuleConfirmation = "Confirmed when H2 console login page or interface is accessible without authentication"
-	ModuleSeverity     = severity.Critical
+	ModuleConfirmation = "Candidate requires credential-free 200 response with H2-specific marker groups and negative path controls; database or code execution is not tested"
+	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"spring", "java", "misconfiguration", "rce", "light"}
 )

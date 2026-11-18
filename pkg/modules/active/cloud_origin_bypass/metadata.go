@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects when cloud storage origins are directly reachable with weaker security controls
-than the CDN/WAF layer. Identifies CDN presence from headers, extracts origin storage
-URLs from response body, and compares security headers between CDN and origin.
+	ModuleDesc = `**What it means:** The site is served via a CDN (CloudFront, Fastly, Akamai, Cloudflare), but its storage origin (S3, GCS, or Azure Blob) is leaked in the page body and directly reachable, returning content while missing headers the CDN adds (CSP, X-Frame-Options, HSTS).
 
-## Notes
-- Step 1: Detect CDN from CF-Ray, X-Cache, Via, X-Amz-Cf-Id, X-Served-By headers
-- Step 2: Extract origin storage URLs from response body
-- Step 3: Fetch origin directly and compare security headers
-- Flags when origin is reachable with weaker controls (missing CSP, XFO, XCTO, HSTS)
-- Runs once per host with deduplication
+**How it's exploited:** An attacker connecting to the origin directly bypasses the WAF, rate limiting, and edge headers, regaining attack surface like clickjacking, MIME sniffing, or HSTS downgrade.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/
-- https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html`
+**Fix:** Restrict origin access to the CDN only (S3 Origin Access Control, signed requests, or IP allowlisting), and apply the same headers at the origin.`
 
 	ModuleConfirmation = "Confirmed when cloud storage origin is directly reachable with fewer security headers than the CDN-fronted endpoint"
 	ModuleSeverity     = severity.Medium

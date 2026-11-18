@@ -9,18 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects API version indicators in HTTP traffic including URL path patterns,
-version headers, and version fields in JSON response bodies.
+	ModuleDesc = `**What it means:** The application exposes its API version through a URL path (/v1/, /api/v2/), a header (API-Version, X-API-Version, Accept-Version), or a JSON body field. Informational fingerprint, not a vulnerability on its own.
 
-## Notes
-- Detects version patterns in URL paths (e.g., /v1/, /api/v2/)
-- Checks for version-related response headers (API-Version, X-API-Version, Accept-Version)
-- Parses JSON response bodies for version fields
-- Useful for API enumeration and identifying deprecated API versions
+**How it's exploited:** An attacker uses the disclosed version to map the API surface, look up version-specific known issues, and probe for older or deprecated versions (/v1/ alongside /v2/) that may still be reachable but lack newer authorization or validation fixes.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/12-API_Testing/`
+**Fix:** Fully decommission deprecated API versions rather than leaving them accessible, and apply consistent authentication and authorization across every supported version.`
 
 	ModuleConfirmation = "Confirmed when URL path, headers, or response body contain API version indicators"
 	ModuleSeverity     = severity.Info

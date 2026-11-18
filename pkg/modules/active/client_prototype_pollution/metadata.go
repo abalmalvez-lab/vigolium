@@ -9,26 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects client-side prototype pollution vulnerabilities by analyzing JavaScript code
-on the page for known vulnerable URL parameter parsing patterns (sources) and
-exploitable property access patterns (gadgets).
+	ModuleDesc = `**What it means:** Inline or same-origin JavaScript contains a nearby URL-source and recursive merge/property-write pattern associated with client-side prototype pollution. Generic params and cross-origin scripts are excluded.
 
-## Notes
-- Different from server-side prototype pollution: targets browser-side JavaScript, not JSON bodies
-- Analyzes inline scripts and fetches external JS files (skipping CDN libraries)
-- Detects source patterns (jQuery.extend, lodash.merge, custom parsers)
-- Detects gadget patterns (innerHTML, eval, script.src assignments)
-- Sends probe requests to verify URL parameter acceptance
-- Host-level deduplication (scans once per host)
+**How it's exploited:** A real exploit requires the crafted key to reach the write, alter Object.prototype at runtime, and flow into a useful gadget. Gadgets found elsewhere in the page are enrichment, not connected-flow proof.
 
-## References
-- https://portswigger.net/web-security/prototype-pollution
-- https://portswigger.net/web-security/prototype-pollution/client-side
-- https://portswigger.net/research/widespread-prototype-pollution-gadgets`
+**Fix:** Avoid recursive merge of untrusted URL input, strip __proto__ and constructor keys, and use Object.create(null) or Map for parameter stores.`
 
-	ModuleConfirmation = "Confirmed when JavaScript static analysis identifies known prototype pollution source patterns in the page's scripts"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleConfirmation = "Candidate after same-origin source-pattern proximity and optional reachability probe; runtime prototype mutation and source-to-gadget flow remain unconfirmed"
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"prototype-pollution", "xss", "light"}
 )

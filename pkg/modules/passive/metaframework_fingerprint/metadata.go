@@ -9,23 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies newer JavaScript meta-frameworks by analyzing HTML response bodies
-and HTTP headers for framework-specific markers. Complements the existing js-framework-fingerprint
-module which covers Next.js, Nuxt, Angular, React, and Gatsby.
+	ModuleDesc = `**What it means:** The app is built on a JavaScript meta-framework (Remix, Astro, SvelteKit, SolidStart, or Qwik), identified from hydration markers, asset URL patterns, or response headers. Informational recon, not a vulnerability.
 
-## Notes
-- Passive only — does not send any HTTP requests
-- Detects: Remix, Astro, SvelteKit, SolidStart, Qwik
-- Uses strong signals (hydration markers, asset URL patterns, headers) to avoid false positives
-- Deduplicates by host to fingerprint each host only once
+**How it's exploited:** An attacker maps the likely server-side runtime (Node.js), route conventions, and data-loading endpoints, then targets framework-specific issues such as SSR injection, hydration mismatches, or exposed loader/action routes.
 
-## References
-- https://remix.run/docs
-- https://docs.astro.build
-- https://svelte.dev/docs/kit
-- https://start.solidjs.com
-- https://qwik.dev`
+**Fix:** Strip identifying headers and markers only if concealment is desired, and keep the framework and its dependencies patched to current versions.`
 
 	ModuleConfirmation = "Confirmed when framework-specific markers (hydration scripts, asset URL patterns, or headers) are detected in the response"
 	ModuleSeverity     = severity.Info

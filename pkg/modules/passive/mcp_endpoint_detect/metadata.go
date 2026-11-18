@@ -9,23 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects MCP (Model Context Protocol) server endpoints by analyzing HTTP
-responses for JSON-RPC 2.0 structures with MCP-specific methods, SSE event streams,
-and characteristic response headers.
+	ModuleDesc = `**What it means:** A Model Context Protocol (MCP) server endpoint was identified by its JSON-RPC 2.0 traffic, MCP method names, SSE stream, Mcp-Session-Id header, or exposed tools list. MCP servers expose AI tools that read data or perform actions, so an unauthenticated endpoint widens the attack surface.
 
-## Notes
-- Checks response bodies for JSON-RPC 2.0 messages with MCP methods (initialize, tools/list, tools/call)
-- Detects SSE streams (text/event-stream) containing MCP event data
-- Identifies MCP-related response headers (Mcp-Session-Id)
-- Extracts server info and tool names when visible in response bodies
-- One finding per host with all detected MCP indicators
+**How it's exploited:** An attacker maps the exposed tools, probes each for missing authentication, command or path injection, or SSRF, and calls privileged actions directly. Disclosed server info enables version-specific targeting.
 
-## References
-- https://modelcontextprotocol.io/specification/2025-11-25
-- https://modelcontextprotocol.io/specification/2025-11-25/basic/transports`
+**Fix:** Require authentication and authorization on the endpoint, restrict it to trusted networks, and avoid disclosing server version and the tool catalog.`
 
-	ModuleConfirmation = "Confirmed when response contains JSON-RPC 2.0 structure with MCP-specific method names or MCP transport indicators"
+	ModuleConfirmation = "Observation only when multiple protocol-specific indicators or an MCP session header confirm the endpoint; a path name alone never triggers and no vulnerability is inferred"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"mcp", "api-security", "misconfiguration", "light"}

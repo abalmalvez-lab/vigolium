@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for exposed Blazor WebAssembly and Blazor Server endpoints. Blazor WASM
-ships .NET DLL assemblies to the browser; if the boot manifest is accessible,
-attackers can download and decompile all application assemblies to recover source
-code, API keys, and business logic. Blazor Server exposes a SignalR hub that
-reveals real-time communication infrastructure.
+	ModuleDesc = `**What it means:** The target serves ASP.NET Blazor resources without authentication - the WebAssembly boot manifest (/_framework/blazor.boot.json), runtime scripts, the .NET WASM binary, a SignalR negotiate endpoint (/_blazor/negotiate), or a /_content listing. The boot manifest enumerates every .NET assembly shipped to the browser.
 
-## Notes
-- Runs once per host
-- Probes boot manifest, runtime JS, and SignalR negotiate endpoint
-- If boot manifest found, extracts assembly names as evidence
-- Fingerprints 404 to avoid false positives
+**How it's exploited:** Since Blazor WASM runs client-side, an attacker downloads each listed .dll/.wasm and decompiles them with ILSpy or dnSpy to recover source code, embedded API keys, connection strings, and business logic.
 
-## References
-- https://learn.microsoft.com/en-us/aspnet/core/blazor/
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/01-Test_Network_Infrastructure_Configuration`
+**Fix:** Restrict or remove public access to /_framework, /_blazor, and /_content; keep secrets server-side, not in WASM assemblies.`
 
 	ModuleConfirmation = "Confirmed when Blazor boot manifest or framework DLLs are publicly accessible"
 	ModuleSeverity     = severity.Medium

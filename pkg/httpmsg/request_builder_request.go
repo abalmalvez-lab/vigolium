@@ -2,9 +2,18 @@ package httpmsg
 
 import (
 	"fmt"
+	"strings"
 
 	urlutil "github.com/projectdiscovery/utils/url"
 )
+
+// firstRequestLine returns the request line (first line) of a raw HTTP request,
+// scanning only up to the first CR/LF. GetMethod/GetPath only need the request
+// line, so this avoids parsing — and allocating a string copy of — every header
+// line via ExtractAllHeaders on the per-probe hot path.
+func firstRequestLine(request []byte) string {
+	return string(request[:FindLineEnd(request, 0, len(request))])
+}
 
 // request_builder_request.go - HTTP request component manipulation
 //
@@ -39,18 +48,8 @@ func GetMethod(request []byte) (string, error) {
 		return "", nil
 	}
 
-	// Extract headers
-	headers, _, _, err := ExtractAllHeaders(request)
-	if err != nil {
-		return "", err
-	}
-
-	if len(headers) == 0 {
-		return "", nil
-	}
-
-	// Parse request line
-	method, _, _ := parseRequestLineString(headers[0])
+	// Parse only the request line (first line) — no need to parse all headers.
+	method, _, _ := parseRequestLineString(firstRequestLine(request))
 	return method, nil
 }
 
@@ -78,18 +77,8 @@ func GetPath(request []byte) (string, error) {
 		return "", nil
 	}
 
-	// Extract headers
-	headers, _, _, err := ExtractAllHeaders(request)
-	if err != nil {
-		return "", err
-	}
-
-	if len(headers) == 0 {
-		return "", nil
-	}
-
-	// Parse request line
-	_, path, _ := parseRequestLineString(headers[0])
+	// Parse only the request line (first line) — no need to parse all headers.
+	_, path, _ := parseRequestLineString(firstRequestLine(request))
 	return path, nil
 }
 
@@ -161,27 +150,64 @@ func GetURLFromService(request []byte, httpService *Service) (*urlutil.URL, erro
 		return nil, fmt.Errorf("failed to extract path: %w", err)
 	}
 
+	// Absolute-form request target (RFC 9112 §3.2.2, the proxy-style
+	// "GET http://host/path HTTP/1.1" some Burp/proxy exports emit): the request
+	// line already carries the full URL, so parse it directly. Prepending
+	// scheme://host as below would double it into an invalid URL (e.g.
+	// "http://host:8899http://host:8899/path" → "invalid port"), which silently
+	// dropped the whole request from the scan.
+	if isAbsoluteFormTarget(path) {
+		// isAbsoluteFormTarget accepts the scheme case-insensitively, but the
+		// downstream parser's scheme allow-list is case-sensitive and rejects an
+		// uppercase scheme ("HTTP://host/path" → "invalid scheme"), which would
+		// silently drop the whole request. Normalize the scheme first.
+		return urlutil.ParseAbsoluteURL(lowercaseScheme(path), false)
+	}
+
 	// If path is empty, default to "/"
 	if path == "" {
 		path = "/"
 	}
 
-	// Build URL string: scheme://host:port/path
 	scheme := httpService.Protocol()
 	host := httpService.Host()
 	port := httpService.Port()
 
-	// Format host:port (omit default ports)
-	hostPort := host
+	// Build "scheme://host[:port]path" with a strings.Builder rather than two
+	// fmt.Sprintf calls (reflection overhead per probe).
+	var b strings.Builder
+	b.Grow(len(scheme) + 3 + len(host) + 6 + len(path))
+	b.WriteString(scheme)
+	b.WriteString("://")
+	b.WriteString(host)
+	// Append :port only for non-default ports.
 	if (scheme == "http" && port != 80) || (scheme == "https" && port != 443) {
-		hostPort = fmt.Sprintf("%s:%d", host, port)
+		b.WriteByte(':')
+		b.WriteString(intToString(port))
 	}
-
-	// Construct full URL
-	urlStr := fmt.Sprintf("%s://%s%s", scheme, hostPort, path)
+	b.WriteString(path)
 
 	// Parse into urlutil.URL to populate all fields (including Params)
-	return urlutil.ParseAbsoluteURL(urlStr, false)
+	return urlutil.ParseAbsoluteURL(b.String(), false)
+}
+
+// isAbsoluteFormTarget reports whether a request-line target is in absolute form
+// (already a full http:// or https:// URL) rather than the usual origin form
+// ("/path?query"). Case-insensitive on the scheme.
+func isAbsoluteFormTarget(target string) bool {
+	return len(target) >= 7 && strings.EqualFold(target[:7], "http://") ||
+		len(target) >= 8 && strings.EqualFold(target[:8], "https://")
+}
+
+// lowercaseScheme lowercases only the scheme prefix (up to and including "://")
+// of an absolute-form URL, leaving host, path, and query untouched. It returns
+// the input unchanged when there is no "://" separator.
+func lowercaseScheme(target string) string {
+	idx := strings.Index(target, "://")
+	if idx <= 0 {
+		return target
+	}
+	return strings.ToLower(target[:idx]) + target[idx:]
 }
 
 // GetHTTPVersion extracts the HTTP version from a request.
@@ -856,8 +882,10 @@ func HasBody(request []byte) (bool, error) {
 //
 // Algorithm:
 //  1. Extract headers
-//  2. Build new request with headers + new body
-//  3. Update Content-Length header
+//  2. Set Content-Length for the new body (when there is a body or the
+//     request already carried the header)
+//  3. Build the request once: the body is copied a single time, which
+//     matters for multi-MiB bodies
 //
 // Parameters:
 //   - request: HTTP request bytes
@@ -882,11 +910,17 @@ func SetBody(request []byte, body []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Build request with new body
-	rebuilt := BuildHttpMessage(headers, body)
+	if headers == nil {
+		return UpdateContentLength(BuildHttpMessage(headers, body))
+	}
 
-	// Update Content-Length
-	return UpdateContentLength(rebuilt)
+	// Same Content-Length rule as UpdateContentLength, applied before the
+	// build so the body is not copied a second time.
+	if len(body) > 0 || Header(headers, "Content-Length") != "" {
+		headers = removeHeaderFromList(headers, "Content-Length")
+		headers = append(headers, "Content-Length: "+intToString(len(body)))
+	}
+	return BuildHttpMessage(headers, body), nil
 }
 
 // SetBodyString replaces the body with a string value.

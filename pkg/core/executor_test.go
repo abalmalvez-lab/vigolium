@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/http"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
@@ -47,12 +49,12 @@ func TestModuleFindingAllowed(t *testing.T) {
 	t.Run("cap enforced", func(t *testing.T) {
 		e := &Executor{cfg: ExecutorConfig{MaxFindingsPerModule: 3}}
 		for i := 0; i < 3; i++ {
-			if !e.moduleFindingAllowed("test-mod") {
+			if !e.moduleFindingAllowed("id-"+strconv.Itoa(i), "test-mod") {
 				t.Fatalf("call %d should be allowed", i+1)
 			}
 		}
 		for i := 0; i < 2; i++ {
-			if e.moduleFindingAllowed("test-mod") {
+			if e.moduleFindingAllowed("id-"+strconv.Itoa(i), "test-mod") {
 				t.Fatalf("call %d past cap should be denied", i+4)
 			}
 		}
@@ -60,13 +62,13 @@ func TestModuleFindingAllowed(t *testing.T) {
 
 	t.Run("independent modules", func(t *testing.T) {
 		e := &Executor{cfg: ExecutorConfig{MaxFindingsPerModule: 1}}
-		if !e.moduleFindingAllowed("mod-a") {
+		if !e.moduleFindingAllowed("a1", "mod-a") {
 			t.Fatal("mod-a first call should be allowed")
 		}
-		if e.moduleFindingAllowed("mod-a") {
+		if e.moduleFindingAllowed("a2", "mod-a") {
 			t.Fatal("mod-a second call should be denied")
 		}
-		if !e.moduleFindingAllowed("mod-b") {
+		if !e.moduleFindingAllowed("b1", "mod-b") {
 			t.Fatal("mod-b should be independent and allowed")
 		}
 	})
@@ -74,7 +76,7 @@ func TestModuleFindingAllowed(t *testing.T) {
 	t.Run("cap zero means unlimited", func(t *testing.T) {
 		e := &Executor{cfg: ExecutorConfig{MaxFindingsPerModule: 0}}
 		for i := 0; i < 100; i++ {
-			if !e.moduleFindingAllowed("test-mod") {
+			if !e.moduleFindingAllowed("id-"+strconv.Itoa(i), "test-mod") {
 				t.Fatalf("call %d should be allowed with cap 0", i+1)
 			}
 		}
@@ -137,6 +139,7 @@ func newTestExecutor(cfg ExecutorConfig, passiveMods []modules.PassiveModule) (*
 		perRequestPassive: filterPassiveModulesByScanScope(passiveMods, modules.ScanScopeRequest),
 		perHostPassive:    filterPassiveModulesByScanScope(passiveMods, modules.ScanScopeHost),
 		caches:            scanCaches{requestUUIDs: newShardedMap(1)},
+		pool:              workerPool{itemSlots: make(chan struct{}, 4), sched: newActiveScheduler(32, nil)},
 	}
 	return e, &resultCount
 }
@@ -239,9 +242,9 @@ func TestFeedbackChannel(t *testing.T) {
 
 func TestParamFindingLocationKeyNormalization(t *testing.T) {
 	item, _ := makeTestItem("example.com", "/users?id=1", "<html>body</html>")
-	got := paramFindingLocationKeyFromItem(item.Request)
+	got := modkit.ParamFindingKey(item.Request)
 	if got != "https://example.com/users" {
-		t.Fatalf("paramFindingLocationKeyFromItem() = %q, want %q", got, "https://example.com/users")
+		t.Fatalf("modkit.ParamFindingKey() = %q, want %q", got, "https://example.com/users")
 	}
 
 	result := &output.ResultEvent{
@@ -249,8 +252,8 @@ func TestParamFindingLocationKeyNormalization(t *testing.T) {
 		Matched:          "https://example.com/users?id=1",
 		FuzzingParameter: "id",
 	}
-	if key := paramFindingLocationKeyFromResult(result); key != got {
-		t.Fatalf("paramFindingLocationKeyFromResult() = %q, want %q", key, got)
+	if key := modkit.ParamFindingKeyFromResult(result); key != got {
+		t.Fatalf("modkit.ParamFindingKeyFromResult() = %q, want %q", key, got)
 	}
 }
 
@@ -395,9 +398,10 @@ func TestRunActiveWithTimeout_FastCompletes(t *testing.T) {
 	_, item := makeTestItem("example.com", "/", "ok")
 	want := []*output.ResultEvent{{}}
 
-	got, completed := e.runActiveWithTimeout(context.Background(),
-		func(context.Context) ([]*output.ResultEvent, error) { return want, nil },
-		&fakeActiveModule{id: "fast"}, item)
+	res := e.runActiveWithTimeout(context.Background(),
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) { return want, nil },
+		&fakeActiveModule{id: "fast"}, item, nil, func() {}, 0)
+	got, completed := res.events, res.completed
 
 	if !completed {
 		t.Fatal("expected completed=true for a fast module")
@@ -412,12 +416,13 @@ func TestRunActiveWithTimeout_SlowTimesOut(t *testing.T) {
 	_, item := makeTestItem("example.com", "/", "ok")
 
 	start := time.Now()
-	got, completed := e.runActiveWithTimeout(context.Background(),
-		func(context.Context) ([]*output.ResultEvent, error) {
+	res := e.runActiveWithTimeout(context.Background(),
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
 			time.Sleep(2 * time.Second)
 			return []*output.ResultEvent{{}}, nil
 		},
-		&fakeActiveModule{id: "slow"}, item)
+		&fakeActiveModule{id: "slow"}, item, nil, func() {}, 0)
+	got, completed := res.events, res.completed
 
 	if completed {
 		t.Fatal("expected completed=false when the module exceeds its timeout")
@@ -437,12 +442,13 @@ func TestRunActiveWithTimeout_TimeoutHinterRaisesBound(t *testing.T) {
 	_, item := makeTestItem("example.com", "/", "ok")
 	want := []*output.ResultEvent{{}}
 
-	got, completed := e.runActiveWithTimeout(context.Background(),
-		func(context.Context) ([]*output.ResultEvent, error) {
+	res := e.runActiveWithTimeout(context.Background(),
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
 			time.Sleep(80 * time.Millisecond)
 			return want, nil
 		},
-		&fakeActiveHinterModule{fakeActiveModule{id: "hinted"}, time.Second}, item)
+		&fakeActiveHinterModule{fakeActiveModule{id: "hinted"}, time.Second}, item, nil, func() {}, 0)
+	got, completed := res.events, res.completed
 
 	if !completed {
 		t.Fatal("expected completed=true: TimeoutHint should raise the bound above the default")
@@ -456,9 +462,10 @@ func TestRunActiveWithTimeout_ModuleErrorMarksCompleted(t *testing.T) {
 	e := &Executor{cfg: ExecutorConfig{ActiveModuleTimeout: 200 * time.Millisecond}}
 	_, item := makeTestItem("example.com", "/", "ok")
 
-	got, completed := e.runActiveWithTimeout(context.Background(),
-		func(context.Context) ([]*output.ResultEvent, error) { return nil, fmt.Errorf("boom") },
-		&fakeActiveModule{id: "errs"}, item)
+	res := e.runActiveWithTimeout(context.Background(),
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) { return nil, fmt.Errorf("boom") },
+		&fakeActiveModule{id: "errs"}, item, nil, func() {}, 0)
+	got, completed := res.events, res.completed
 
 	// A module that returns an error still "completed" (it ran to conclusion);
 	// the caller skips processResults because there are no results.
@@ -480,12 +487,13 @@ func TestRunActiveWithTimeout_CanceledCtxReturnsPromptly(t *testing.T) {
 	cancel()
 
 	start := time.Now()
-	got, completed := e.runActiveWithTimeout(ctx,
-		func(context.Context) ([]*output.ResultEvent, error) {
+	res := e.runActiveWithTimeout(ctx,
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
 			time.Sleep(2 * time.Second) // leaked goroutine drains into the buffered chan
 			return []*output.ResultEvent{{}}, nil
 		},
-		&fakeActiveModule{id: "blocked"}, item)
+		&fakeActiveModule{id: "blocked"}, item, nil, func() {}, 0)
+	got, completed := res.events, res.completed
 
 	if completed {
 		t.Fatal("expected completed=false when the phase context is canceled")
@@ -495,6 +503,162 @@ func TestRunActiveWithTimeout_CanceledCtxReturnsPromptly(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("expected prompt return on canceled ctx, took %s", elapsed)
+	}
+}
+
+// TestRunActiveWithTimeout_TimeoutIsCounted verifies that a genuine per-module
+// timeout (the watchdog timer fires while the parent ctx is alive) increments
+// the timed-out counter surfaced in the status line.
+func TestRunActiveWithTimeout_TimeoutIsCounted(t *testing.T) {
+	e := &Executor{cfg: ExecutorConfig{ActiveModuleTimeout: 20 * time.Millisecond}}
+	_, item := makeTestItem("example.com", "/", "ok")
+
+	res := e.runActiveWithTimeout(context.Background(),
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
+			time.Sleep(2 * time.Second)
+			return nil, nil
+		},
+		&fakeActiveModule{id: "slowcount"}, item, nil, func() {}, 0)
+	completed := res.completed
+
+	if completed {
+		t.Fatal("expected completed=false on timeout")
+	}
+	if n := e.timedOutCount(); n != 1 {
+		t.Fatalf("a genuine per-module timeout should be counted once, got %d", n)
+	}
+}
+
+// TestRunActiveWithTimeout_ParentCancelNotCounted verifies that parent-context
+// cancellation while a module is mid-flight returns promptly but is NOT counted
+// as a per-module timeout — the watchdog (t.C) and the parent-cancel (ctx.Done())
+// paths are distinct.
+func TestRunActiveWithTimeout_ParentCancelNotCounted(t *testing.T) {
+	e := &Executor{cfg: ExecutorConfig{ActiveModuleTimeout: 10 * time.Second}}
+	_, item := makeTestItem("example.com", "/", "ok")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	res := e.runActiveWithTimeout(ctx,
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
+			time.Sleep(2 * time.Second)
+			return []*output.ResultEvent{{}}, nil
+		},
+		&fakeActiveModule{id: "interrupted"}, item, nil, func() {}, 0)
+	completed := res.completed
+
+	if completed {
+		t.Fatal("expected completed=false on parent cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected prompt return on parent cancel, took %s", elapsed)
+	}
+	if n := e.timedOutCount(); n != 0 {
+		t.Fatalf("parent cancellation must not be counted as a module timeout, got %d", n)
+	}
+}
+
+// TestRunActiveWithTimeout_PooledTimerReuse runs fast → slow(timeout) → fast on
+// the same executor so the recycled watchdog timer is exercised. A stale fire
+// from the pooled timer would make the final fast call spuriously time out.
+func TestRunActiveWithTimeout_PooledTimerReuse(t *testing.T) {
+	e := &Executor{cfg: ExecutorConfig{ActiveModuleTimeout: 30 * time.Millisecond}}
+	_, item := makeTestItem("example.com", "/", "ok")
+	fast := func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
+		return []*output.ResultEvent{{}}, nil
+	}
+	slow := func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
+		time.Sleep(300 * time.Millisecond)
+		return []*output.ResultEvent{{}}, nil
+	}
+
+	if o := e.runActiveWithTimeout(context.Background(), fast, &fakeActiveModule{id: "r1"}, item, nil, func() {}, 0); !o.completed {
+		t.Fatal("first fast call should complete")
+	}
+	if o := e.runActiveWithTimeout(context.Background(), slow, &fakeActiveModule{id: "r2"}, item, nil, func() {}, 0); o.completed {
+		t.Fatal("slow call should time out")
+	}
+	res := e.runActiveWithTimeout(context.Background(), fast, &fakeActiveModule{id: "r3"}, item, nil, func() {}, 0)
+	got, ok := res.events, res.completed
+	if !ok {
+		t.Fatal("final fast call should complete — a pooled timer must not carry a stale fire")
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result from final fast call, got %d", len(got))
+	}
+}
+
+// TestRunActiveWithTimeout_SlotHeldUntilWorkUnwinds verifies the active-task slot
+// is released when the module's real work finishes, NOT when the wrapper gives up
+// on a per-module timeout. Otherwise the executor could admit replacement work
+// while an abandoned scan still holds a connection, so the concurrency cap would
+// understate true in-flight work.
+func TestRunActiveWithTimeout_SlotHeldUntilWorkUnwinds(t *testing.T) {
+	e := &Executor{cfg: ExecutorConfig{ActiveModuleTimeout: 20 * time.Millisecond}}
+	_, item := makeTestItem("example.com", "/", "ok")
+
+	var released atomic.Bool
+	workDone := make(chan struct{})
+
+	res := e.runActiveWithTimeout(context.Background(),
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) {
+			<-workDone // block until the test lets the "real work" finish
+			return []*output.ResultEvent{{}}, nil
+		},
+		&fakeActiveModule{id: "held"}, item, nil,
+		func() { released.Store(true) }, 0)
+	completed := res.completed
+
+	if completed {
+		t.Fatal("expected completed=false: the module overran its timeout")
+	}
+	// The wrapper has returned on timeout, but the background scan is still blocked,
+	// so the slot must NOT have been released yet.
+	if released.Load() {
+		t.Fatal("slot released while the abandoned scan is still running")
+	}
+
+	close(workDone) // let the real work unwind
+	// The release runs in the background goroutine's defer; poll briefly for it.
+	deadline := time.Now().Add(time.Second)
+	for !released.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("slot was never released after the real work finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestRunPassiveWithTimeout_FastAndSlow exercises the passive timeout wrapper:
+// a fast module returns its results; a module that overruns the bound is
+// abandoned (nil) and returns promptly rather than blocking the worker.
+func TestRunPassiveWithTimeout_FastAndSlow(t *testing.T) {
+	e := &Executor{cfg: ExecutorConfig{PassiveModuleTimeout: 20 * time.Millisecond}}
+	_, item := makeTestItem("example.com", "/", "ok")
+	mod := &contextualPassiveModule{id: "p"}
+
+	want := []*output.ResultEvent{{}}
+	got := e.runPassiveWithTimeout(context.Background(),
+		func(context.Context) ([]*output.ResultEvent, error) { return want, nil }, mod, item)
+	if len(got) != 1 {
+		t.Fatalf("fast passive: expected 1 result, got %d", len(got))
+	}
+
+	start := time.Now()
+	got = e.runPassiveWithTimeout(context.Background(),
+		func(context.Context) ([]*output.ResultEvent, error) {
+			time.Sleep(2 * time.Second)
+			return want, nil
+		}, mod, item)
+	if got != nil {
+		t.Fatalf("slow passive: expected nil on timeout, got %d", len(got))
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("slow passive: expected prompt timeout return, took %s", elapsed)
 	}
 }
 
@@ -684,5 +848,66 @@ func TestPassiveFlushSkippedWhenWorkerAbandoned(t *testing.T) {
 
 	if flusher.flushed.Load() {
 		t.Fatal("Flush ran while a worker was still abandoned in flight — this is the race the guard must prevent")
+	}
+}
+
+// TestRunScanFnGuardedRecoversPanic verifies a module panic is converted to an
+// error value rather than unwinding the goroutine (CR-06). Without the recover
+// this would crash the test binary.
+func TestRunScanFnGuardedRecoversPanic(t *testing.T) {
+	t.Parallel()
+	e, _ := newTestExecutor(ExecutorConfig{}, nil)
+
+	events, err := e.runScanFnGuarded(context.Background(), "boom-module", func(context.Context) ([]*output.ResultEvent, error) {
+		panic("kaboom")
+	})
+	if err == nil {
+		t.Fatal("expected an error from a panicking module, got nil")
+	}
+	if !strings.Contains(err.Error(), "boom-module") {
+		t.Fatalf("error should name the panicking module, got: %v", err)
+	}
+	if events != nil {
+		t.Fatalf("expected nil events on panic, got %d", len(events))
+	}
+
+	// A non-panicking call passes its return through unchanged.
+	want := []*output.ResultEvent{{}}
+	got, err := e.runScanFnGuarded(context.Background(), "ok", func(context.Context) ([]*output.ResultEvent, error) {
+		return want, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error from clean call: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d passthrough events, got %d", len(want), len(got))
+	}
+}
+
+// TestRunActiveWithTimeoutRecoversPanic drives the real watchdog goroutine path:
+// a panicking active scan function must complete cleanly (result "completed" with
+// no events), release its slot, and never crash the process (CR-06).
+func TestRunActiveWithTimeoutRecoversPanic(t *testing.T) {
+	t.Parallel()
+	e, _ := newTestExecutor(ExecutorConfig{}, nil)
+	mod := &activeStub{id: "panic-active", scopes: modkit.ScanScopeRequest, canProc: true}
+	_, item := makeTestItem("example.com", "/boom", "<html>x</html>")
+
+	released := make(chan struct{})
+	res := e.runActiveWithTimeout(context.Background(),
+		func(context.Context, *http.Requester) ([]*output.ResultEvent, error) { panic("boom") },
+		mod, item, nil, func() { close(released) }, 0)
+	events, completed := res.events, res.completed
+
+	if !completed {
+		t.Fatal("a recovered panic should report completed=true (it produced a result), not a timeout")
+	}
+	if events != nil {
+		t.Fatalf("expected nil events from a panicking module, got %d", len(events))
+	}
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("releaseSlot was never called — the slot would leak after a module panic")
 	}
 }

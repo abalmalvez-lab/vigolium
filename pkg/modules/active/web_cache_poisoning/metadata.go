@@ -9,22 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects web cache poisoning vulnerabilities by injecting values via unkeyed headers
-(X-Forwarded-Host, X-Forwarded-Scheme, X-Original-URL) and checking for reflection.
+	ModuleDesc = `**What it means:** A fresh unkeyed-header value appeared in a shared-cacheable response but not the clean baseline. Tests use a unique query key. Reflection is a candidate; repeated header-free replay to a separate client is a finding.
 
-## Notes
-- Tests unkeyed headers that may influence cached responses
-- Checks for header value reflection in response body
-- Analyzes cache-related headers (Age, X-Cache, Cache-Control)
-- Runs per-request to test endpoint-specific caching behavior
+**How it's exploited:** An attacker injects a value that the shared cache stores and serves to later visitors.
 
-## References
-- https://portswigger.net/web-security/web-cache-poisoning
-- https://portswigger.net/research/practical-web-cache-poisoning`
+**Fix:** Include influential headers in the cache key, strip untrusted forwarding headers, or mark the response uncacheable.`
 
-	ModuleConfirmation = "Confirmed when unkeyed header values are reflected in the response body, indicating cache-poisoning potential"
-	ModuleSeverity     = severity.High
-	ModuleConfidence   = severity.Firm
+	ModuleConfirmation = "Candidate on fresh reflection plus explicit cacheability; confirmed only by repeated clean cross-client replay of the injected value"
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"cache-poisoning", "header-security", "moderate"}
 )

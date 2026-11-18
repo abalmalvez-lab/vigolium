@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +16,8 @@ import (
 	agentprompt "github.com/vigolium/vigolium/pkg/agent/prompt"
 	"github.com/vigolium/vigolium/pkg/audit/claudecost"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/olium"
+	"github.com/vigolium/vigolium/pkg/olium/skill"
 
 	"go.uber.org/zap"
 )
@@ -37,6 +41,11 @@ type SwarmConfig struct {
 	// on the CLI. Has no effect when DryRun is true (DryRun still skips Phase 2).
 	ForceExtensions bool
 
+	// Skill selection (planner-driven loading overrides)
+	SkillNames    []string // --skill: force-include these skills, bypassing planner judgement
+	SkillTags     []string // --skill-tag: force-include every skill carrying one of these tags
+	NoSkillFilter bool     // --no-skill-filter: load the full skill set, ignore planner selection
+
 	// Scanning parameters
 	VulnType         string   // optional: focus on specific vulnerability type
 	Focus            string   // optional: broad strategic hint (e.g. "API injection", "auth bypass")
@@ -54,9 +63,9 @@ type SwarmConfig struct {
 	ShowPrompt         bool   // print rendered prompts to stderr before executing
 	SourceAnalysisOnly bool   // run only source analysis phase and exit
 	CodeAudit          bool   // enable AI security code audit phase (--code-audit)
-	Browser            bool   // enable agent-browser integration (--browser)
-	Auth               bool   // run browser-based auth phase before discovery (--browser-auth, requires Browser)
-	Credentials        string // optional credentials for browser auth phase (--credentials)
+	Browser            bool   // enable agent-browser integration (always on for swarm; no --browser flag)
+	Auth               bool   // run browser-based auth phase before discovery (--browser-auth)
+	Credentials        string // optional credentials for the browser auth phase (extracted from the prompt)
 	CredentialSets     []agenttypes.IntentCredentialSet
 	AuthRequired       bool
 	RequiresBrowser    bool
@@ -132,6 +141,19 @@ type SwarmConfig struct {
 	// Audit is the background-audit cfg slot — backed by either audit or
 	// piolium per AuditHarness. Requires SourcePath to be non-empty. Field
 	// name is legacy; the runtime is harness-agnostic.
+	// Run budgets (--max-commands / --token-budget / --max-cost-usd): caps on
+	// the cumulative tool calls, input+output tokens and estimated USD cost
+	// across every agent call of the run (Engine.SetRunBudget). Zero = no cap.
+	// Hitting one stops the run with SwarmResult.BudgetStop set and the
+	// agentic_scans row at "budget_exhausted".
+	MaxCommands int
+	TokenBudget int64
+	MaxCostUSD  float64
+
+	// SkipPreflight skips the provider ping before the first phase
+	// (--no-preflight). The ping's deadline is agent.olium.preflight_timeout.
+	SkipPreflight bool
+
 	Audit *config.AuditAgentConfig
 
 	// AuditHarness selects which harness backs the Audit cfg. Zero-valued
@@ -152,6 +174,12 @@ const (
 type SwarmRunner struct {
 	engine *Engine
 	repo   *database.Repository
+
+	// skills is the full skill registry loaded once at the start of Run
+	// (~/.vigolium/skills + project scopes + embedded). The plan phase sees
+	// the full menu; the triage phase gets a planner-filtered subset. nil when
+	// loading failed — phases then run without skills.
+	skills *skill.Registry
 
 	// extensionCache memoises successful runExtensionAgent results within
 	// a process lifetime, keyed by a hash of (target + focus areas +
@@ -182,6 +210,41 @@ func NewSwarmRunner(engine *Engine, repo *database.Repository) *SwarmRunner {
 		engine: engine,
 		repo:   repo,
 	}
+}
+
+// selectTriageSkills computes the planner-filtered skill registry handed to
+// the triage agent: the plan's recommended_skills unioned with the always-on
+// set and any operator override (--skill / --skill-tag), or the full set under
+// --no-skill-filter. Returns nil when no skills are loaded. Emits a one-line
+// summary of the selection to stderr so the operator sees what triage will use.
+func (s *SwarmRunner) selectTriageSkills(cfg SwarmConfig, result *SwarmResult) *skill.Registry {
+	if s.skills == nil || s.skills.Len() == 0 {
+		return nil
+	}
+	var picks []string
+	if result != nil && result.SwarmPlan != nil {
+		picks = result.SwarmPlan.RecommendedSkills
+	}
+	var alwaysOn []string
+	if s.engine != nil && s.engine.settings != nil {
+		alwaysOn = s.engine.settings.Agent.Olium.EffectiveAlwaysOnSkills()
+	}
+	sel, warnings := s.skills.Select(skill.SelectOptions{
+		Picks:         picks,
+		AlwaysOn:      alwaysOn,
+		Forced:        cfg.SkillNames,
+		ForcedTags:    cfg.SkillTags,
+		DisableFilter: cfg.NoSkillFilter,
+	})
+	for _, w := range warnings {
+		zap.L().Warn(w)
+	}
+	if sel == nil || sel.Len() == 0 {
+		return sel
+	}
+	fmt.Fprintf(os.Stderr, "[swarm] triage loading %d of %d skill(s): %s\n",
+		sel.Len(), s.skills.Len(), strings.Join(sel.Names(), ", "))
+	return sel
 }
 
 // persistPhase updates the agent run's current phase in the database.
@@ -226,6 +289,16 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 	if cfg.AgentName == "" && s.engine != nil && s.engine.settings != nil {
 		cfg.AgentName = s.engine.settings.Agent.DefaultAgent
 	}
+
+	// Load the skill registry once for the whole run. The plan phase sees the
+	// full menu and selects a subset (plan.recommended_skills); the triage
+	// phase loads the planner-selected subset plus the always-on set. includeUser
+	// surfaces ~/.vigolium/skills/. Loading is best-effort — a failure just runs
+	// the phases without skills.
+	s.skills, _ = olium.LoadSkillsFor(true)
+	if s.skills != nil && s.skills.Len() > 0 {
+		fmt.Fprintf(os.Stderr, "[swarm] %d skills available (planner selects a subset for triage)\n", s.skills.Len())
+	}
 	var protocol, model string
 	if s.engine != nil && s.engine.settings != nil {
 		protocol, model = s.engine.settings.Agent.BackendMeta()
@@ -234,6 +307,14 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 	agenticScanUUID := cfg.AgenticScanUUID
 	if agenticScanUUID == "" {
 		agenticScanUUID = uuid.New().String()
+	}
+	// Ensure a run-unique native scan_uuid. Scan callbacks receive it via
+	// ScanRequest.ScanUUID and tag the native scan's findings with it, so the
+	// pipeline can stamp agentic_scan_uuid onto exactly this run's findings and
+	// scope its finding counts to the run rather than the whole project. Empty
+	// slips through when a caller (e.g. the server) didn't pin one.
+	if cfg.ScanUUID == "" {
+		cfg.ScanUUID = uuid.New().String()
 	}
 	agenticScan := &database.AgenticScan{
 		UUID:        agenticScanUUID,
@@ -273,12 +354,30 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 
 	result := &SwarmResult{AgenticScanUUID: agenticScanUUID}
 
+	// The parent ctx may expire (--max-duration) or be cancelled by the
+	// budget below; the run row is still finalized after that, so its writes
+	// go through a context that outlives the run's.
+	finalizeCtx := context.WithoutCancel(ctx)
+
+	// Run budget: the engine charges every agent call; the first cap crossed
+	// cancels the run with a *BudgetExhaustedError cause.
+	budget := RunBudget{MaxCommands: cfg.MaxCommands, TokenBudget: cfg.TokenBudget, MaxCostUSD: cfg.MaxCostUSD, Model: model}
+	if s.engine != nil && budget.Active() {
+		var cancelBudget context.CancelCauseFunc
+		ctx, cancelBudget = context.WithCancelCause(ctx)
+		defer cancelBudget(nil)
+		s.engine.SetRunBudget(budget, func(b *BudgetExhaustedError) {
+			fmt.Fprintf(os.Stderr, "[swarm] %s — stopping\n", b.Reason)
+			cancelBudget(b)
+		})
+	}
+
 	// Fail fast on a broken olium provider so callers don't pay for
 	// normalize + discovery before the very first LLM call dies on a
 	// missing credential. Mirrors autopilot's RunAutonomous preflight.
 	var err error
-	if s.engine != nil {
-		if perr := s.engine.Preflight(cfg.AgentName); perr != nil {
+	if s.engine != nil && !cfg.SkipPreflight {
+		if perr := s.engine.Preflight(ctx); perr != nil {
 			err = fmt.Errorf("swarm preflight failed: %w", perr)
 		}
 	}
@@ -322,18 +421,33 @@ func (s *SwarmRunner) Run(ctx context.Context, cfg SwarmConfig) (*SwarmResult, e
 		}
 	}
 
-	if err != nil {
-		agenticScan.Status = "failed"
+	var budgetErr *BudgetExhaustedError
+	if s.engine != nil {
+		budgetErr = s.engine.BudgetExhausted()
+	}
+	if budgetErr != nil {
+		result.BudgetStop = budgetErr.Stop
+	}
+	end := database.AgenticRunEnd{
+		Err:             err,
+		TimedOut:        err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded),
+		BudgetExhausted: budgetErr != nil,
+		Cancelled:       err != nil && budgetErr == nil && errors.Is(ctx.Err(), context.Canceled),
+		Degraded:        result.Degraded,
+	}
+	result.TimedOut = end.TimedOut
+	agenticScan.Status = database.AgenticRunStatus(end)
+	switch {
+	case budgetErr != nil:
+		agenticScan.ErrorMessage = budgetErr.Reason
+	case err != nil:
 		agenticScan.ErrorMessage = err.Error()
-	} else if result.Degraded {
-		agenticScan.Status = "completed_with_warnings"
+	case result.Degraded:
 		agenticScan.ErrorMessage = strings.Join(result.Warnings, "\n")
-	} else {
-		agenticScan.Status = "completed"
 	}
 
 	if s.repo != nil {
-		if updateErr := s.repo.UpdateAgenticScan(ctx, agenticScan); updateErr != nil {
+		if updateErr := s.repo.UpdateAgenticScan(finalizeCtx, agenticScan); updateErr != nil {
 			zap.L().Warn("Failed to update agent run record", zap.Error(updateErr))
 		}
 	}

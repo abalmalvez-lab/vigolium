@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/gson"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 )
@@ -57,6 +59,83 @@ func createTestEntry(url string) *TrafficEntry {
 			Body:    []byte{},
 		},
 		ResourceType: "Document",
+	}
+}
+
+// TestWriteEntryParamValueVariantsKept verifies that up to maxParamVariants
+// DISTINCT query-value variants of one endpoint shape survive dedup, that further
+// variants collapse back onto the shape, and that exact repeats are still dropped.
+func TestWriteEntryParamValueVariantsKept(t *testing.T) {
+	mock := &mockWriter{}
+	capture := &Capture{
+		writer:           mock,
+		logged:           make(map[string]struct{}),
+		seenHashes:       make(map[string]bool),
+		shapeVariants:    make(map[string]int),
+		maxParamVariants: 3,
+		noColor:          true,
+	}
+
+	// Five distinct category values of the same shape (/catalog?category=…).
+	for _, v := range []string{"Books", "Gin", "Juice", "Accessories", "Accompaniments"} {
+		capture.writeEntry(createTestEntry("https://example.com/catalog?category=" + v))
+	}
+
+	// Only the first 3 distinct variants are kept; the rest collapse onto the shape.
+	if mock.getWriteCount() != 3 {
+		t.Errorf("Expected 3 variants written (cap=3), got %d", mock.getWriteCount())
+	}
+	if capture.duplicateCount != 2 {
+		t.Errorf("Expected 2 over-cap variants dropped, got %d", capture.duplicateCount)
+	}
+
+	// An exact repeat of an already-written variant is still a duplicate.
+	before := mock.getWriteCount()
+	capture.writeEntry(createTestEntry("https://example.com/catalog?category=Books"))
+	if mock.getWriteCount() != before {
+		t.Errorf("Exact-repeat variant should be deduped, write count changed to %d", mock.getWriteCount())
+	}
+}
+
+// TestWriteEntryParamVariantsDisabled verifies maxParamVariants<=1 reproduces the
+// original value-blind behavior: all value-variants of a shape collapse to one.
+func TestWriteEntryParamVariantsDisabled(t *testing.T) {
+	mock := &mockWriter{}
+	capture := &Capture{
+		writer:           mock,
+		logged:           make(map[string]struct{}),
+		seenHashes:       make(map[string]bool),
+		shapeVariants:    make(map[string]int),
+		maxParamVariants: 1,
+		noColor:          true,
+	}
+	for _, v := range []string{"1", "2", "3", "4"} {
+		capture.writeEntry(createTestEntry("https://example.com/catalog/product?productId=" + v))
+	}
+	if mock.getWriteCount() != 1 {
+		t.Errorf("Expected value-blind collapse to 1 record, got %d", mock.getWriteCount())
+	}
+}
+
+// TestWriteEntryDistinctShapesUnaffectedByVariantCap verifies the per-shape cap is
+// scoped per shape: different param-name sets and path-only URLs are independent.
+func TestWriteEntryDistinctShapesUnaffectedByVariantCap(t *testing.T) {
+	mock := &mockWriter{}
+	capture := &Capture{
+		writer:           mock,
+		logged:           make(map[string]struct{}),
+		seenHashes:       make(map[string]bool),
+		shapeVariants:    make(map[string]int),
+		maxParamVariants: 2,
+		noColor:          true,
+	}
+	// Two shapes (category vs searchTerm) + one path-only URL: all independent.
+	capture.writeEntry(createTestEntry("https://example.com/catalog?category=Books"))
+	capture.writeEntry(createTestEntry("https://example.com/catalog?category=Gin"))
+	capture.writeEntry(createTestEntry("https://example.com/catalog?searchTerm=a"))
+	capture.writeEntry(createTestEntry("https://example.com/about"))
+	if mock.getWriteCount() != 4 {
+		t.Errorf("Expected 4 records across distinct shapes, got %d", mock.getWriteCount())
 	}
 }
 
@@ -291,7 +370,7 @@ func TestWriteEntryCloseRace(t *testing.T) {
 func TestCloseStatistics(t *testing.T) {
 	// Create zaptest logger to capture logs
 	logger := zaptest.NewLogger(t)
-	zap.ReplaceGlobals(logger)
+	t.Cleanup(zap.ReplaceGlobals(logger))
 
 	mock := &mockWriter{}
 	capture := &Capture{
@@ -338,7 +417,7 @@ func TestCloseStatistics(t *testing.T) {
 // TestCloseWithZeroDuplicates tests that Close() doesn't log when no duplicates.
 func TestCloseWithZeroDuplicates(t *testing.T) {
 	logger := zaptest.NewLogger(t)
-	zap.ReplaceGlobals(logger)
+	t.Cleanup(zap.ReplaceGlobals(logger))
 
 	mock := &mockWriter{}
 	capture := &Capture{
@@ -809,5 +888,376 @@ func TestComputeHashAuthHeaderCaseInsensitive(t *testing.T) {
 	// Both should produce the same hash (case-insensitive matching)
 	if hash1 != hash2 {
 		t.Errorf("authorization and Authorization with same value should produce same hash, got %s vs %s", hash1, hash2)
+	}
+}
+
+// TestShouldLogEntryCrossOriginFilter verifies the non-verbose cross-origin
+// log filter: traffic on a host unrelated to the configured target is
+// suppressed, while same/sub-host traffic is logged.
+func TestShouldLogEntryCrossOriginFilter(t *testing.T) {
+	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.globex.com", "spider")
+
+	if c.shouldLogEntry(createTestEntry("https://eaccess.mis.teach.globex.com/app")) != true {
+		t.Errorf("same-host entry should be logged")
+	}
+	if c.shouldLogEntry(createTestEntry("https://www.globex.com/us/en/x.html")) != false {
+		t.Errorf("cross-origin entry should be suppressed before adoption")
+	}
+}
+
+// TestSetTargetHostUnsuppressesAdoptedHost reproduces the off-host-redirect
+// adoption case: the start host redirects to an unrelated host that the crawler
+// adopts into scope. Until the capture's filter is re-pointed at the adopted
+// host, every adopted-host line is dropped from stderr even though records are
+// written. SetTargetHost must flip that.
+func TestSetTargetHostUnsuppressesAdoptedHost(t *testing.T) {
+	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.globex.com", "spider")
+
+	adopted := createTestEntry("https://www.globex.com/us/en/training.html")
+	if c.shouldLogEntry(adopted) != false {
+		t.Fatalf("precondition: adopted-host entry should be suppressed before SetTargetHost")
+	}
+
+	// Crawler adopts the off-host redirect target into scope.
+	c.SetTargetHost("www.globex.com")
+
+	if c.shouldLogEntry(adopted) != true {
+		t.Errorf("adopted-host entry should be logged after SetTargetHost")
+	}
+	if c.targetHostValue() != "www.globex.com" {
+		t.Errorf("targetHostValue() = %q, want %q", c.targetHostValue(), "www.globex.com")
+	}
+}
+
+// TestSetTargetHostStaticStillSuppressed confirms re-pointing the filter does
+// not override the unconditional static-content suppression.
+func TestSetTargetHostStaticStillSuppressed(t *testing.T) {
+	c := New(&mockWriter{}, true, false, false, false, false, "eaccess.mis.teach.globex.com", "spider")
+	c.SetTargetHost("www.globex.com")
+
+	css := createTestEntry("https://www.globex.com/assets/app.css")
+	css.Response.Headers = map[string]string{"content-type": "text/css"}
+	if c.shouldLogEntry(css) != false {
+		t.Errorf("static content on adopted host should still be suppressed")
+	}
+}
+
+// TestOnWorkerAttachedGuards verifies the service-worker attach handler is a safe
+// no-op for nil/empty events (so a malformed Target.attachedToTarget never panics
+// the capture event loop) and does not dereference the browser in those paths.
+func TestOnWorkerAttachedGuards(t *testing.T) {
+	c := &Capture{}
+	// nil browser + nil event: must not panic.
+	c.onWorkerAttached(nil, nil)
+	// nil browser + event with no TargetInfo: must return before touching browser.
+	c.onWorkerAttached(nil, &proto.TargetAttachedToTarget{SessionID: "s1"})
+	// non-nil event but nil TargetInfo with a session: still must not touch browser.
+	c.onWorkerAttached(nil, &proto.TargetAttachedToTarget{SessionID: "s2", WaitingForDebugger: true})
+}
+
+// TestServiceWorkerAutoAttachConfig locks down the auto-attach request invariants.
+// These are safety-critical: the filter must stay scoped to service workers so
+// auto-attach never fights rod's page/tab management (which would risk stuck
+// sessions and un-reaped "zombie" browsers), and the flags must be set so the
+// worker's first precache request is captured rather than missed.
+func TestServiceWorkerAutoAttachConfig(t *testing.T) {
+	cfg := serviceWorkerAutoAttachConfig()
+
+	if !cfg.AutoAttach {
+		t.Error("AutoAttach must be true")
+	}
+	if !cfg.Flatten {
+		t.Error("Flatten must be true so worker events arrive over the root connection")
+	}
+	if !cfg.WaitForDebuggerOnStart {
+		t.Error("WaitForDebuggerOnStart must be true so Network is enabled before the worker runs")
+	}
+
+	if len(cfg.Filter) < 2 {
+		t.Fatalf("filter must have an include + a trailing exclude-all, got %d entries", len(cfg.Filter))
+	}
+	// First entry includes service workers.
+	if got := cfg.Filter[0]; got.Type != string(proto.TargetTargetInfoTypeServiceWorker) || got.Exclude {
+		t.Errorf("first filter entry must INCLUDE service_worker, got %+v", got)
+	}
+	// Last entry is the exclude-everything-else catch-all.
+	if last := cfg.Filter[len(cfg.Filter)-1]; !last.Exclude || last.Type != "" {
+		t.Errorf("last filter entry must be an exclude-all catch-all, got %+v", last)
+	}
+	// Regression guard: no page/tab/browser/iframe target may be auto-attached —
+	// only service workers. Broadening this is the path to zombie browsers.
+	for _, e := range cfg.Filter {
+		if e.Exclude {
+			continue
+		}
+		switch e.Type {
+		case "page", "tab", "browser", "iframe":
+			t.Errorf("filter must not auto-attach %q targets (service workers only)", e.Type)
+		case "":
+			t.Errorf("filter must not have an INCLUDE-everything entry (%+v) — that attaches pages too", e)
+		}
+	}
+}
+
+// TestWriteEntryDropsCatchAllAssetShell verifies the soft-404 guard: a JS/JSON
+// asset path that returns the SPA index shell (200, text/html) — as the service
+// -worker priming probe's well-known-filename guesses do on a catch-all host — is
+// dropped, never written to the DB, while a genuine asset served with its proper
+// content-type is written.
+func TestWriteEntryDropsCatchAllAssetShell(t *testing.T) {
+	mock := &mockWriter{}
+	capture := &Capture{
+		writer:     mock,
+		logged:     make(map[string]struct{}),
+		seenHashes: make(map[string]bool),
+		noColor:    true,
+		silent:     true,
+	}
+
+	// All of these are PWA priming guesses that a SPA catch-all returns as its
+	// text/html index shell — none is a real endpoint.
+	shells := []string{
+		"https://example.com/sw.js",
+		"https://example.com/firebase-messaging-sw.js",
+		"https://example.com/combined-sw.js",
+		"https://example.com/safety-worker.js",
+		"https://example.com/worker-basic.min.js",
+		"https://example.com/ngsw.json",
+		"https://example.com/manifest.webmanifest",
+		"https://example.com/_nuxt/builds/latest.json",
+	}
+	for _, u := range shells {
+		e := createTestEntry(u) // createTestEntry defaults to a 200 text/html response
+		capture.writeEntry(e)
+	}
+	if mock.getWriteCount() != 0 {
+		t.Errorf("catch-all asset shells should not be written, got writeCount=%d", mock.getWriteCount())
+	}
+
+	// A genuine service worker / bundle / manifest served with its real
+	// content-type is kept.
+	realSW := createTestEntry("https://example.com/service-worker.js")
+	realSW.Response.Headers = map[string]string{"content-type": "application/javascript"}
+	realSW.ContentType = "application/javascript"
+	capture.writeEntry(realSW)
+
+	realManifest := createTestEntry("https://example.com/config.json")
+	realManifest.Response.Headers = map[string]string{"content-type": "application/json"}
+	realManifest.ContentType = "application/json"
+	capture.writeEntry(realManifest)
+
+	if mock.getWriteCount() != 2 {
+		t.Errorf("genuine JS/JSON assets should be written, got writeCount=%d", mock.getWriteCount())
+	}
+
+	// A non-asset HTML route (no JS/JSON extension) is unaffected by the guard.
+	htmlPage := createTestEntry("https://example.com/dashboard")
+	capture.writeEntry(htmlPage)
+	if mock.getWriteCount() != 3 {
+		t.Errorf("normal HTML route should still be written, got writeCount=%d", mock.getWriteCount())
+	}
+}
+
+// TestIsCatchAllAssetShell unit-tests the soft-404 classifier directly.
+func TestIsCatchAllAssetShell(t *testing.T) {
+	mkEntry := func(rawURL, ct string, status int) *TrafficEntry {
+		return &TrafficEntry{
+			Request:     RequestData{Method: "GET", URL: rawURL},
+			Response:    &ResponseData{Status: status, Headers: map[string]string{"content-type": ct}},
+			ContentType: ct,
+		}
+	}
+	tests := []struct {
+		name   string
+		entry  *TrafficEntry
+		expect bool
+	}{
+		{"js served as html (catch-all)", mkEntry("https://x.com/sw.js", "text/html", 200), true},
+		{"json served as html (catch-all)", mkEntry("https://x.com/ngsw.json", "text/html; charset=utf-8", 200), true},
+		{"webmanifest served as html", mkEntry("https://x.com/manifest.webmanifest", "text/html", 200), true},
+		{"mjs served as html", mkEntry("https://x.com/app.mjs", "text/html", 200), true},
+		{"real js asset", mkEntry("https://x.com/app.js", "application/javascript", 200), false},
+		{"real json asset", mkEntry("https://x.com/config.json", "application/json", 200), false},
+		{"html page (no asset ext)", mkEntry("https://x.com/dashboard", "text/html", 200), false},
+		{"js 404 (handled elsewhere)", mkEntry("https://x.com/sw.js", "text/html", 404), false},
+		{"js 3xx redirect", mkEntry("https://x.com/sw.js", "text/html", 302), false},
+		{"json query string still matches path ext", mkEntry("https://x.com/ngsw.json?v=2", "text/html", 200), true},
+		{"nil response", &TrafficEntry{Request: RequestData{URL: "https://x.com/sw.js"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCatchAllAssetShell(tt.entry); got != tt.expect {
+				t.Errorf("isCatchAllAssetShell(%s) = %v, want %v", tt.name, got, tt.expect)
+			}
+		})
+	}
+}
+
+// newRedirectTestCapture builds a Capture wired to a mock writer, suitable for
+// driving onRequestWillBeSent directly (no browser). silent avoids stderr; the
+// pending map must be initialized or onRequestWillBeSent's map assignment panics.
+func newRedirectTestCapture(mock *mockWriter) *Capture {
+	return &Capture{
+		writer:     mock,
+		pending:    make(map[proto.NetworkRequestID]*pendingEntry),
+		logged:     make(map[string]struct{}),
+		seenHashes: make(map[string]bool),
+		noColor:    true,
+		silent:     true,
+	}
+}
+
+func reqWillBeSent(reqID, url string, redirect *proto.NetworkResponse) *proto.NetworkRequestWillBeSent {
+	return &proto.NetworkRequestWillBeSent{
+		RequestID:        proto.NetworkRequestID(reqID),
+		Type:             proto.NetworkResourceTypeDocument,
+		Request:          &proto.NetworkRequest{Method: "GET", URL: url},
+		RedirectResponse: redirect,
+	}
+}
+
+func (m *mockWriter) urls() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.entries))
+	for _, e := range m.entries {
+		out = append(out, e.Request.URL)
+	}
+	return out
+}
+
+// TestOnRequestWillBeSentEmitsRedirectHops is the regression guard for the bug
+// where each 3xx hop in a redirect chain was overwritten by its target and lost
+// (so an SSO chain's /oauth2/authorize and /idp/endpoint/HttpRedirect were never
+// recorded). CDP reuses one RequestID across a redirect chain, delivering the
+// previous hop's response in RedirectResponse on the next requestWillBeSent. Each
+// intermediate hop must be emitted as its own record.
+func TestOnRequestWillBeSentEmitsRedirectHops(t *testing.T) {
+	mock := &mockWriter{}
+	c := newRedirectTestCapture(mock)
+
+	const (
+		a  = "https://app.example.com/oauth2/authorize?response_type=code"
+		b  = "https://idp.example.com/idp/login?app=1"
+		cc = "https://idp.example.com/idp/endpoint/HttpRedirect?SAMLRequest=zzz"
+	)
+
+	// Same RequestID across the whole chain: A -302-> B -302-> C.
+	c.onRequestWillBeSent(reqWillBeSent("1", a, nil), "sess")
+	c.onRequestWillBeSent(reqWillBeSent("1", b, &proto.NetworkResponse{Status: 302}), "sess")
+	c.onRequestWillBeSent(reqWillBeSent("1", cc, &proto.NetworkResponse{Status: 302}), "sess")
+
+	got := mock.urls()
+	// The two completed hops (A and B) must be written; C is still pending its
+	// own response and is emitted later by onLoadingFinished.
+	if len(got) != 2 {
+		t.Fatalf("expected 2 redirect hops emitted, got %d: %v", len(got), got)
+	}
+	wantSet := map[string]bool{a: false, b: false}
+	for _, u := range got {
+		if _, ok := wantSet[u]; !ok {
+			t.Errorf("unexpected emitted URL %q", u)
+			continue
+		}
+		wantSet[u] = true
+	}
+	for u, seen := range wantSet {
+		if !seen {
+			t.Errorf("redirect hop %q was not emitted (it would be silently lost)", u)
+		}
+	}
+
+	// C is still in flight (not yet emitted): exactly one pending entry, keyed by
+	// the shared RequestID, pointing at the final URL.
+	c.mu.Lock()
+	pendingLen := len(c.pending)
+	finalEntry := c.pending["1"]
+	c.mu.Unlock()
+	if pendingLen != 1 || finalEntry == nil || finalEntry.entry.Request.URL != cc {
+		t.Errorf("expected the final hop %q to remain pending, got pending=%d entry=%v", cc, pendingLen, finalEntry)
+	}
+}
+
+// TestOnRequestWillBeSentNoRedirectDoesNotEmit verifies a normal (non-redirect)
+// request is only buffered as pending — it is emitted later by
+// onLoadingFinished/onLoadingFailed, not prematurely here.
+func TestOnRequestWillBeSentNoRedirectDoesNotEmit(t *testing.T) {
+	mock := &mockWriter{}
+	c := newRedirectTestCapture(mock)
+
+	c.onRequestWillBeSent(reqWillBeSent("1", "https://example.com/page", nil), "sess")
+
+	if mock.getWriteCount() != 0 {
+		t.Errorf("a non-redirect request must not be written from onRequestWillBeSent, got %d", mock.getWriteCount())
+	}
+	c.mu.Lock()
+	_, pending := c.pending["1"]
+	c.mu.Unlock()
+	if !pending {
+		t.Errorf("a non-redirect request must be buffered as pending")
+	}
+}
+
+// TestOnRequestWillBeSentRedirectCapturesResponseMeta verifies the emitted
+// redirect hop carries the redirect status and (when headers are included) the
+// Location header that points at the next hop — the evidence that proves it was a
+// redirect and where it went.
+func TestOnRequestWillBeSentRedirectCapturesResponseMeta(t *testing.T) {
+	mock := &mockWriter{}
+	c := newRedirectTestCapture(mock)
+	c.includeResponseHeaders = true
+
+	const hop = "https://app.example.com/oauth2/authorize"
+	const next = "https://idp.example.com/idp/login"
+
+	c.onRequestWillBeSent(reqWillBeSent("1", hop, nil), "sess")
+	c.onRequestWillBeSent(&proto.NetworkRequestWillBeSent{
+		RequestID: "1",
+		Type:      proto.NetworkResourceTypeDocument,
+		Request:   &proto.NetworkRequest{Method: "GET", URL: next},
+		RedirectResponse: &proto.NetworkResponse{
+			Status:  302,
+			Headers: proto.NetworkHeaders{"Location": gson.New(next)},
+		},
+	}, "sess")
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if len(mock.entries) != 1 {
+		t.Fatalf("expected 1 emitted redirect hop, got %d", len(mock.entries))
+	}
+	e := mock.entries[0]
+	if e.Request.URL != hop {
+		t.Errorf("emitted hop URL = %q, want %q", e.Request.URL, hop)
+	}
+	if e.Response == nil || e.Response.Status != 302 {
+		t.Fatalf("emitted hop must carry the 302 redirect status, got %+v", e.Response)
+	}
+	if loc := e.Response.Headers["Location"]; loc != next {
+		t.Errorf("emitted hop Location header = %q, want %q", loc, next)
+	}
+}
+
+// TestShouldLogEntry404Suppressed verifies probe noise (404s from e.g.
+// service-worker / manifest priming) is suppressed from stderr in non-verbose
+// mode but shown under verbose. Records are still written regardless.
+func TestShouldLogEntry404Suppressed(t *testing.T) {
+	// Non-verbose: same-host 404 is suppressed.
+	c := New(&mockWriter{}, true, false, false, false, false, "example.com", "spider")
+	notFound := createTestEntry("https://example.com/ngsw.json")
+	notFound.Response.Status = 404
+	if c.shouldLogEntry(notFound) != false {
+		t.Errorf("404 should be suppressed in non-verbose mode")
+	}
+	// A same-host 200 on the same path is still logged (only 404s are dropped).
+	ok := createTestEntry("https://example.com/ngsw.json")
+	if c.shouldLogEntry(ok) != true {
+		t.Errorf("200 should still be logged in non-verbose mode")
+	}
+
+	// Verbose: 404 is shown.
+	cv := New(&mockWriter{}, true, false, true, false, false, "example.com", "spider")
+	if cv.shouldLogEntry(notFound) != true {
+		t.Errorf("404 should be logged under verbose mode")
 	}
 }

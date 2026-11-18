@@ -95,7 +95,7 @@ curl -s -X POST http://localhost:9002/api/scans/run \
 
 ### What gets uploaded
 
-By default the bundle contains the per-scan `runtime.log` only. Pass `output_formats` (currently `jsonl` and/or `html`) on the request to also materialize and bundle the rendered findings — these land at `<sessions_dir>/<scan-uuid>/output.{jsonl,html}` on the server and are added to the tar.gz alongside `runtime.log`. CLI runs that pass `--output` and `--format` get the same shape.
+By default the bundle contains the per-scan `runtime.log` only. Pass `output_formats` on the request to also materialize and bundle the rendered findings. Accepted values are `jsonl` (the live result stream) and the report formats `html`, `report`, `pdf`, `markdown` (alias `md`), `sarif`, `csv` and `junit` (case-insensitive), which are rendered after the scan by the same generator `scan --format` uses, scoped to that scan. Any other value is rejected with `400`. The files land at `<sessions_dir>/<scan-uuid>/output.<ext>` on the server (`output.jsonl`, `output.html`, `output.report.html`, `output.pdf`, `output.md`, `output.sarif`, `output.csv`, `output.junit.xml`) and are added to the tar.gz alongside `runtime.log`. A requested file that could not be produced is logged at error level by name rather than silently left out. CLI runs that pass `--output` and `--format` get the same shape.
 
 ```
 <bucket>/<project-uuid>/native-scans/<scan-uuid>/results.tar.gz
@@ -215,7 +215,7 @@ vigolium agent swarm \
 
 ## Agent Audit
 
-Foreground vigolium-audit (multi-phase source code security audit).
+Unified, asynchronous source audit using the Audit harness, Piolium, or both.
 
 ```bash
 curl -s -X POST http://localhost:9002/api/agent/run/audit \
@@ -224,8 +224,9 @@ curl -s -X POST http://localhost:9002/api/agent/run/audit \
   -H "X-Project-UUID: <project-uuid>" \
   -d '{
     "source": "https://github.com/example/myapp",
+    "driver": "audit",
     "intensity": "deep",
-    "platform": "claude",
+    "agent": "claude",
     "scan_uuid": "550e8400-e29b-41d4-a716-446655440000",
     "upload_results": true
   }' | jq .
@@ -242,7 +243,10 @@ vigolium agent audit \
   --upload-results
 ```
 
-The bundle contains `runtime.log`, `audit-stream.jsonl`, `vigolium-audit-output.md`, and the synced `vigolium-results/` artifact tree (per-phase reports, advisory matrices, audit-state.json).
+The Audit bundle contains `runtime.log`, `audit-stream.jsonl`, and the synced
+`vigolium-results/` artifact tree (phase reports, findings, and audit state).
+Multi-driver runs keep the Audit and Piolium artifacts in separate session
+subtrees.
 
 ---
 
@@ -383,7 +387,7 @@ The same pattern applies to `vigolium agent autopilot|swarm|query|audit` and `PO
 **Node A** — dispatcher pre-creates an autopilot run (e.g. so a UI can show the run UUID before the worker picks it up). Pre-creation is most ergonomic via the agentic API itself with `dry_run: true` (avoids spending agent budget on an empty run):
 
 ```bash
-RUN_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+AGENTIC_SCAN_UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
 
 curl -s -X POST http://node-a:9002/api/agent/run/autopilot \
   -H "Content-Type: application/json" \

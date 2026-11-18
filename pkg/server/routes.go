@@ -2,6 +2,7 @@ package server
 
 import (
 	"io/fs"
+	"os"
 	"strings"
 
 	"github.com/gofiber/contrib/v3/swaggerui"
@@ -12,14 +13,25 @@ import (
 	"github.com/gofiber/fiber/v3/middleware/requestid"
 	"github.com/gofiber/fiber/v3/middleware/static"
 
+	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/public"
 )
 
 // registerRoutes sets up all middleware and routes on the Fiber app.
 func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
-	// Global middleware
+	// Global middleware. The author banner registers first so X-Author lands
+	// directly under the Server header rather than trailing the request id.
+	if author := strings.TrimSpace(cfg.Author); author != "" {
+		app.Use(AuthorHeaderMiddleware(author))
+	}
 	app.Use(requestid.New())
-	app.Use(fiberlogger.New())
+	// Negotiate the response version before anything that can answer: auth,
+	// project lookup and the body limit all write errors in it.
+	app.Use(apiVersionMiddleware(cfg.APIVersionDefault))
+	// The stream is read when the routes are built, not when fiber's
+	// package initialized: a CLI that points os.Stdout at stderr (server
+	// machine mode) keeps the access log off its stdout.
+	app.Use(fiberlogger.New(fiberlogger.Config{Stream: os.Stdout}))
 	app.Use(fiberrecover.New())
 	app.Use(SecurityHeadersMiddleware())
 	app.Use(DefaultBodyLimitMiddleware())
@@ -31,8 +43,22 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	// CORS
 	if cfg.CORSAllowedOrigins != "" {
 		corsCfg := cors.Config{
-			AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-			AllowHeaders: []string{"Content-Type", "Authorization", "X-Project-UUID", "X-User-Email"},
+			// PATCH is load-bearing, not decorative: PATCH /api/findings/:id/status
+			// is the only way a browser client marks a finding triaged, and a method
+			// missing from this list fails the preflight — the request never reaches
+			// the route at all. Keep this in sync with the verbs registered below.
+			AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+			AllowHeaders: []string{
+				"Content-Type", "Authorization", "X-Project-UUID", "X-User-Email",
+				// A browser client pushing traffic needs this through preflight;
+				// without it the header is dropped and its records fall back to
+				// the generic ingest-server label. Plugin backends (Caido) are
+				// not browsers and are unaffected either way.
+				IngestSourceHeader,
+				// Version negotiation and opt-in project creation.
+				apicontract.RESTAPIVersionHeader, apicontract.ProjectCreateHeader,
+			},
+			ExposeHeaders: []string{apicontract.RESTAPIVersionHeader},
 		}
 		switch cfg.CORSAllowedOrigins {
 		case "reflect-origin":
@@ -66,7 +92,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	app.Get("/favicon.ico", func(c fiber.Ctx) error {
 		data, err := public.StaticFS.ReadFile("favicon.ico")
 		if err != nil {
-			return c.SendStatus(fiber.StatusNotFound)
+			return respondErrorMsg(c, fiber.StatusNotFound, "favicon not found")
 		}
 		c.Set("Content-Type", "image/x-icon")
 		c.Set("Cache-Control", "public, max-age=86400")
@@ -93,13 +119,14 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 		app.Use(BearerAuth(cfg.APIKeys, cfg.UserStore))
 	}
 
-	// Project UUID extraction from X-Project-UUID header.
-	// Passing the repo enables lazy auto-creation of unknown UUIDs so client-side
-	// state (UI localStorage, CLI configs) keeps working after a scanner DB reset.
-	app.Use(ProjectUUIDMiddleware(handlers.repo))
+	// Project UUID extraction from X-Project-UUID header. An unknown UUID is a
+	// 404 project_not_found unless the request sends X-Project-Create: 1 (or
+	// ?create=1) or server.auto_create_projects is set.
+	app.Use(ProjectUUIDMiddleware(handlers.repo, ProjectMiddlewareConfig{AutoCreate: cfg.AutoCreateProjects, Reader: handlers.readerRepo()}))
 
 	// Routes (public — no role guard needed, auth already skips these)
-	app.Get("/health", handlers.HandleHealth)
+	app.Get("/health", handlers.HandleHealth) // liveness (no DB dependency)
+	app.Get("/ready", handlers.HandleReady)   // readiness (DB ping)
 	app.Get("/server-info", handlers.HandleServerInfo)
 
 	// API group
@@ -121,10 +148,7 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 		demo.Get("/extensions", handlers.HandleListExtensions)
 		demo.Get("/extensions/:name", handlers.HandleGetExtension)
 		api.All("/*", func(c fiber.Ctx) error {
-			return c.Status(fiber.StatusForbidden).JSON(ErrorResponse{
-				Error: "this API endpoint is disabled in demo mode",
-				Code:  fiber.StatusForbidden,
-			})
+			return respondErrorMsg(c, fiber.StatusForbidden, "this API endpoint is disabled in demo mode")
 		})
 		return
 	}
@@ -169,6 +193,15 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	viewer.Get("/db/tables/:table/records", handlers.HandleListDBRecords)
 	viewer.Get("/db/tables/:table/records/:id", handlers.HandleGetDBRecord)
 
+	// --- Cloud storage reads (viewer) ---
+	// Registered here, above the view-only return, because they are reads: a
+	// view-only deployment that can list a scan but not fetch its result bundle
+	// is missing half the read surface. The storage writes stay with the other
+	// operator routes below. Scoped by project UUID via middleware; requires
+	// storage config to be enabled.
+	viewer.Get("/storage/source/:key", handlers.HandleStorageDownloadSource)
+	viewer.Get("/storage/results/:scan_uuid", handlers.HandleStorageDownloadResults)
+
 	// In view-only mode, skip all write/mutation routes (operator + admin).
 	if cfg.ViewOnly {
 		return
@@ -186,15 +219,18 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	operator.Post("/scans/:uuid/pause", handlers.HandlePauseScan)
 	operator.Post("/scans/:uuid/resume", handlers.HandleResumeScan)
 	operator.Post("/ingest-http", handlers.HandleIngestHTTP)
+	operator.Post("/burp/sitemap/snapshot", handlers.HandleBurpSiteMapSnapshot)
 	operator.Post("/import", handlers.HandleImport)
 	operator.Post("/scans/:uuid/update", handlers.HandleUpdateScan)
 	operator.Post("/agent/scans/:uuid/update", handlers.HandleUpdateAgenticScan)
 	operator.Patch("/findings/:id/status", handlers.findingsHandler().HandleUpdateFindingStatus)
+	operator.Post("/findings/:id/verify", handlers.HandleVerifyFinding)
 	if !cfg.NoAgent {
 		operator.Post("/agent/run/query", handlers.HandleAgentQuery)
 		operator.Post("/agent/run/autopilot", handlers.HandleAgentAutopilot)
 		operator.Post("/agent/run/swarm", handlers.HandleAgentSwarm)
 		operator.Post("/agent/run/audit", handlers.HandleAgentAudit)
+		operator.Post("/agent/scans/:uuid/cancel", handlers.HandleAgentCancel)
 		operator.Post("/agent/chat/completions", handlers.HandleChatCompletions)
 	}
 
@@ -212,10 +248,8 @@ func registerRoutes(app *fiber.App, handlers *Handlers, cfg ServerConfig) {
 	admin.Post("/projects", handlers.HandleCreateProject)
 	admin.Put("/projects/:uuid", handlers.HandleUpdateProject)
 
-	// --- Cloud storage endpoints ---
-	// Scoped by project UUID via middleware. Requires storage config to be enabled.
-	viewer.Get("/storage/source/:key", handlers.HandleStorageDownloadSource)
-	viewer.Get("/storage/results/:scan_uuid", handlers.HandleStorageDownloadResults)
+	// --- Cloud storage writes ---
+	// The matching viewer reads are registered above the view-only return.
 	operator.Post("/storage/upload-source", handlers.HandleStorageUploadSource)
 	operator.Post("/storage/presign", handlers.HandleStoragePresign)
 

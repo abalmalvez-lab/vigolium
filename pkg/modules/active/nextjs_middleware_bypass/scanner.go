@@ -88,7 +88,7 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		result, err := m.executeAndCheck(modifiedRaw, ctx, httpClient, statusCode, hp.desc, hp.name+": "+hp.value)
+		result, err := m.executeAndCheck(modifiedRaw, ctx, httpClient, scanCtx, statusCode, hp.desc, hp.name+": "+hp.value, false)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return results, nil
@@ -109,7 +109,12 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
-		result, err := m.executeAndCheck(modifiedRaw, ctx, httpClient, statusCode, pp.desc, modifiedPath)
+		// checkCatchAll=true: a path rewrite can land on a generic 200 app shell
+		// (home / marketing / a [...slug] catch-all) that is not the protected
+		// resource. The header phase keeps the same path, so its still-denied
+		// recheck already rules that out; the path phase needs an explicit
+		// catch-all control.
+		result, err := m.executeAndCheck(modifiedRaw, ctx, httpClient, scanCtx, statusCode, pp.desc, modifiedPath, true)
 		if err != nil {
 			if errors.Is(err, hosterrors.ErrUnresponsiveHost) {
 				return results, nil
@@ -129,15 +134,15 @@ func (m *Module) executeAndCheck(
 	modifiedRaw []byte,
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	origStatus int,
 	desc string,
 	payload string,
+	checkCatchAll bool,
 ) (*output.ResultEvent, error) {
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil, err
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// modifiedRaw is internally built (well-formed), so wrap directly instead
+	// of re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{NoRedirects: true})
 	if err != nil {
@@ -156,13 +161,47 @@ func (m *Module) executeAndCheck(
 		return nil, nil
 	}
 
+	// Capture the bypass (attack) response before it is consumed/closed by the
+	// confirmation rounds below; it stays the finding's primary Response.
+	attackResp := resp.FullResponseString()
+
+	// Each finding gets its own evidence collector. Record the ORIGINAL,
+	// pre-bypass 401/403 pair (the baseline that proves middleware enforcement
+	// was in place) and let confirmBypass append the reproduction rounds.
+	ev := modkit.NewEvidenceCollector()
+	if origReq := ctx.Request(); origReq != nil {
+		var origRespStr string
+		if origResp := ctx.Response(); origResp != nil {
+			origRespStr = string(origResp.Raw())
+		}
+		ev.Add(fmt.Sprintf("original-%d", origStatus), string(origReq.Raw()), origRespStr)
+	}
+
+	// Confirm the bypass is real and reproducible, not a transient flap: the
+	// captured 401/403 is a crawl-time snapshot that may have been a momentary
+	// rate-limit/WAF block (or the endpoint may simply return 200 for everything
+	// now). Re-verify with the bypass payload as the only variable.
+	if !m.confirmBypass(ctx, httpClient, modifiedRaw, ev) {
+		return nil, nil
+	}
+
+	// Catch-all control (path phase only): a rewritten path may resolve to a
+	// generic 200 app shell served for any unmatched route. If the bypass body is
+	// indistinguishable from the host's response to a random nonexistent path, the
+	// rewrite reached the catch-all shell, not the protected resource — not a
+	// middleware bypass.
+	if checkCatchAll && !m.bypassDistinctFromCatchAll(ctx, httpClient, scanCtx, body) {
+		return nil, nil
+	}
+
 	target := ctx.Target()
 	return &output.ResultEvent{
-		ModuleID: ModuleID,
-		URL:      target,
-		Matched:  target,
-		Request:  string(modifiedRaw),
-		Response: resp.FullResponseString(),
+		ModuleID:           ModuleID,
+		URL:                target,
+		Matched:            target,
+		Request:            string(modifiedRaw),
+		Response:           attackResp,
+		AdditionalEvidence: ev.Entries(),
 		ExtractedResults: []string{
 			fmt.Sprintf("Bypass: %s", desc),
 			fmt.Sprintf("Payload: %s", payload),
@@ -177,6 +216,105 @@ func (m *Module) executeAndCheck(
 			Reference:   []string{"https://github.com/advisories/GHSA-f82v-jwr5-mffw"},
 		},
 	}, nil
+}
+
+// confirmBypass re-runs the pair interleaved, with the bypass payload as the only
+// variable, to rule out a transient flap or a host that simply 200s everything:
+// each round the ORIGINAL (unmodified) request must STILL be denied (401/403) and
+// the bypass request must STILL return a non-login/non-error 200. The fetches
+// bypass the response cache so a stale replay can't mask instability. Fails
+// closed (drops) on a fetch error — a CVE-class claim should not rest on an
+// unverifiable transition.
+func (m *Module) confirmBypass(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	modifiedRaw []byte,
+	ev *modkit.EvidenceCollector,
+) bool {
+	const rounds = 2
+	origRaw := ctx.Request().Raw()
+	for round := 1; round <= rounds; round++ {
+		status, _, fullResp, ok := m.freshProbe(ctx, httpClient, origRaw)
+		if !ok || (status != 401 && status != 403) {
+			return false // original request not denied → the 401/403 wasn't stable
+		}
+		ev.Add(fmt.Sprintf("confirm round %d (original denied)", round), string(origRaw), fullResp)
+
+		status, body, fullResp, ok := m.freshProbe(ctx, httpClient, modifiedRaw)
+		if !ok || status != 200 || isLoginOrErrorPage(strings.ToLower(body)) {
+			return false // bypass not reproducibly allowed with real content
+		}
+		ev.Add(fmt.Sprintf("confirm round %d (bypass allowed)", round), string(modifiedRaw), fullResp)
+	}
+	return true
+}
+
+// bypassDistinctFromCatchAll reports whether the bypass body is a distinct
+// protected resource rather than the host's catch-all app shell. A Next.js app
+// that serves a generic 200 shell (home / marketing / a [...slug] catch-all) for
+// unmatched routes answers a rewritten path with that shell rather than the
+// protected resource, so a bypass body similar to the shell is not a real
+// middleware bypass.
+//
+// The shell is sampled from THREE INDEPENDENT controls, OR-ed, so no single
+// WAF/CDN-throttled probe can disable the guard — the failure mode that would let
+// a wildcard-SPA shell be reported as a Critical bypass (a lone control throttled
+// to a non-200 previously fell through to "distinct → keep"):
+//   - a random nonexistent path via the clean original template (preserves the
+//     request's auth headers),
+//   - a random nonexistent web-root directory (RandomDirCatchAll), and
+//   - the site root "/" (RootPageCatchAll).
+//
+// Each control fails OPEN (a non-200 / errored control is treated as "not the
+// shell"), so a genuine bypass — where these controls are real 404s and the
+// homepage is a distinct page — is never suppressed. Returns true (distinct →
+// keep the finding) only when the bypass body matches NONE of the shell samples.
+// ResemblesObservedPage is deliberately NOT used here: the observed page is the
+// original 401/403 body, not the 200 shell, so it can never match the bypass.
+func (m *Module) bypassDistinctFromCatchAll(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
+	bypassBody string,
+) bool {
+	bypassSig := modkit.BodySignature(bypassBody)
+	shellMatch := func(b string) bool { return modkit.BodiesSimilarSig(bypassSig, b) }
+
+	// Control 1: a random nonexistent path via the clean original request
+	// template (keeps the method and auth headers the protected request carried).
+	if raw, err := httpmsg.SetPath(ctx.Request().Raw(), "/"+modkit.FreshCanary()+"-vigolium404"); err == nil {
+		if status, body, _, ok := m.freshProbe(ctx, httpClient, raw); ok && status == 200 && shellMatch(body) {
+			return false // matches the catch-all shell → not a bypass
+		}
+	}
+
+	// Controls 2 & 3: independent web-root directory and site-root shell samples.
+	// Distinct (keep) only when the bypass body matches neither.
+	return !modkit.RandomDirCatchAll(scanCtx, ctx, httpClient, shellMatch) &&
+		!modkit.RootPageCatchAll(scanCtx, ctx, httpClient, shellMatch)
+}
+
+// freshProbe issues raw with redirects disabled and the response cache bypassed,
+// returning the status, body, and full raw response string. The full response is
+// captured before Close so callers can record it as confirmation evidence. ok is
+// false on parse/transport error or nil response.
+func (m *Module) freshProbe(
+	ctx *httpmsg.HttpRequestResponse,
+	httpClient *http.Requester,
+	raw []byte,
+) (int, string, string, bool) {
+	// raw is internally built (well-formed), so wrap directly instead of
+	// re-parsing on this hot path.
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
+	resp, _, err := httpClient.Execute(req, http.Options{NoRedirects: true, NoClustering: true})
+	if err != nil {
+		return 0, "", "", false
+	}
+	defer resp.Close()
+	if resp.Response() == nil {
+		return 0, "", "", false
+	}
+	return resp.Response().StatusCode, resp.Body().String(), resp.FullResponseString(), true
 }
 
 // isLoginOrErrorPage checks if the body looks like a login or error page.

@@ -8,6 +8,37 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/vigolium/vigolium/internal/config"
+)
+
+// SkillsDirEnv overrides the user-scope skills directory. When unset, the
+// default is ~/.vigolium/skills. Mirrors VIGOLIUM_WORDLIST_DIR.
+const SkillsDirEnv = "VIGOLIUM_SKILLS_DIR"
+
+// UserSkillsDir resolves the user-scope skills directory: VIGOLIUM_SKILLS_DIR
+// (with ~ and env-var expansion) when set, else ~/.vigolium/skills. Both the
+// loader (read) and the init-time materializer (write) call this so the two
+// never diverge. Returns "" only if the home directory can't be resolved and
+// no override is set.
+func UserSkillsDir() string {
+	if v := os.Getenv(SkillsDirEnv); v != "" {
+		return config.ExpandPath(v)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".vigolium", "skills")
+}
+
+// Project-scope skill subdirectories, relative to a project root. Single source
+// of truth for where agent skills live on disk: the loader (read) walks these
+// and `vigolium skills install` (write) targets them, so the two must stay in
+// lockstep — a mismatch silently produces installs the loader never finds.
+var (
+	ClaudeSkillsSubdir = filepath.Join(".claude", "skills")
+	AgentsSkillsSubdir = filepath.Join(".agents", "skills")
 )
 
 // Registry holds skills loaded for a single olium session. First-found-by-name
@@ -41,6 +72,20 @@ func (r *Registry) List() []*Skill {
 	return out
 }
 
+// Names returns the registered skill names in the same stable order as List().
+func (r *Registry) Names() []string {
+	if r == nil {
+		return nil
+	}
+	out := make([]string, 0, len(r.order))
+	for _, n := range r.order {
+		if _, ok := r.skills[n]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // Len reports the number of registered skills.
 func (r *Registry) Len() int {
 	if r == nil {
@@ -53,7 +98,7 @@ func (r *Registry) Len() int {
 type LoadOptions struct {
 	// WorkingDir is the starting point for project-scope skill discovery.
 	// Defaults to os.Getwd(). Ancestor directories are searched too, so
-	// running olium from a subfolder still picks up repo-root .agent/skills/.
+	// running olium from a subfolder still picks up repo-root .agents/skills/.
 	WorkingDir string
 
 	// IncludeUserSkills enables ~/.vigolium/skills/ discovery. Enabled
@@ -86,17 +131,17 @@ func Load(opts LoadOptions) (*Registry, error) {
 		cwd, _ = os.Getwd()
 	}
 
-	// Walk: project-scope (.agent/skills/, .claude/skills/) across cwd
+	// Walk: project-scope (.agents/skills/, .claude/skills/) across cwd
 	// and ancestors. Closer to cwd wins on conflict.
 	for _, dir := range ancestorDirs(cwd) {
-		loadDiskDir(reg, filepath.Join(dir, ".agent", "skills"), SourceProjectAgent, opts.Warnings)
-		loadDiskDir(reg, filepath.Join(dir, ".claude", "skills"), SourceProjectClaude, opts.Warnings)
+		loadDiskDir(reg, filepath.Join(dir, AgentsSkillsSubdir), SourceProjectAgents, opts.Warnings)
+		loadDiskDir(reg, filepath.Join(dir, ClaudeSkillsSubdir), SourceProjectClaude, opts.Warnings)
 	}
 
-	// User scope (autopilot/swarm only).
+	// User scope (autopilot/swarm only). Honors VIGOLIUM_SKILLS_DIR.
 	if opts.IncludeUserSkills {
-		if home, err := os.UserHomeDir(); err == nil {
-			loadDiskDir(reg, filepath.Join(home, ".vigolium", "skills"), SourceUserVigolium, opts.Warnings)
+		if dir := UserSkillsDir(); dir != "" {
+			loadDiskDir(reg, dir, SourceUserVigolium, opts.Warnings)
 		}
 	}
 

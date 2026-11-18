@@ -2,55 +2,81 @@ package env_secret_exposure
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 
+	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/vigolium/vigolium/pkg/dedup"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
+	"github.com/vigolium/vigolium/pkg/modules/infra"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 	"github.com/vigolium/vigolium/pkg/utils"
 )
 
-// envPattern defines a single environment secret exposure pattern.
-type envPattern struct {
-	name    string
-	pattern *regexp.Regexp
-	cwe     string
-}
+var (
+	// Public framework prefixes deliberately ship values to every browser. A
+	// suspicious key name is therefore only useful when the value itself also
+	// resembles a credential.
+	publicEnvAssignmentPattern = regexp.MustCompile(`(?m)\b((?:NEXT_PUBLIC_|VITE_|REACT_APP_)[A-Z0-9_]*(?:SECRET|KEY|TOKEN|PASSWORD|PRIVATE|CREDENTIAL)[A-Z0-9_]*)\s*[=:]\s*["']([^"'\\\r\n]{8,})["']`)
+	dotenvLinePattern          = regexp.MustCompile(`(?m)^\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*([^\r\n]*)\s*$`)
 
-// Compiled patterns at package level.
-var envPatterns = []envPattern{
-	{
-		name:    "Next.js public secret (NEXT_PUBLIC_*SECRET/KEY/TOKEN*)",
-		pattern: regexp.MustCompile(`NEXT_PUBLIC_\w*(?:SECRET|KEY|TOKEN|PASSWORD|PRIVATE|CREDENTIAL)\w*\s*[=:]\s*['"]([^'"]{8,})`),
-		cwe:     "CWE-200",
-	},
-	{
-		name:    "Vite public secret (VITE_*SECRET/KEY/TOKEN*)",
-		pattern: regexp.MustCompile(`VITE_\w*(?:SECRET|KEY|TOKEN|PASSWORD|PRIVATE|CREDENTIAL)\w*\s*[=:]\s*['"]([^'"]{8,})`),
-		cwe:     "CWE-200",
-	},
-	{
-		name:    "Create React App public secret (REACT_APP_*SECRET/KEY/TOKEN*)",
-		pattern: regexp.MustCompile(`REACT_APP_\w*(?:SECRET|KEY|TOKEN|PASSWORD|PRIVATE|CREDENTIAL)\w*\s*[=:]\s*['"]([^'"]{8,})`),
-		cwe:     "CWE-200",
-	},
-}
+	knownSecretPatterns = []struct {
+		name string
+		re   *regexp.Regexp
+	}{
+		{"GitHub token", regexp.MustCompile(`^(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})$`)},
+		{"Stripe secret key", regexp.MustCompile(`^(?:sk|rk)_live_[A-Za-z0-9]{16,}$`)},
+		{"OpenAI-style secret key", regexp.MustCompile(`^sk-[A-Za-z0-9_-]{20,}$`)},
+		{"Slack credential", regexp.MustCompile(`^xox[baprs]-[A-Za-z0-9-]{20,}$`)},
+		{"private key", regexp.MustCompile(`(?i)(?:-----BEGIN|\\n-----BEGIN)[ A-Z0-9_-]*PRIVATE KEY-----`)},
+	}
 
-// dotenvSecretIndicators are substrings that indicate a secret value in .env file lines.
-var dotenvSecretIndicators = []string{
-	"sk_live_", "sk_test_",
-	"AKIA",
-	"ghp_", "gho_", "ghu_", "ghs_", "ghr_",
-	"password=", "PASSWORD=",
-	"secret=", "SECRET=",
-	"private_key=", "PRIVATE_KEY=",
-}
+	// These values are identifiers or publishable browser credentials by design.
+	// A variable name containing KEY or TOKEN does not turn them into secrets, so
+	// without this list each falls through to the "unrecognized high-entropy key"
+	// branch of assessCredential and reports Medium.
+	//
+	// Every entry must be public by design, because a match here suppresses the
+	// finding outright. Only Stripe's `pk_` prefix qualifies: `rk_` is a RESTRICTED
+	// key, i.e. a scoped SECRET key ("never put a secret API key (prefixed sk_live_
+	// or rk_live_) in a variable that your framework bundles" — Stripe), and it
+	// belongs in knownSecretPatterns alone. TestKnownValueListsAreDisjoint pins that
+	// no value can land in both.
+	//
+	// Shapes that secret_detect also needs live in modkit rather than being encoded
+	// twice; passive modules do not import each other.
+	knownPublicValuePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`^pk_(?:live|test)_[A-Za-z0-9]{8,}$`),
+		regexp.MustCompile(`^AIza[0-9A-Za-z_-]{20,}$`),
+		regexp.MustCompile(`^[0-9]+-[0-9A-Za-z_-]+\.apps\.googleusercontent\.com$`),
+		regexp.MustCompile(`^[0-9]+:[0-9]+:web:[0-9a-f]+$`),
+		// Branch.io key — the app's public id, required to init the web/mobile
+		// SDK. The sensitive half is `secret_live_…`, which does not match this.
+		regexp.MustCompile(`^key_(?:live|test)_[A-Za-z0-9]{16,40}$`),
+		// Braintree tokenization key — "publishable, meaning safe to include in
+		// your app"; authorizes tokenization only.
+		regexp.MustCompile(`^(?:sandbox|production)_[a-z0-9]{6,10}_[a-z0-9]{14,20}$`),
+	}
 
-// dotenvLinePattern matches raw .env file lines (KEY=VALUE format).
-var dotenvLinePattern = regexp.MustCompile(`(?m)^[A-Z_]+=.+`)
+	// knownPublicValueShapes are the public-by-design shapes shared with
+	// secret_detect (a reCAPTCHA site key rendered into the widget, a Salesforce
+	// Connected App Consumer Key riding in the /services/oauth2/authorize
+	// redirect). They live in modkit so the two modules cannot drift.
+	knownPublicValueShapes = []func(string) bool{
+		modkit.IsReCaptchaSiteKeyShape,
+		modkit.HasSalesforceConsumerKeyPrefix,
+	}
+)
+
+type credentialAssessment struct {
+	label      string
+	severity   severity.Severity
+	confidence severity.Confidence
+	reportable bool
+}
 
 // Module implements the environment secret exposure passive scanner.
 type Module struct {
@@ -78,12 +104,9 @@ func New() *Module {
 	return m
 }
 
-// CanProcess accepts text-based responses: JS, HTML, JSON, plain text, or .env/.js/.json URLs.
+// CanProcess accepts text responses and explicit JavaScript, JSON, or .env paths.
 func (m *Module) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
-	if ctx == nil || ctx.Response() == nil {
-		return false
-	}
-	if len(ctx.Response().Body()) == 0 {
+	if ctx == nil || ctx.Response() == nil || len(ctx.Response().Body()) == 0 {
 		return false
 	}
 
@@ -95,18 +118,22 @@ func (m *Module) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
 
 	if u, err := ctx.URL(); err == nil {
 		pathLower := strings.ToLower(u.Path)
-		if strings.HasSuffix(pathLower, ".env") || strings.HasSuffix(pathLower, ".js") ||
-			strings.HasSuffix(pathLower, ".json") {
-			return true
-		}
+		return isDotenvPath(pathLower) || strings.HasSuffix(pathLower, ".js") ||
+			strings.HasSuffix(pathLower, ".json")
 	}
 
 	return false
 }
 
-// ScanPerRequest scans response body for exposed environment secrets.
+// ScanPerRequest scans a response for credential-shaped values in intentionally
+// public environment variables or in a directly served dotenv file. It does not
+// treat a sensitive-looking key name as proof that its value is secret.
 func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext) ([]*output.ResultEvent, error) {
-	if !ctx.HasResponse() {
+	if !ctx.HasResponse() || modkit.IsEdgeBlockedResponse(ctx.Response()) {
+		return nil, nil
+	}
+	status := ctx.Response().StatusCode()
+	if status < 200 || status >= 300 {
 		return nil, nil
 	}
 
@@ -115,109 +142,172 @@ func (m *Module) ScanPerRequest(ctx *httpmsg.HttpRequestResponse, scanCtx *modki
 		return nil, nil
 	}
 
-	// Dedup by host
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	dedupKey := utils.Sha1(urlx.Host)
-	if diskSet != nil && diskSet.IsSeen(dedupKey) {
+	if diskSet != nil && diskSet.IsSeen(utils.Sha1(urlx.Host)) {
 		return nil, nil
 	}
 
 	body := ctx.Response().BodyToString()
-
+	ct := strings.ToLower(ctx.Response().Header("Content-Type"))
 	var results []*output.ResultEvent
 
-	// Check framework-prefixed env var patterns
-	for _, ep := range envPatterns {
-		matches := ep.pattern.FindAllStringSubmatch(body, -1)
-		if len(matches) == 0 {
-			continue
-		}
-
-		extracted := make([]string, 0, len(matches))
-		seen := make(map[string]struct{})
-		for _, match := range matches {
-			// Use the full match (match[0]) but redact the secret value
-			full := match[0]
-			key := utils.Sha1(full)
-			if _, ok := seen[key]; ok {
+	// Rendered documentation and examples commonly show public-env assignment
+	// syntax. Actual bundles remain eligible even when their URL happens to sit
+	// below a /docs route.
+	if !isRenderedDocumentation(urlx, ct) {
+		for _, match := range publicEnvAssignmentPattern.FindAllStringSubmatch(body, -1) {
+			key, value := match[1], strings.TrimSpace(match[2])
+			assessment := assessCredential(key, value)
+			if !assessment.reportable {
 				continue
 			}
-			seen[key] = struct{}{}
-			extracted = append(extracted, redactValue(modkit.Truncate(full, 120)))
+			results = append(results, newCandidate(
+				urlx,
+				"Public Environment Variable Contains Credential-Shaped Value",
+				fmt.Sprintf("%s exposes a value classified as %s. The public framework prefix proves browser exposure, but credential validity still requires provider-side validation.", key, assessment.label),
+				[]string{modkit.Truncate(match[0], 120)},
+				assessment,
+				map[string]any{"variable": key, "source_context": "public-framework-variable"},
+			))
 		}
-
-		results = append(results, &output.ResultEvent{
-			ModuleID:         ModuleID,
-			Host:             urlx.Host,
-			URL:              urlx.String(),
-			Matched:          urlx.String(),
-			ExtractedResults: extracted,
-			Info: output.Info{
-				Name:        fmt.Sprintf("Env Secret Exposure: %s", ep.name),
-				Description: fmt.Sprintf("Found %d unique occurrence(s) of %s at %s (%s)", len(extracted), ep.name, urlx.Path, ep.cwe),
-				Severity:    severity.High,
-				Confidence:  ModuleConfidence,
-				Tags:        []string{"secret", "env-exposure", "information-disclosure", "source-analysis"},
-			},
-			Metadata: map[string]any{
-				"pattern":    ep.name,
-				"cwe":        ep.cwe,
-				"matchCount": len(extracted),
-			},
-		})
 	}
 
-	// Check for .env file content served directly
-	dotenvMatches := dotenvLinePattern.FindAllString(body, 50)
-	if len(dotenvMatches) > 0 {
-		var secretLines []string
-		for _, line := range dotenvMatches {
-			for _, indicator := range dotenvSecretIndicators {
-				if strings.Contains(line, indicator) {
-					secretLines = append(secretLines, redactValue(modkit.Truncate(line, 120)))
-					break
-				}
+	// Generic KEY=VALUE parsing is deliberately limited to a successful response
+	// whose URL itself names a dotenv file. Text and HTML pages frequently contain
+	// snippets that merely document dotenv syntax.
+	if isDotenvPath(urlx.Path) && modkit.ClassifyContentType(ct) != modkit.ContentClassHTML && !modkit.IsJSOrTSContentType(ct) {
+		for _, match := range dotenvLinePattern.FindAllStringSubmatch(body, 100) {
+			key := strings.TrimSpace(match[1])
+			value := trimAssignmentValue(match[2])
+			assessment := assessCredential(key, value)
+			if !assessment.reportable {
+				continue
 			}
-		}
-
-		if len(secretLines) > 0 {
-			results = append(results, &output.ResultEvent{
-				ModuleID:         ModuleID,
-				Host:             urlx.Host,
-				URL:              urlx.String(),
-				Matched:          urlx.String(),
-				ExtractedResults: secretLines,
-				Info: output.Info{
-					Name:        "Env File Secret Exposure",
-					Description: fmt.Sprintf("Found %d secret line(s) in .env file content at %s (CWE-200)", len(secretLines), urlx.Path),
-					Severity:    severity.High,
-					Confidence:  severity.Certain,
-					Tags:        []string{"secret", "env-exposure", "information-disclosure", "source-analysis"},
-				},
-				Metadata: map[string]any{
-					"cwe":        "CWE-200",
-					"matchCount": len(secretLines),
-				},
-			})
+			results = append(results, newCandidate(
+				urlx,
+				"Credential-Shaped Value in Served Dotenv File",
+				fmt.Sprintf("A successful response for %s contains %s with a value classified as %s. The file exposure is established, but the credential must be validated before it is treated as live.", urlx.Path, key, assessment.label),
+				[]string{modkit.Truncate(match[0], 120)},
+				assessment,
+				map[string]any{"variable": key, "source_context": "dotenv-path"},
+			))
 		}
 	}
 
 	return results, nil
 }
 
-// redactValue redacts secret values after the = or : delimiter, keeping the key visible.
-func redactValue(s string) string {
-	for _, delim := range []string{"=", ":"} {
-		idx := strings.Index(s, delim)
-		if idx != -1 && idx+1 < len(s) {
-			key := s[:idx+1]
-			val := s[idx+1:]
-			val = strings.TrimLeft(val, " '\"")
-			if len(val) > 8 {
-				return key + val[:4] + strings.Repeat("*", len(val)-8) + val[len(val)-4:]
-			}
-			return key + strings.Repeat("*", len(val))
+func newCandidate(urlx *urlutil.URL, name, description string, extracted []string, assessment credentialAssessment, metadata map[string]any) *output.ResultEvent {
+	metadata["credential_class"] = assessment.label
+	metadata["validation_required"] = true
+	return &output.ResultEvent{
+		ModuleID:         ModuleID,
+		RecordKind:       output.RecordKindCandidate,
+		EvidenceGrade:    output.EvidenceGradeCandidate,
+		Host:             urlx.Host,
+		URL:              urlx.String(),
+		Matched:          urlx.String(),
+		ExtractedResults: extracted,
+		Info: output.Info{
+			Name:        name,
+			Description: description,
+			Severity:    assessment.severity,
+			Confidence:  assessment.confidence,
+			Tags:        []string{"secret", "env-exposure", "information-disclosure", "source-analysis"},
+		},
+		Metadata: metadata,
+	}
+}
+
+func assessCredential(key, value string) credentialAssessment {
+	value = trimAssignmentValue(value)
+	if !dotenvValueIsSubstantive(value) {
+		return credentialAssessment{}
+	}
+	// A recognised secret family is classified BEFORE the public list. The two are
+	// disjoint today (TestKnownValueListsAreDisjoint pins that), but should they
+	// ever overlap again the value must be reported rather than silently dropped —
+	// which is what happened while `rk_live_…` sat in both lists.
+	for _, pattern := range knownSecretPatterns {
+		if pattern.re.MatchString(value) {
+			return credentialAssessment{label: pattern.name, severity: severity.High, confidence: severity.Firm, reportable: true}
 		}
 	}
-	return s
+	if isKnownPublicValue(value) {
+		return credentialAssessment{}
+	}
+
+	keyLower := strings.ToLower(key)
+	if strings.Contains(keyLower, "secret") || strings.Contains(keyLower, "password") ||
+		strings.Contains(keyLower, "private") || strings.Contains(keyLower, "credential") ||
+		strings.Contains(keyLower, "token") {
+		if len(value) >= 16 && infra.ShannonEntropyBits(value) >= 3.2 {
+			return credentialAssessment{label: "high-entropy value under a secret-bearing key", severity: severity.Medium, confidence: severity.Tentative, reportable: true}
+		}
+	}
+
+	// API_KEY and similar names are especially likely to hold intentionally
+	// publishable identifiers. Only retain an unrecognized one when it is both
+	// long and unusually varied; provider validation is still required.
+	if strings.Contains(keyLower, "key") && len(value) >= 24 && infra.ShannonEntropyBits(value) >= 4.0 {
+		return credentialAssessment{label: "unrecognized high-entropy key", severity: severity.Medium, confidence: severity.Tentative, reportable: true}
+	}
+	return credentialAssessment{}
+}
+
+func isKnownPublicValue(value string) bool {
+	for _, pattern := range knownPublicValuePatterns {
+		if pattern.MatchString(value) {
+			return true
+		}
+	}
+	for _, shape := range knownPublicValueShapes {
+		if shape(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDotenvPath(rawPath string) bool {
+	base := strings.ToLower(path.Base(rawPath))
+	return base == ".env" || strings.HasPrefix(base, ".env.") || strings.HasSuffix(base, ".env")
+}
+
+func isRenderedDocumentation(u *urlutil.URL, contentType string) bool {
+	if modkit.ClassifyContentType(contentType) != modkit.ContentClassHTML && !strings.Contains(contentType, "x-component") {
+		return false
+	}
+	for _, segment := range strings.Split(strings.ToLower(u.Path), "/") {
+		switch segment {
+		case "doc", "docs", "documentation", "reference", "guide", "tutorial", "example", "examples":
+			return true
+		}
+	}
+	return false
+}
+
+func trimAssignmentValue(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, `"'`)
+	return strings.TrimSpace(value)
+}
+
+// dotenvValueIsSubstantive rejects empty, short, and obvious demonstration
+// values before any entropy or provider-specific classification is attempted.
+func dotenvValueIsSubstantive(value string) bool {
+	value = trimAssignmentValue(value)
+	if len(value) < 8 || modkit.IsPlaceholderValue(value) {
+		return false
+	}
+	lower := strings.ToLower(value)
+	for _, placeholder := range []string{
+		"changeme", "change-me", "your_", "your-", "yourvalue", "placeholder",
+		"example", "dummy", "sample", "redacted", "xxxx", "****", "<", "${",
+	} {
+		if strings.Contains(lower, placeholder) {
+			return false
+		}
+	}
+	return true
 }

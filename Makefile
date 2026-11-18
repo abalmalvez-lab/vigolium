@@ -1,4 +1,11 @@
-.PHONY: build build-embedded build-all snapshot release public public-release prepare-public-scripts clean test test-unit test-integration test-e2e test-e2e-api test-e2e-agent test-e2e-postgres test-canary sanity-check smoke-autopilot-auth test-e2e-vampi test-e2e-dvwa test-e2e-juiceshop test-e2e-browser-fallback test-e2e-piolium test-benchmark test-benchmark-whitebox test-benchmark-blackbox test-benchmark-all test-benchmark-crapi test-benchmark-vuln-java test-benchmark-vuln-nginx test-benchmark-coverage test-agent-benchmark test-agent-parsing test-agent-quality test-agent-handoff test-agent-benchmark-e2e benchmark-agent-generate test-coverage coverage-gate coverage-combined test-coverage-check test-race test-ci test-xbow test-xbow-ssti test-xbow-xss test-xbow-sqli test-xbow-lfi test-xbow-cmdi test-xbow-ssrf test-xbow-xxe xbow-build lint verify-generated fmt tidy deps deps-chrome deps-chrome-update install install-gotestsum swagger help postgres-up postgres-down postgres-logs postgres-status crapi-up crapi-down crapi-logs crapi-status juiceshop-up juiceshop-down juiceshop-logs juiceshop-status vampi-up vampi-down vampi-logs vampi-status vulnerable-java-up vulnerable-java-down vulnerable-java-logs vulnerable-java-status vulnerable-nginx-up vulnerable-nginx-down vulnerable-nginx-logs vulnerable-nginx-status apps-up apps-down docker docker-build docker-build-prod docker-run docker-push docker-buildx-setup docker-publish update-jsscan ensure-jsscan sync-audit update-audit ensure-audit ensure-audit-dist restage-host-audit build-audit update-ui ssh-testbed-keygen ssh-testbed-up ssh-testbed-down ssh-testbed-status ssh-testbed-logs generate-metadata prepare-release-scripts cdn-sync bump-version npm-build npm-pack npm-publish
+.PHONY: build build-prof build-embedded build-all snapshot release public public-release github-release prepare-public-scripts clean test test-unit test-integration test-spitolas-browser test-browser-conformance test-e2e test-e2e-api test-e2e-agent test-e2e-rest-scan test-e2e-postgres test-canary sanity-check test-e2e-vampi test-e2e-dvwa test-e2e-juiceshop test-e2e-browser-fallback test-e2e-piolium test-benchmark test-benchmark-whitebox test-benchmark-blackbox test-benchmark-all test-benchmark-crapi test-benchmark-vuln-java test-benchmark-vuln-nginx test-benchmark-coverage bench-diff test-agent-benchmark test-agent-parsing test-agent-quality test-agent-handoff test-agent-benchmark-e2e benchmark-agent-generate test-coverage coverage-gate coverage-combined test-coverage-check test-race test-ci test-xbow test-xbow-ssti test-xbow-xss test-xbow-sqli test-xbow-lfi test-xbow-cmdi test-xbow-ssrf test-xbow-xxe xbow-build lint verify-generated fmt tidy deps deps-chrome deps-chrome-update install install-gotestsum swagger help postgres-up postgres-down postgres-logs postgres-status crapi-up crapi-down crapi-logs crapi-status juiceshop-up juiceshop-down juiceshop-logs juiceshop-status vampi-up vampi-down vampi-logs vampi-status vulnerable-java-up vulnerable-java-down vulnerable-java-logs vulnerable-java-status vulnerable-nginx-up vulnerable-nginx-down vulnerable-nginx-logs vulnerable-nginx-status apps-up apps-down docker docker-build docker-build-prod docker-run docker-push docker-buildx-setup docker-publish update-jstangle ensure-jstangle sync-audit update-audit ensure-audit ensure-audit-dist restage-host-audit build-audit update-ui ssh-testbed-keygen ssh-testbed-up ssh-testbed-down ssh-testbed-status ssh-testbed-logs generate-metadata prepare-release-scripts release-verify release-sign release-prune cdn-sync bump-version npm-build npm-pack npm-publish
+# Phony targets defined in their own sections below (declared here so a stray
+# same-named file can never shadow them).
+.PHONY: all build-linux build-darwin build-windows deps-chrome-cft sync-platform sync-skills \
+	test-canary-postgres test-pg-full test-e2e-autonomous test-e2e-scorecard test-e2e-expect test-e2e-expect-lab test-e2e-expect-live e2e-expect-lab \
+	access-lab-up access-lab-down access-lab-logs access-lab-status schema \
+	setup-agent-codex test-smoke-autopilot test-smoke-autopilot-rest test-smoke-autopilot-prior test-smoke-autopilot-ginandjuice \
+	test-smoke-autopilot-crapi test-smoke-autopilot-juiceshop
 
 # Go parameters
 GOCMD=go
@@ -7,6 +14,7 @@ GOTEST=$(GOCMD) test
 GOGET=$(GOCMD) get
 GOFMT=$(GOCMD) fmt
 GOMOD=$(GOCMD) mod
+GORUN=$(GOCMD) run
 BINARY_NAME=vigolium
 BINARY_DIR=bin
 
@@ -52,7 +60,11 @@ VERSION=$(shell grep -E '^[[:space:]]*Version[[:space:]]+=' pkg/cli/version.go |
 COMMIT_HASH=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME=$(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 CLI_PKG=github.com/vigolium/vigolium/pkg/cli
-LDFLAGS_INNER=-s -w -X $(CLI_PKG).Version=$(VERSION) -X $(CLI_PKG).Commit=$(COMMIT_HASH) -X $(CLI_PKG).BuildTime=$(BUILD_TIME)
+# Shared version stamps. Factored out so a new -X symbol is added once and reaches
+# every build variant — a stamp that lands in only one is invisible until someone
+# reads --version output from the other. VERSION_SUFFIX lets a variant mark itself.
+LDFLAGS_STAMP=-X $(CLI_PKG).Version=$(VERSION)$(VERSION_SUFFIX) -X $(CLI_PKG).Commit=$(COMMIT_HASH) -X $(CLI_PKG).BuildTime=$(BUILD_TIME)
+LDFLAGS_INNER=-s -w $(LDFLAGS_STAMP)
 LDFLAGS=-ldflags "$(LDFLAGS_INNER)"
 
 # R2 CDN prefix for `make release` — nightly release uploads. Served at
@@ -65,7 +77,10 @@ INSTALL_BASE_URL=https://cdn.vigolium.com/$(R2_PREFIX)
 R2_PUBLIC_PREFIX=vigolium-release
 PUBLIC_INSTALL_BASE_URL=https://cdn.vigolium.com/$(R2_PUBLIC_PREFIX)
 PUBLIC_DIST_DIR=build/dist-public
-PUBLIC_TARGETS=linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+# windows/arm64 is intentionally absent: the embedded vigolium-audit and
+# jstangle helpers are Bun-compiled and Bun has no bun-windows-arm64 target.
+# Windows on ARM runs the amd64 artifact under emulation.
+PUBLIC_TARGETS=linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 # Version without leading 'v' — matches the install.sh tarball-name convention.
 PUBLIC_VERSION=$(patsubst v%,%,$(VERSION))
 
@@ -74,10 +89,11 @@ all: build
 
 # Build main binary and install to GOBIN
 build: ensure-audit
-	@if [ -z "$$(ls $(JSSCAN_RES_DST_DIR)/ 2>/dev/null)" ]; then \
-		echo "$(PREFIX) First build on this machine — jsscan binaries not found, running 'make deps' to prepare dependencies..."; \
+	@if [ -z "$$(ls $(JSTANGLE_RES_DST_DIR)/ 2>/dev/null)" ]; then \
+		echo "$(PREFIX) First build on this machine — jstangle binaries not found, running 'make deps' to prepare dependencies..."; \
 		$(MAKE) deps; \
 	fi
+	@$(MAKE) --no-print-directory pack-jstangle-host
 	@echo "$(PREFIX) Building $(BINARY_NAME)..."
 	@mkdir -p $(BINARY_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BINARY_DIR)/$(BINARY_NAME) ./cmd/vigolium
@@ -88,7 +104,7 @@ build: ensure-audit
 	@echo "$(PREFIX) Build complete! Binary: $(BINARY_DIR)/$(BINARY_NAME) and $(GOPATH_BIN)/$(BINARY_NAME)"
 
 # Build with embedded Chromium (requires 'make deps-chrome' first)
-build-embedded: ensure-audit
+build-embedded: ensure-audit pack-jstangle-host
 	@echo "$(PREFIX) Building $(BINARY_NAME) with embedded Chromium..."
 	@mkdir -p $(BINARY_DIR)
 	$(GOBUILD) $(LDFLAGS) -tags=embed_chromium -o $(BINARY_DIR)/$(BINARY_NAME) ./cmd/vigolium
@@ -97,6 +113,21 @@ build-embedded: ensure-audit
 	@rm -f $(GOPATH_BIN)/$(BINARY_NAME)
 	@cp $(BINARY_DIR)/$(BINARY_NAME) $(GOPATH_BIN)/$(BINARY_NAME)
 	@echo "$(PREFIX) Build complete! Binary: $(BINARY_DIR)/$(BINARY_NAME) and $(GOPATH_BIN)/$(BINARY_NAME)"
+
+# Build a profiling binary: `build` without -s -w, so Go symbols survive and CPU
+# profilers can attribute samples (the stripped release binary reports every frame
+# as "??? (in vigolium)"). Writes bin/vigolium-prof and deliberately does NOT
+# install to $(GOPATH_BIN) — profiling means running a real scan, which must not
+# require swapping out the binary you ship.
+#
+#   make build-prof
+#   sample $$(pgrep -n -f 'vigolium-prof scan') 15 -f /tmp/scan.sample
+build-prof: VERSION_SUFFIX=-prof
+build-prof: ensure-audit pack-jstangle-host
+	@echo "$(PREFIX) Building $(BINARY_NAME)-prof (symbols retained, not installed)..."
+	@mkdir -p $(BINARY_DIR)
+	$(GOBUILD) -ldflags "$(LDFLAGS_STAMP)" -o $(BINARY_DIR)/$(BINARY_NAME)-prof ./cmd/vigolium
+	@echo "$(PREFIX) Profiling binary: $(BINARY_DIR)/$(BINARY_NAME)-prof"
 
 # Build for multiple platforms
 build-all: build build-linux build-darwin build-windows
@@ -122,17 +153,23 @@ install-gotestsum:
 	fi
 
 # Run all tests (install gotestsum first; see GOLIST_EXCLUDE for what's filtered)
-test: install-gotestsum ensure-jsscan
+test: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Running all tests..."
 	$(TESTCMD) $(TESTFLAGS) $$(go list ./... | grep -Ev '$(GOLIST_EXCLUDE)')
 
 # Run tests with race detector (see GOLIST_EXCLUDE for what's filtered)
-test-race: install-gotestsum ensure-jsscan
+# Race-sensitive packages (goroutine shutdown, ctx-aware polling, shared
+# counters) whose tests are meant to run here: pkg/spitolas/internal/network
+# (capture writer receipt/drain, capture timing), pkg/spitolas/internal/condition
+# (ctx-aware wait polling), pkg/spitolas/internal/browser (launch/tab-creation
+# cancellation, dialog handling), pkg/spitolas/internal/crawler and
+# pkg/spitolas/internal/form (stats, policy gates, upload fixtures).
+test-race: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Running tests with race detector..."
-	$(TESTCMD) $(TESTFLAGS) -race $$(go list ./... | grep -Ev '$(GOLIST_EXCLUDE)')
+	$(TESTCMD) $(TESTFLAGS) -race -timeout 30m $$(go list ./... | grep -Ev '$(GOLIST_EXCLUDE)')
 
 # Run unit tests (excludes integration, e2e; see GOLIST_EXCLUDE for what's filtered)
-test-unit: install-gotestsum ensure-jsscan
+test-unit: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Running unit tests..."
 	$(TESTCMD) $(TESTFLAGS) -short $$(go list ./... | grep -Ev '$(GOLIST_EXCLUDE)')
 
@@ -144,10 +181,37 @@ test-integration: install-gotestsum
 # Run benchmark tests (alias for test-integration)
 test-benchmark: test-integration
 
+# Run spitolas browser integration tests (launch a real headless browser against a
+# local httptest server; no Docker). Covers native service-worker network capture
+# and browser teardown / zombie-process guards.
+test-spitolas-browser: install-gotestsum
+	@echo "$(PREFIX) Running spitolas browser integration tests (real headless browser)..."
+	$(TESTCMD) $(TESTFLAGS) -tags=integration -timeout 15m ./pkg/spitolas/internal/browser/...
+
+# Browser conformance: the integration contracts of the browser crawler —
+# launcher and security flags, dialog and submit-guard policy, form fill
+# outcomes and form scoping, POST-submission attribution, crawler gates, wait
+# conditions — against a real headless browser and local httptest fixtures (no
+# Docker, no internet). These files are //go:build integration, so the -short
+# unit run never executes them. Fails up front when no browser can be
+# launched, so a host without one is never reported green. -p 1 keeps the
+# packages from competing for the CPU, which the timing-sensitive cases need.
+# The crawler package alone runs over 20m of real crawls over the Crawljax site
+# fixtures (test/spitolas/testdata/html/site), hence the 45m binary timeout.
+CONFORMANCE_PKGS=./pkg/spitolas/internal/browser/... ./pkg/spitolas/internal/form/... ./pkg/spitolas/internal/crawler/... ./pkg/spitolas/internal/condition/...
+test-browser-conformance: install-gotestsum
+	@echo "$(PREFIX) Checking that a headless browser can be launched..."
+	@out="$$($(GOTEST) -tags=integration -count=1 -run '^TestConformancePrecheck$$' ./pkg/spitolas/internal/browser/ 2>&1)" || { \
+		echo "$$out" | tail -n 5; \
+		echo "$(PREFIX) No launchable headless browser. Install Google Chrome or Chromium, or run 'vigolium doctor --fix --only chrome' to fetch Chrome for Testing, then re-run."; \
+		exit 1; }
+	@echo "$(PREFIX) Running browser conformance tests (real headless browser)..."
+	$(TESTCMD) $(TESTFLAGS) -tags=integration -p 1 -count=1 -timeout 45m $(CONFORMANCE_PKGS)
+
 # Run E2E tests (requires Docker)
 test-e2e: install-gotestsum
 	@echo "$(PREFIX) Running E2E tests (requires Docker)..."
-	$(TESTCMD) $(TESTFLAGS) -tags=e2e -timeout 60m ./test/e2e/...
+	$(TESTCMD) $(TESTFLAGS) -tags=e2e -timeout 90m ./test/e2e/... ./test/e2e-expect/...
 
 # Run API E2E tests only (server endpoint tests, no Docker needed)
 test-e2e-api: install-gotestsum
@@ -158,6 +222,16 @@ test-e2e-api: install-gotestsum
 test-e2e-agent: install-gotestsum
 	@echo "$(PREFIX) Running Agent API E2E tests..."
 	$(TESTCMD) $(TESTFLAGS) -tags=e2e -run TestAgentAPI_ ./test/e2e/...
+
+# Run the REST scan-trigger E2E tests: boot the API server in-process and drive a
+# native scan AND an agentic (autopilot/swarm) scan entirely through the REST API
+# against a hermetic 127.0.0.1 target. No Docker, no LLM provider required — the
+# agentic legs assert the launch/track/cancel wiring (a real provider-backed run
+# lives in `make test-smoke-autopilot`). Regression guard for server mis-wiring
+# that turns scan-triggering endpoints into 500s/panics.
+test-e2e-rest-scan: install-gotestsum
+	@echo "$(PREFIX) Running REST scan-trigger E2E tests (native + agentic via API)..."
+	$(TESTCMD) $(TESTFLAGS) -tags=e2e -timeout 10m -run TestAPI_REST_ ./test/e2e/...
 
 # Run PostgreSQL E2E tests (requires 'make postgres-up' first)
 test-e2e-postgres: install-gotestsum
@@ -171,6 +245,31 @@ test-e2e-postgres: install-gotestsum
 test-canary: install-gotestsum
 	@echo "$(PREFIX) Running canary tests (requires Docker)..."
 	$(TESTCMD) $(TESTFLAGS) -tags=canary -timeout 60m ./test/e2e/...
+
+# Expectation e2e kit (test/e2e-expect). Two halves, both under the e2e tag:
+#   lab  — scan/fuzz/probe/lifecycle against an in-process lab of planted bugs,
+#          benign twins and hostile servers, asserting on findings AND on what
+#          each server saw on the wire (scope, pace, budgets, hangs, leaks).
+#   live — TestLive_*: native scans, module-scoped and stateless scans, and
+#          `vigolium run <phase>` against Docker targets (Juice Shop, VAmPI).
+# Known defects live in knownDefects (scan_test.go); golden results in
+# test/e2e-expect/testdata/expect.json (regenerate: E2E_EXPECT_ARGS='-args -update-expect').
+# E2E_EXPECT_BIN=bin/vigolium reuses a built binary for the CLI scenarios.
+test-e2e-expect: install-gotestsum
+	@echo "$(PREFIX) Running expectation e2e kit (lab + live Docker targets)..."
+	$(TESTCMD) $(TESTFLAGS) -tags=e2e -timeout 90m ./test/e2e-expect/... $(E2E_EXPECT_ARGS)
+
+test-e2e-expect-lab: install-gotestsum
+	@echo "$(PREFIX) Running expectation e2e kit, lab half (no Docker)..."
+	$(TESTCMD) $(TESTFLAGS) -tags=e2e -timeout 30m -short ./test/e2e-expect/... $(E2E_EXPECT_ARGS)
+
+test-e2e-expect-live: install-gotestsum
+	@echo "$(PREFIX) Running expectation e2e kit, live half (requires Docker)..."
+	$(TESTCMD) $(TESTFLAGS) -tags=e2e -timeout 90m -run 'TestLive_' ./test/e2e-expect/... $(E2E_EXPECT_ARGS)
+
+# Serve the expectation lab standalone for hands-on testing (Ctrl-C prints the ledger).
+e2e-expect-lab:
+	go run ./test/tools/lab $(LAB_ARGS)
 
 # Run canary tests against PostgreSQL (requires 'make postgres-up' first).
 # Per-test: drops+recreates the shared PG schema for isolation.
@@ -200,20 +299,7 @@ test-pg-full: install-gotestsum
 # provider (~/.codex/auth.json, $ANTHROPIC_API_KEY, or $OPENAI_API_KEY) is set.
 sanity-check: build
 	@echo "$(PREFIX) Running sanity-check (real-target API + storage smoke test)..."
-	@bash test/smoke-test-scripts/sanity-check.sh
-
-# Smoke test: agentic-scan auth preflight against local Juice Shop.
-# Verifies `vigolium agent autopilot --credentials --auth-required` end-to-end:
-# boots juice-shop, clones the source, runs autopilot with a pinned --scan-uuid,
-# and asserts the prepared session config + hydrated headers landed on disk and
-# in the AgenticScan row.
-#
-# Required: ~/.codex/auth.json (codex-oauth provider); docker + git + jq + curl
-# on PATH. Leaves juice-shop running for fast re-runs (tear down with
-# `make juiceshop-down`).
-smoke-autopilot-auth: build
-	@echo "$(PREFIX) Running smoke-autopilot-auth (juice-shop autopilot + --credentials)..."
-	@bash test/smoke-test-scripts/smoke-autopilot-juiceshop-auth.sh
+	@bash test/sanity-check/sanity-check.sh
 
 # Run E2E VAmPI tests only (SQLi testing)
 test-e2e-vampi: install-gotestsum
@@ -229,6 +315,31 @@ test-e2e-dvwa: install-gotestsum
 test-e2e-juiceshop: install-gotestsum
 	@echo "$(PREFIX) Running Juice Shop E2E tests..."
 	$(TESTCMD) $(TESTFLAGS) -tags=canary -run TestJuiceShop ./test/e2e/
+
+# Run autonomous full-chain scan canary tests: point the scanner at a live app's
+# base URL only and let it discover the surface (content discovery + browser
+# spidering) and assess it (dynamic-assessment) with the full module set, then
+# assert it found routes it was never told about AND findings on them. Requires
+# Docker; the Juice Shop SPA case also needs a Chromium runtime (skips gracefully
+# without one).
+test-e2e-autonomous: install-gotestsum
+	@echo "$(PREFIX) Running autonomous full-chain scan canary tests..."
+	$(TESTCMD) $(TESTFLAGS) -tags=canary -timeout 30m -run TestAutonomousScan ./test/e2e/
+
+# Run the ground-truth coverage scorecards: seed each app's source-verified
+# vulnerable surface (DVWA/VAmPI/Juice Shop/vulnerable-java), run the full module
+# set, and report CATCH/MISS per known vuln vs the catalog extracted from the
+# app's own source (reverse-engineered endpoints for vulnerable-java). Includes
+# authenticated cases: Juice Shop (Bearer token) and crAPI (a multi-session
+# --auth-file bundle) that reach the protected surface and catch the numeric-ID
+# BOLA/IDOR via idor-detection (single identity) and authz-compare (second
+# identity). Requires Docker; the crAPI case also needs its stack up
+# (`make crapi-up`) and skips cleanly otherwise (VIGOLIUM_CRAPI_URL overrides).
+test-e2e-scorecard: install-gotestsum
+	@echo "$(PREFIX) Running ground-truth coverage scorecard canary tests..."
+	@echo "$(PREFIX) (verbose: each scan logs its replicable 'vigolium scan ...' command + per-vuln CATCH/MISS)"
+	@echo "$(PREFIX) (includes TestCoverageScorecard_RESTNativeScan_DVWA — the same DVWA scan driven through the REST API)"
+	$(GOTEST) -v -tags=canary -timeout 40m -run TestCoverageScorecard ./test/e2e/
 
 # Run browser fallback E2E tests (Docker multi-arch, verifies system chromium fallback)
 test-e2e-browser-fallback: install-gotestsum
@@ -273,6 +384,14 @@ test-benchmark-vuln-nginx: install-gotestsum
 test-benchmark-coverage: install-gotestsum
 	@echo "$(PREFIX) Generating benchmark coverage report..."
 	$(TESTCMD) $(TESTFLAGS) -tags=canary -run TestBenchmark_CoverageReport ./test/benchmark/coverage/...
+
+# Compare two benchmark result files (BENCH_OUT JSON lines, e.g. the nightly
+# `benchmark-results` artifacts of two commits). Exits 1 on a regression:
+# passed -> failed, fewer findings, or a case missing from HEAD.
+#   make bench-diff BASE=old.jsonl HEAD=new.jsonl [BENCH_DIFF_FLAGS=-strict-requests]
+bench-diff:
+	@test -n "$(BASE)" -a -n "$(HEAD)" || { echo "usage: make bench-diff BASE=old.jsonl HEAD=new.jsonl"; exit 2; }
+	go run ./test/tools/benchdiff -base "$(BASE)" -head "$(HEAD)" $(BENCH_DIFF_FLAGS)
 
 # XBOW validation benchmarks (requires XBOW_SOURCE_DIR, Docker)
 XBOW_SOURCE_DIR ?= /Users/j3ssie/Desktop/research/validation-benchmarks
@@ -357,7 +476,7 @@ xbow-build:
 	@echo "$(PREFIX) XBOW containers pre-built"
 
 # Run tests with coverage
-test-coverage: install-gotestsum ensure-jsscan
+test-coverage: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Running tests with coverage..."
 	$(TESTCMD) $(TESTFLAGS) -coverprofile=coverage.out ./...
 	$(GOCMD) tool cover -html=coverage.out -o coverage.html
@@ -365,7 +484,7 @@ test-coverage: install-gotestsum ensure-jsscan
 
 # Test with JUnit XML output (for CI). Emits a coverage profile and enforces
 # the COVERAGE_MIN floor after the run so a coverage regression fails the build.
-test-ci: install-gotestsum ensure-jsscan
+test-ci: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Running tests for CI..."
 	@$(GOPATH_BIN)/gotestsum --junitfile test-results.xml --format testdox --format-hide-empty-pkg --hide-summary=skipped,output -- -v -race -coverprofile=coverage.out ./...
 	@$(MAKE) --no-print-directory coverage-gate
@@ -382,7 +501,7 @@ coverage-gate:
 
 # Standalone coverage floor check over the unit-test scope. Runs the -short
 # suite once with coverage and enforces COVERAGE_MIN via coverage-gate.
-test-coverage-check: install-gotestsum ensure-jsscan
+test-coverage-check: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Checking coverage floor ($(COVERAGE_MIN)%)..."
 	@$(GOCMD) test -short -coverprofile=coverage.out $$($(GOCMD) list ./... | grep -Ev '$(GOLIST_EXCLUDE)') > /dev/null
 	@$(MAKE) --no-print-directory coverage-gate
@@ -402,7 +521,7 @@ test-coverage-check: install-gotestsum ensure-jsscan
 # denominators: per-package unit is over packages-with-tests; whole-tree combined
 # is over every package (the e2e leg's untested-package blocks are in the base).
 # `set -e` makes any failing leg or merge abort the target (no silent stale report).
-coverage-combined: install-gotestsum ensure-jsscan
+coverage-combined: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Combined coverage (unit + no-Docker e2e; report only, not gated)..."
 	@set -e; \
 	pkgs=$$($(GOCMD) list ./... | grep -Ev '$(GOLIST_EXCLUDE)'); \
@@ -467,6 +586,7 @@ JUICESHOP_DIR=$(VULN_APPS_DIR)/juice-shop
 VAMPI_DIR=$(VULN_APPS_DIR)/vampi
 VULN_JAVA_DIR=$(VULN_APPS_DIR)/vulnerable-java
 VULN_NGINX_DIR=$(VULN_APPS_DIR)/vulnerable-nginx
+ACCESS_LAB_DIR=$(VULN_APPS_DIR)/access-lab
 
 # Start all vulnerable apps
 apps-up: juiceshop-up vampi-up crapi-up vulnerable-java-up vulnerable-nginx-up
@@ -576,8 +696,8 @@ vulnerable-java-status:
 
 vulnerable-nginx-up:
 	@echo "$(PREFIX) Starting detectify Vulnerable Nginx..."
-	docker compose -f $(VULN_NGINX_DIR)/docker-compose.yaml up -d
-	@echo "$(PREFIX) Vulnerable Nginx: http://127.0.0.1:5000"
+	docker compose -f $(VULN_NGINX_DIR)/docker-compose.yaml up -d --build
+	@echo "$(PREFIX) Vulnerable Nginx: http://$$(docker compose -f $(VULN_NGINX_DIR)/docker-compose.yaml port nginx 5000)"
 
 vulnerable-nginx-down:
 	@echo "$(PREFIX) Stopping detectify Vulnerable Nginx..."
@@ -589,42 +709,272 @@ vulnerable-nginx-logs:
 vulnerable-nginx-status:
 	docker compose -f $(VULN_NGINX_DIR)/docker-compose.yaml ps
 
-# jsscan binary management
-JSSCAN_SRC_DIR=platform/jsscan/bin
-JSSCAN_DST_DIR=internal/resources/deparos/jsscan
+# --- access-lab (durable-autopilot auth/IDOR/BAC demo) ---
 
-# jsscan embedded resources (internal/resources)
-JSSCAN_RES_SRC_DIR=platform/jsscan/bin
-JSSCAN_RES_DST_DIR=internal/resources/deparos/jsscan
-JSSCAN_RES_BINS=jsscan-darwin-amd64 jsscan-darwin-arm64 jsscan-linux-amd64 jsscan-linux-arm64 jsscan-windows-amd64.exe
+access-lab-up:
+	@echo "$(PREFIX) Starting access-lab (deliberately vulnerable)..."
+	docker compose -f $(ACCESS_LAB_DIR)/docker-compose.yml up -d --build
+	@echo "$(PREFIX) access-lab: http://127.0.0.1:9899  (wiener/peter, carlos/hunter2, admin/admin123)"
 
-# Build jsscan from source and copy binaries
-update-jsscan:
-	@echo "$(PREFIX) Building jsscan from source..."
-	cd platform/jsscan && bun install --linker isolated && bun run build:bin
-	@echo "$(PREFIX) Copying jsscan binaries to $(JSSCAN_DST_DIR)..."
-	@mkdir -p $(JSSCAN_DST_DIR)
-	@cp -R $(JSSCAN_SRC_DIR)/* $(JSSCAN_DST_DIR)/
-	@echo "$(PREFIX) jsscan binaries updated"
+access-lab-down:
+	@echo "$(PREFIX) Stopping access-lab..."
+	docker compose -f $(ACCESS_LAB_DIR)/docker-compose.yml down -v
 
-# Pre-test step: build jsscan from source if any binary is missing or is an LFS pointer
-ensure-jsscan:
-	@needs_build=0; \
-	for bin in $(JSSCAN_RES_BINS); do \
-		f="$(JSSCAN_RES_DST_DIR)/$$bin"; \
-		if [ ! -f "$$f" ] || [ $$(wc -c < "$$f" | tr -d ' ') -lt 1024 ]; then \
-			needs_build=1; \
-			break; \
+access-lab-logs:
+	docker compose -f $(ACCESS_LAB_DIR)/docker-compose.yml logs -f
+
+access-lab-status:
+	docker compose -f $(ACCESS_LAB_DIR)/docker-compose.yml ps
+
+# Point vigolium at the codex (OpenAI) OAuth agent backend. Assumes you have
+# already run `codex login` (or `codex exec -m gpt-5.4 'hola'`
+# works). Defaults to the cheaper gpt-5.4 model to keep smoke-test
+# cost down. This only writes config — it does not make a paid call.
+setup-agent-codex:
+	@echo "$(PREFIX) Configuring the codex (openai-codex-oauth) agent backend..."
+	@echo "$(PREFIX) Prereq: 'codex exec -m gpt-5.4 hola' must already work (run 'codex login' first)."
+	vigolium config set agent.olium.provider openai-codex-oauth
+	vigolium config set agent.olium.oauth_cred_path ~/.codex/auth.json
+	vigolium config set agent.olium.model gpt-5.4
+	@echo "$(PREFIX) done. Verify with: vigolium ol -p 'what model are you running'"
+
+# Durable-autopilot SMOKE tests (not deterministic e2e tests): run the REAL
+# agent (a live, PAID LLM run under your configured agent.olium credentials)
+# against a vulnerable target, logging in and hunting IDOR / BAC / XSS / mass-
+# assignment — the auth-gated, multi-step, browser classes a native scan can't
+# reach. Print the exact agent command + the actual input before running.
+#
+#   !!! COSTS MONEY. Requires `make setup-agent-codex` (or another configured
+#   !!! agent.olium provider) first. Bounded by MAX_DURATION (default 15m).
+#
+# Override via env, e.g.:
+#   MODEL=gpt-5.5 MODE=shadow MAX_DURATION=8m make test-smoke-autopilot
+test-smoke-autopilot: build
+	@echo "$(PREFIX) Durable-autopilot access-lab SMOKE test (REAL, PAID agent run)..."
+	VIGOLIUM_BIN=$(CURDIR)/bin/vigolium PROFILE=access-lab bash test/smoke-test/smoke-autopilot.sh
+
+# Same REAL, PAID autopilot run as test-smoke-autopilot, but driven through the
+# REST API instead of the CLI: the script boots `vigolium server`, POSTs
+# /api/agent/run/autopilot, and polls /api/agent/status/:id to completion — the
+# operator/workbench path end-to-end. Same cost profile; TRANSPORT overridable.
+test-smoke-autopilot-rest: build
+	@echo "$(PREFIX) Durable-autopilot access-lab SMOKE test via the REST API (REAL, PAID agent run)..."
+	VIGOLIUM_BIN=$(CURDIR)/bin/vigolium PROFILE=access-lab TRANSPORT=rest bash test/smoke-test/smoke-autopilot.sh
+
+# Prior-context / --burp-bridge-url simulation: seed the throwaway DB with a
+# native scan first, then run autopilot --no-prescan --prior-context full so it
+# mines that prior traffic instead of starting from scratch. Asserts the
+# "Prior context:" brief fired. Same cost profile as test-smoke-autopilot.
+test-smoke-autopilot-prior: build
+	@echo "$(PREFIX) Autopilot prior-context / --burp-bridge-url SMOKE test (REAL, PAID; seeds the DB first)..."
+	VIGOLIUM_BIN=$(CURDIR)/bin/vigolium PROFILE=access-lab SEED_PRIOR=1 bash test/smoke-test/smoke-autopilot.sh
+
+# Live PortSwigger demo shop (external target, carlos/hunter2). Outward-facing +
+# paid — only run against a target you are authorized to test.
+test-smoke-autopilot-ginandjuice: build
+	@echo "$(PREFIX) Durable-autopilot SMOKE test against ginandjuice.shop (REAL, PAID, EXTERNAL)..."
+	VIGOLIUM_BIN=$(CURDIR)/bin/vigolium PROFILE=ginandjuice bash test/smoke-test/smoke-autopilot.sh
+
+# Local OWASP crAPI (brings the stack up; provisions a login account best-effort).
+test-smoke-autopilot-crapi: build crapi-up
+	@echo "$(PREFIX) Provisioning a crAPI account (best-effort) ..."
+	@curl -s -m 15 -X POST http://127.0.0.1:8888/identity/api/auth/signup \
+		-H 'Content-Type: application/json' \
+		-d '{"name":"smoke","email":"smoke@crapi.test","number":"4088888888","password":"Smoke123!"}' >/dev/null 2>&1 || true
+	@echo "$(PREFIX) Durable-autopilot SMOKE test against crAPI (REAL, PAID agent run)..."
+	VIGOLIUM_BIN=$(CURDIR)/bin/vigolium PROFILE=crapi CREDS=smoke@crapi.test/Smoke123! bash test/smoke-test/smoke-autopilot.sh
+
+# Local OWASP Juice Shop (brings it up; registers a login account best-effort).
+test-smoke-autopilot-juiceshop: build juiceshop-up
+	@echo "$(PREFIX) Registering a Juice Shop account (best-effort) ..."
+	@curl -s -m 15 -X POST http://127.0.0.1:3000/api/Users \
+		-H 'Content-Type: application/json' \
+		-d '{"email":"smoke@juice-sh.op","password":"Smoke123!","passwordRepeat":"Smoke123!"}' >/dev/null 2>&1 || true
+	@echo "$(PREFIX) Durable-autopilot SMOKE test against Juice Shop (REAL, PAID agent run)..."
+	VIGOLIUM_BIN=$(CURDIR)/bin/vigolium PROFILE=juiceshop CREDS=smoke@juice-sh.op/Smoke123! bash test/smoke-test/smoke-autopilot.sh
+
+# jstangle binary management
+# update-jstangle and ensure-jstangle are already declared .PHONY at the top.
+.PHONY: verify-jstangle-fresh build-jstangle-current build-jstangle-target ensure-jstangle-dist pack-jstangle pack-jstangle-host
+JSTANGLE_SRC_DIR=platform/jstangle/bin
+JSTANGLE_DST_DIR=internal/resources/deparos/jstangle
+
+# jstangle embedded resources (internal/resources)
+JSTANGLE_RES_SRC_DIR=platform/jstangle/bin
+JSTANGLE_RES_DST_DIR=internal/resources/deparos/jstangle
+JSTANGLE_RES_BINS=jstangle-darwin-amd64 jstangle-darwin-arm64 jstangle-linux-amd64 jstangle-linux-arm64 jstangle-windows-amd64.exe
+JSTANGLE_RES_TARGETS=darwin-amd64 darwin-arm64 linux-amd64 linux-arm64 windows-amd64
+
+# Helpers are embedded zstd-compressed (<blob>.zst) with a pin file (<blob>.pin)
+# recording the sha256/size of the uncompressed executable; the raw blobs stay
+# in place for the --capabilities and fingerprint gates. blobpack is
+# content-addressed, so re-running it on an unchanged blob only re-hashes it.
+BLOBPACK=$(GORUN) ./internal/tools/blobpack
+
+# Build every release helper from source and copy binaries.
+update-jstangle:
+	@echo "$(PREFIX) Building jstangle from source..."
+	cd platform/jstangle && bun install --linker isolated --ignore-scripts && bun run build:bin
+	@echo "$(PREFIX) Copying jstangle binaries to $(JSTANGLE_DST_DIR)..."
+	@mkdir -p $(JSTANGLE_DST_DIR)
+	@cp -R $(JSTANGLE_SRC_DIR)/* $(JSTANGLE_DST_DIR)/
+	@$(MAKE) --no-print-directory pack-jstangle
+	@echo "$(PREFIX) jstangle release binaries updated"
+
+# Build and stage only the current host helper. Ordinary tests and development
+# do not need to spend time producing four binaries that cannot run locally.
+build-jstangle-current:
+	@set -e; \
+	os=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	arch=$$(uname -m); \
+	case "$$arch" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; esac; \
+	name="jstangle-$$os-$$arch"; \
+	cd platform/jstangle; \
+	bun install --linker isolated --ignore-scripts; \
+	bun run build:bin:host; \
+	cd ../..; \
+	mkdir -p $(JSTANGLE_RES_DST_DIR); \
+	cp "$(JSTANGLE_SRC_DIR)/$$name" "$(JSTANGLE_RES_DST_DIR)/$$name"; \
+	$(MAKE) --no-print-directory pack-jstangle JSTANGLE_TARGET=$$os-$$arch
+
+# Build and stage the jstangle helper for ONE target triple, e.g.
+#     make build-jstangle-target JSTANGLE_TARGET=windows-amd64
+# The cross-compile CI job needs the target platform's binary present to satisfy
+# its go:embed (internal/resources/deparos/embed_jstangle_<os>_<arch>.go) but has
+# no reason to spend time on the other four.
+build-jstangle-target:
+	@set -e; \
+	target="$(JSTANGLE_TARGET)"; \
+	if [ -z "$$target" ]; then \
+		echo "\033[31m[!] usage: make build-jstangle-target JSTANGLE_TARGET=<os>-<arch>\033[0m"; \
+		exit 1; \
+	fi; \
+	name="jstangle-$$target"; \
+	case "$$target" in windows-*) name="$$name.exe" ;; esac; \
+	cd platform/jstangle; \
+	bun install --linker isolated --ignore-scripts; \
+	mkdir -p bin; \
+	bun run scripts/build-binaries.ts --target=$$target; \
+	cd ../..; \
+	mkdir -p $(JSTANGLE_RES_DST_DIR); \
+	cp "$(JSTANGLE_SRC_DIR)/$$name" "$(JSTANGLE_RES_DST_DIR)/$$name"; \
+	$(MAKE) --no-print-directory pack-jstangle JSTANGLE_TARGET=$$target; \
+	echo "$(PREFIX) Staged $$name for cross-compile"
+
+# Compress staged jstangle helpers for go:embed: JSTANGLE_TARGET=<os>-<arch>
+# packs one (failing if its raw blob is missing), otherwise every raw blob
+# present is packed. The source fingerprint is recorded in the pin when the
+# blob carries it, which keeps it visible in the vigolium binary for the npm
+# release gate (build/npm/build.mjs) now that the blob bytes are compressed.
+pack-jstangle:
+	@set -e; \
+	source_hash=$$(cd platform/jstangle 2>/dev/null && bun scripts/source-fingerprint.ts 2>/dev/null || true); \
+	targets="$(JSTANGLE_TARGET)"; \
+	[ -n "$$targets" ] || targets="$(JSTANGLE_RES_TARGETS)"; \
+	for target in $$targets; do \
+		name="jstangle-$$target"; \
+		case "$$target" in windows-*) name="$$name.exe" ;; esac; \
+		raw="$(JSTANGLE_RES_DST_DIR)/$$name"; \
+		if [ ! -f "$$raw" ]; then \
+			if [ -n "$(JSTANGLE_TARGET)" ]; then \
+				echo "\033[31m[!] $$raw is missing; build it with 'make build-jstangle-target JSTANGLE_TARGET=$$target'\033[0m"; \
+				exit 1; \
+			fi; \
+			continue; \
+		fi; \
+		$(BLOBPACK) -in "$$raw" -platform "$$(echo $$target | tr - /)" $${source_hash:+-marker "$$source_hash"}; \
+	done
+
+# Pack the host helper only when its raw blob exists. Every `make build`
+# runs this so a checkout whose raw helper predates compression (or a CI
+# cache that restored only the raw blob) still has the .zst go:embed needs.
+pack-jstangle-host:
+	@os=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	arch=$$(uname -m); \
+	case "$$arch" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; esac; \
+	if [ -f "$(JSTANGLE_RES_DST_DIR)/jstangle-$$os-$$arch" ]; then \
+		$(MAKE) --no-print-directory pack-jstangle JSTANGLE_TARGET=$$os-$$arch; \
+	fi
+
+# Pre-test step: compare the executable's compiled source fingerprint and
+# protocol contract with the current TypeScript tree. A source edit that keeps
+# the same flags must still invalidate the helper.
+ensure-jstangle:
+	@set -e; \
+	os=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	arch=$$(uname -m); \
+	case "$$arch" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; esac; \
+	host_bin="$(JSTANGLE_RES_DST_DIR)/jstangle-$$os-$$arch"; \
+	source_hash=$$(cd platform/jstangle && bun scripts/source-fingerprint.ts); \
+	needs_build=0; \
+	if [ ! -x "$$host_bin" ] || [ $$(wc -c < "$$host_bin" 2>/dev/null || echo 0) -lt 1024 ]; then \
+		needs_build=1; \
+	else \
+		caps=$$("$$host_bin" --capabilities 2>/dev/null || true); \
+		printf '%s' "$$caps" | grep -Fq '"protocolVersion":2' || needs_build=1; \
+		printf '%s' "$$caps" | grep -Fq "\"sourceHash\":\"$$source_hash\"" || needs_build=1; \
+		printf '%s' "$$caps" | grep -Fq '"profiles"' || needs_build=1; \
+	fi; \
+	if [ $$needs_build -eq 1 ]; then \
+		echo "$(PREFIX) jstangle host helper missing or stale; rebuilding..."; \
+		$(MAKE) --no-print-directory build-jstangle-current; \
+	else \
+		echo "$(PREFIX) jstangle host helper is fresh ($$source_hash)"; \
+		$(MAKE) --no-print-directory pack-jstangle JSTANGLE_TARGET=$$os-$$arch; \
+	fi
+
+verify-jstangle-fresh:
+	@$(MAKE) --no-print-directory ensure-jstangle
+
+# Release gate: every embedded jstangle blob must be built from the CURRENT
+# TypeScript tree, not just the host's.
+#
+# `ensure-jstangle` only checks and rebuilds the HOST blob, because that is all
+# tests and local development can run. Nothing else verified the other four, and
+# no release target depended on jstangle at all — so a change under
+# platform/jstangle/ that ran through `make test` would rebuild only the host
+# blob, and the release would ship four stale blobs alongside one fresh one.
+# That shipped in 0.4.9: jstangle-darwin-arm64 carried the new source while
+# linux-amd64, linux-arm64, darwin-amd64 and windows-amd64 were months behind,
+# so the release's jstangle work reached macOS arm64 users only.
+#
+# The blobs for other platforms cannot be executed here, so freshness is read
+# the one way that works cross-platform: bun compiles the source fingerprint
+# into the executable as a literal string (the same value `--capabilities`
+# reports), so a plain byte search for the current fingerprint confirms which
+# tree a blob was built from without running it.
+ensure-jstangle-dist:
+	@set -e; \
+	source_hash=$$(cd platform/jstangle && bun scripts/source-fingerprint.ts); \
+	stale=""; \
+	for name in $(JSTANGLE_RES_BINS); do \
+		bin="$(JSTANGLE_RES_DST_DIR)/$$name"; \
+		if [ ! -f "$$bin" ] || ! LC_ALL=C grep -q -a -F "$$source_hash" "$$bin"; then \
+			stale="$$stale $$name"; \
 		fi; \
 	done; \
-	if [ $$needs_build -eq 1 ]; then \
-		echo "$(PREFIX) jsscan binaries missing or invalid, building from source..."; \
-		cd platform/jsscan && bun install --linker isolated && bun run build:bin; \
-		cd ../..; \
-		mkdir -p $(JSSCAN_RES_DST_DIR); \
-		cp $(JSSCAN_SRC_DIR)/* $(JSSCAN_RES_DST_DIR)/; \
-		echo "$(PREFIX) jsscan binaries built and copied"; \
-	fi
+	if [ -n "$$stale" ]; then \
+		echo "$(PREFIX) jstangle blobs missing or stale for$$stale — rebuilding all targets..."; \
+		$(MAKE) --no-print-directory update-jstangle; \
+		for name in $(JSTANGLE_RES_BINS); do \
+			bin="$(JSTANGLE_RES_DST_DIR)/$$name"; \
+			if [ ! -f "$$bin" ] || ! LC_ALL=C grep -q -a -F "$$source_hash" "$$bin"; then \
+				echo "\033[31m[!] $$name still does not carry the current source fingerprint ($$source_hash) after a rebuild.\033[0m"; \
+				echo "\033[31m    Refusing to release a binary with a stale embedded jstangle.\033[0m"; \
+				exit 1; \
+			fi; \
+		done; \
+	fi; \
+	$(MAKE) --no-print-directory pack-jstangle; \
+	for name in $(JSTANGLE_RES_BINS); do \
+		pin="$(JSTANGLE_RES_DST_DIR)/$$name.pin"; \
+		if ! grep -q -F "\"source_hash\": \"$$source_hash\"" "$$pin" 2>/dev/null; then \
+			echo "\033[31m[!] $$pin does not pin the current source fingerprint ($$source_hash).\033[0m"; \
+			echo "\033[31m    The embedded (compressed) jstangle would not match the raw blob checked above.\033[0m"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "$(PREFIX) jstangle blobs for all targets built from current source ($$source_hash)"
 
 # vigolium-audit security audit binary management.
 # Source lives under platform/vigolium-audit/. `bun run build` produces a host
@@ -635,7 +985,12 @@ ensure-jsscan:
 # at the same path before running the cross GOOS/GOARCH build.
 AUDIT_TS_DIR=platform/vigolium-audit
 AUDIT_BIN_DST_DIR=pkg/audit/bin/_bin
+# Base path of the staged helper: stage-audit-blob.sh writes
+# $(AUDIT_BIN_HOST).zst and $(AUDIT_BIN_HOST).pin (never the raw executable,
+# which `go:embed all:_bin` would embed uncompressed).
 AUDIT_BIN_HOST=$(AUDIT_BIN_DST_DIR)/vigolium-audit
+AUDIT_HOST_GOOS=$(shell uname -s | tr '[:upper:]' '[:lower:]')
+AUDIT_HOST_GOARCH=$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 
 # Upstream vigolium-audit checkout, expected as a sibling of the vigolium repo.
 # Override on the command line, e.g. `make sync-audit AUDIT_UPSTREAM=...`.
@@ -671,7 +1026,8 @@ sync-audit:
 # build.ts ALL_TARGETS list. The host's matching artifact is staged at
 # $(AUDIT_BIN_HOST) for go:embed; the rest stay under the dist dir for
 # cross-compile workflows that swap _bin/vigolium-audit manually.
-AUDIT_BIN_TARGETS=darwin-arm64 darwin-x64 linux-arm64 linux-x64
+# windows is x64-only: Bun has no bun-windows-arm64 compile target.
+AUDIT_BIN_TARGETS=darwin-arm64 darwin-x64 linux-arm64 linux-x64 windows-x64
 AUDIT_DIST_DIR=$(AUDIT_TS_DIR)/build/dist
 
 # Build vigolium-audit binary for every supported os/arch and stage the host's
@@ -685,31 +1041,37 @@ update-audit:
 	@set -e; \
 	for target in $(AUDIT_BIN_TARGETS); do \
 		bin="$(AUDIT_DIST_DIR)/vigolium-audit-$$target"; \
+		case "$$target" in windows-*) bin="$$bin.exe" ;; esac; \
 		if [ ! -x "$$bin" ]; then \
 			echo "\033[31m[!] vigolium-audit binary not produced at $$bin\033[0m"; \
 			exit 1; \
 		fi; \
 		echo "  $$target  $$(wc -c < "$$bin" | tr -d ' ') bytes"; \
 	done
-	@host_arch=$$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/'); \
-	host_os=$$(uname | tr '[:upper:]' '[:lower:]'); \
-	host_bin="$(AUDIT_DIST_DIR)/vigolium-audit-$$host_os-$$host_arch"; \
-	cp "$$host_bin" $(AUDIT_BIN_HOST); \
-	chmod +x $(AUDIT_BIN_HOST); \
-	echo "$(PREFIX) Staged $(AUDIT_BIN_HOST) (vigolium-audit-$$host_os-$$host_arch)"; \
-	echo "$(PREFIX) Cross-compile artifacts available under $(AUDIT_DIST_DIR)/"
+	@bash build/scripts/stage-audit-blob.sh $(AUDIT_HOST_GOOS) $(AUDIT_HOST_GOARCH)
+	@echo "$(PREFIX) Cross-compile artifacts available under $(AUDIT_DIST_DIR)/"
 
-# Pre-build step: compile vigolium-audit when the embedded binary is missing
-# or is the .gitkeep stub. The `go:embed all:_bin` pattern accepts an empty/
-# stub _bin directory at build time — this guard ensures the runtime extract
-# finds a real binary instead of failing with ErrBinaryMissing.
+# Pre-build step: make sure _bin holds the HOST's packed helper. The
+# `go:embed all:_bin` pattern accepts an empty/stub _bin directory at build
+# time — this guard ensures the runtime extract finds a real binary instead of
+# failing with ErrBinaryMissing. A raw _bin/vigolium-audit left by a checkout
+# that predates compression is repacked (or dropped when it is not a host
+# blob); a missing or foreign-platform pin is restaged from the dist blob, and
+# only rebuilt from source when that is absent too.
 ensure-audit:
-	@f="$(AUDIT_BIN_HOST)"; \
-	size=0; \
-	if [ -f "$$f" ]; then size=$$(wc -c < "$$f" | tr -d ' '); fi; \
-	if [ -z "$$size" ] || [ "$$size" -lt 1048576 ]; then \
-		echo "$(PREFIX) vigolium-audit binary missing or stub, building from source..."; \
-		$(MAKE) update-audit; \
+	@set -e; \
+	f="$(AUDIT_BIN_HOST)"; \
+	host="$(AUDIT_HOST_GOOS)/$(AUDIT_HOST_GOARCH)"; \
+	if [ -f "$$f" ]; then \
+		echo "$(PREFIX) Repacking raw $$f (the helper is now embedded zstd-compressed)..."; \
+		$(BLOBPACK) -in "$$f" -out "$$f" -platform "$$host" || rm -f "$$f.zst" "$$f.pin"; \
+		rm -f "$$f"; \
+	fi; \
+	pinned() { [ -s "$$f.zst" ] && grep -q -F "\"platform\": \"$$host\"" "$$f.pin" 2>/dev/null; }; \
+	if ! pinned; then \
+		echo "$(PREFIX) vigolium-audit helper missing, stub or not built for $$host; staging..."; \
+		$(MAKE) --no-print-directory restage-host-audit; \
+		pinned || $(MAKE) update-audit; \
 	fi
 
 # Alias for ensure-audit used by build targets — kept short for readability.
@@ -723,7 +1085,9 @@ build-audit: update-audit
 ensure-audit-dist:
 	@missing=0; \
 	for target in $(AUDIT_BIN_TARGETS); do \
-		if [ ! -x "$(AUDIT_DIST_DIR)/vigolium-audit-$$target" ]; then missing=1; fi; \
+		bin="$(AUDIT_DIST_DIR)/vigolium-audit-$$target"; \
+		case "$$target" in windows-*) bin="$$bin.exe" ;; esac; \
+		if [ ! -x "$$bin" ]; then missing=1; fi; \
 	done; \
 	if [ "$$missing" = "1" ]; then \
 		echo "$(PREFIX) vigolium-audit cross-compile blobs missing, building all targets..."; \
@@ -742,22 +1106,68 @@ ensure-audit-dist:
 # is absent (fresh tree); ensure-audit-dist guarantees it exists in the release
 # flow.
 restage-host-audit:
-	@host_arch=$$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/'); \
-	host_os=$$(uname | tr '[:upper:]' '[:lower:]'); \
-	host_bin="$(AUDIT_DIST_DIR)/vigolium-audit-$$host_os-$$host_arch"; \
+	@host_bin="$(AUDIT_DIST_DIR)/vigolium-audit-$(AUDIT_HOST_GOOS)-$$(echo $(AUDIT_HOST_GOARCH) | sed 's/amd64/x64/')"; \
 	if [ -f "$$host_bin" ]; then \
-		cp "$$host_bin" $(AUDIT_BIN_HOST); chmod +x $(AUDIT_BIN_HOST); \
-		echo "$(PREFIX) Restored host vigolium-audit blob ($$host_os-$$host_arch) to $(AUDIT_BIN_HOST)"; \
+		bash build/scripts/stage-audit-blob.sh $(AUDIT_HOST_GOOS) $(AUDIT_HOST_GOARCH); \
+		echo "$(PREFIX) Restored host vigolium-audit blob ($(AUDIT_HOST_GOOS)/$(AUDIT_HOST_GOARCH)) to $(AUDIT_BIN_HOST).zst"; \
 	fi
 
-# Copy fresh UI builds into embedded public/ paths
+# Opt-in lazy vigolium-audit (`-tags audit_external`): no helper is embedded;
+# the binary downloads the pinned helper on first use from
+# VIGOLIUM_AUDIT_BASE_URL (or AUDIT_EXTERNAL_BASE_URL baked in at link time),
+# https only, sha256-verified. Default builds keep embedding because no CDN
+# hosts the helpers yet. audit-external-pins writes the gitignored
+# pkg/audit/bin/pins_gen.go and the upload assets
+# $(AUDIT_EXTERNAL_ASSET_DIR)/vigolium-audit_<sha12>_<os>_<arch>.zst.
+AUDIT_EXTERNAL_ASSET_DIR=build/dist-helpers
+AUDIT_EXTERNAL_BASE_URL ?=
+.PHONY: audit-external-pins build-audit-external
+audit-external-pins: ensure-audit-dist
+	@bash build/scripts/stage-audit-blob.sh --pins $(AUDIT_EXTERNAL_ASSET_DIR)
+
+# Writes bin/vigolium-audit-external; not installed to $(GOPATH_BIN).
+build-audit-external: audit-external-pins pack-jstangle-host
+	@echo "$(PREFIX) Building $(BINARY_NAME) with -tags audit_external..."
+	@mkdir -p $(BINARY_DIR)
+	$(GOBUILD) -tags audit_external -ldflags "$(LDFLAGS_INNER) -X github.com/vigolium/vigolium/pkg/audit/bin.defaultBaseURL=$(AUDIT_EXTERNAL_BASE_URL)" -o $(BINARY_DIR)/$(BINARY_NAME)-audit-external ./cmd/vigolium
+	@echo "$(PREFIX) Binary: $(BINARY_DIR)/$(BINARY_NAME)-audit-external (upload $(AUDIT_EXTERNAL_ASSET_DIR)/*.zst to the base URL)"
+
+# Regenerate the native secret-detection rule catalog (pkg/secretscan/catalog.json)
+# from the pinned kingfisher rule set. Requires network + git.
+# (The gitleaks/betterleaks family was removed as noisy and redundant with
+# kingfisher's better-anchored provider rules.)
+KINGFISHER_VERSION ?= v1.106.0
+
+.PHONY: update-secret-rules
+update-secret-rules:
+	@echo "$(PREFIX) Regenerating secret catalog (kingfisher $(KINGFISHER_VERSION))..."
+	@set -e; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	echo "  fetching kingfisher rules ($(KINGFISHER_VERSION))..."; \
+	git clone --quiet --depth 1 --branch $(KINGFISHER_VERSION) https://github.com/mongodb/kingfisher "$$tmp/kingfisher"; \
+	go run ./pkg/secretscan/secretgen \
+		-kingfisher "$$tmp/kingfisher/crates/kingfisher-rules/data/rules" \
+		-kingfisher-version $(KINGFISHER_VERSION) \
+		-out pkg/secretscan/catalog.json \
+		-examples-out pkg/secretscan/testdata/examples.json
+	@echo "$(PREFIX) Wrote pkg/secretscan/catalog.json + pkg/secretscan/testdata/examples.json"
+
+# Copy fresh UI builds into embedded public/ paths.
+# Only public/static-reports/template.html is generated here; its sibling
+# report-template.html is hand-maintained and read straight out of the embed
+# by pkg/output/format_report.go.
 update-ui:
-	@echo "$(PREFIX) Updating static report template..."
-	@rm -f public/static-reports/template.html
+	@echo "$(PREFIX) Building static report template..."
+	@cd platform/static-reports && bun install && bun run build
 	@cp platform/static-reports/dist/template.html public/static-reports/template.html
 	@echo "$(PREFIX) Building workbench UI..."
-	@cd platform/vigolium-workbench && bun run build
+	@cd platform/vigolium-workbench && bun install && bun run build
 	@echo "$(PREFIX) Updating dashboard UI..."
+	@if [ ! -f platform/vigolium-workbench/dist/index.html ]; then \
+		echo "\033[31m[!] workbench dist/ has no index.html - refusing to replace public/ui/\033[0m"; \
+		exit 1; \
+	fi
 	@rm -rf public/ui/
 	@mkdir -p public/ui/
 	@cp -r platform/vigolium-workbench/dist/* public/ui/
@@ -766,6 +1176,32 @@ update-ui:
 # Sync platform sub-repos to standalone repos
 sync-platform:
 	@bash build/scripts/sync-platform.sh
+
+# Standalone skills checkout (github.com/vigolium/skills), expected as a sibling
+# of the vigolium repo. Override on the command line, e.g.
+# `make sync-skills SKILLS_UPSTREAM=/path/to/skills`.
+SKILLS_UPSTREAM ?= ../skills
+SKILLS_SRC=public/skills
+
+# Mirror public/skills/ into the standalone skills repo. Unlike sync-platform
+# (which does every sub-repo, then commits and pushes), this touches only the
+# skills tree and leaves the commit to you. Run `make skill-flags` first if the
+# CLI flag surface changed, so flags.generated.md ships current.
+# Warns and exits 0 when the checkout is absent, so CI invocations don't fail
+# just because the sibling clone isn't present.
+sync-skills:
+	@set -e; \
+	if [ ! -d "$(SKILLS_UPSTREAM)" ]; then \
+		echo "\033[33m[!] skills checkout not found at $(SKILLS_UPSTREAM); skipping sync.\033[0m"; \
+		echo "    Clone github.com/vigolium/skills as a sibling of this repo, or override with"; \
+		echo "    'make sync-skills SKILLS_UPSTREAM=/path/to/skills'."; \
+		exit 0; \
+	fi; \
+	echo "$(PREFIX) Syncing $(SKILLS_SRC)/ -> $(SKILLS_UPSTREAM)/"; \
+	rsync -a --delete --exclude='.git' --exclude='.DS_Store' \
+		"$(SKILLS_SRC)/" "$(SKILLS_UPSTREAM)/"; \
+	echo "$(PREFIX) Sync complete. Review and commit in $(SKILLS_UPSTREAM):"; \
+	git -C "$(SKILLS_UPSTREAM)" status --short || true
 
 # Docker parameters
 DOCKER_IMAGE=vigolium
@@ -844,7 +1280,7 @@ docker-buildx-setup:
 # Requires `docker login` beforehand, and QEMU/binfmt for emulating the
 # non-host architecture (bundled with Docker Desktop; on plain Linux run
 # `docker run --privileged --rm tonistiigi/binfmt --install all` once).
-docker-publish: ensure-audit-dist docker-buildx-setup
+docker-publish: ensure-audit-dist ensure-jstangle-dist docker-buildx-setup
 	@echo "$(PREFIX) Building and publishing multi-arch image to Docker Hub: $(DOCKER_HUB_IMAGE) ($(DOCKER_PLATFORMS))..."
 	docker buildx build \
 		--platform $(DOCKER_PLATFORMS) \
@@ -863,7 +1299,7 @@ GORELEASER_VERSION=$(patsubst v%,%,$(VERSION))
 # --parallelism 1 is REQUIRED: the per-target pre-hook stages the matching
 # vigolium-audit blob into a single shared go:embed path, so cross builds must
 # run sequentially or they race and embed the wrong-arch blob.
-snapshot: ensure-audit-dist
+snapshot: ensure-audit-dist ensure-jstangle-dist
 	@echo "$(PREFIX) Building snapshot release..."
 	VIGOLIUM_VERSION=$(GORELEASER_VERSION) goreleaser --verbose release --snapshot --clean --parallelism 1
 	@$(MAKE) restage-host-audit
@@ -899,34 +1335,85 @@ generate-metadata:
 	@printf '{\n  "version": "%s",\n  "commit": "%s",\n  "build_time": "%s"\n}\n' \
 		"$(VERSION)" "$(COMMIT_HASH)" "$(BUILD_TIME)" > build/dist/metadata.json
 
-# GoReleaser release and upload to R2
-release: prepare-release-scripts ensure-audit-dist
+# Gate a dist dir before any upload: one correctly-versioned archive per
+# PUBLIC_TARGETS entry (goreleaser builds the same set; see .goreleaser.yaml),
+# checksums.txt complete and verifying, metadata.json pointing at $(VERSION).
+# Local only, no network. Usage: make release-verify DIST=build/dist
+RELEASE_DIST?=build/dist
+release-verify:
+	@VERSION="$(VERSION)" TARGETS="$(PUBLIC_TARGETS)" REQUIRE="$(RELEASE_REQUIRE)" \
+		bash build/scripts/release-verify.sh "$(or $(DIST),$(RELEASE_DIST))"
+
+# Sign a dist dir's checksums.txt with the offline minisign release key,
+# writing checksums.txt.minisig beside it. One signature covers every archive
+# through its sha256 line. The trusted comment names the version: `vigolium
+# update` refuses a signature whose comment names any other release, so an old
+# signed checksums.txt cannot be replayed under a new metadata.json. The
+# matching public keys live in pkg/selfupdate/keys.go (current + next slot) and
+# in the installers' MINISIGN_PUBKEY. Runs after release-verify, before any
+# upload. The secret key comes from VIGOLIUM_MINISIGN_SECRET_KEY (the base64
+# line of the .key file, kept out of the repo in a shell env file) when set,
+# else from the MINISIGN_KEY file. The fresh signature is verified with
+# VIGOLIUM_MINISIGN_PUBLIC_KEY when set, else with MINISIGN_PUB if it exists.
+# Usage: make release-sign DIST=build/dist [MINISIGN_KEY=…] [MINISIGN_PUB=…]
+MINISIGN_KEY?=$(HOME)/.minisign/vigolium.key
+MINISIGN_PUB?=$(HOME)/.minisign/vigolium.pub
+release-sign:
+	@command -v minisign >/dev/null 2>&1 || { echo "\033[31m[!] release-sign: minisign is required (https://jedisct1.github.io/minisign/)\033[0m" >&2; exit 1; }
+	@set -e; dist="$(or $(DIST),$(RELEASE_DIST))"; \
+		[ -s "$$dist/checksums.txt" ] || { echo "\033[31m[!] release-sign: missing $$dist/checksums.txt\033[0m" >&2; exit 1; }; \
+		key="$(MINISIGN_KEY)"; \
+		if [ -n "$$VIGOLIUM_MINISIGN_SECRET_KEY" ]; then \
+			key=$$(umask 077; mktemp); trap 'rm -f "$$key"' EXIT; \
+			printf 'untrusted comment: vigolium release key (from env)\n%s\n' "$$VIGOLIUM_MINISIGN_SECRET_KEY" > "$$key"; \
+		fi; \
+		[ -f "$$key" ] || { echo "\033[31m[!] release-sign: no secret key (set VIGOLIUM_MINISIGN_SECRET_KEY, or MINISIGN_KEY=… to a key file; tried $(MINISIGN_KEY))\033[0m" >&2; exit 1; }; \
+		rm -f "$$dist/checksums.txt.minisig"; \
+		echo "$(PREFIX) Signing $$dist/checksums.txt (vigolium $(VERSION))..."; \
+		minisign -S -s "$$key" -m "$$dist/checksums.txt" -x "$$dist/checksums.txt.minisig" \
+			-t "vigolium $(VERSION)" -c "vigolium $(VERSION) release checksums"; \
+		if [ -n "$$VIGOLIUM_MINISIGN_PUBLIC_KEY" ]; then \
+			minisign -V -q -P "$$VIGOLIUM_MINISIGN_PUBLIC_KEY" -m "$$dist/checksums.txt" -x "$$dist/checksums.txt.minisig"; \
+			echo "$(PREFIX) Signature verified with VIGOLIUM_MINISIGN_PUBLIC_KEY"; \
+		elif [ -f "$(MINISIGN_PUB)" ]; then \
+			minisign -V -q -p "$(MINISIGN_PUB)" -m "$$dist/checksums.txt" -x "$$dist/checksums.txt.minisig"; \
+			echo "$(PREFIX) Signature verified with $(MINISIGN_PUB)"; \
+		fi
+
+# Delete old vigolium_* archives from an R2 prefix, keeping everything in the
+# new checksums.txt plus the last RELEASE_KEEP versions (rollback window).
+# Never touches install.sh/bootstrap.sh/metadata.json/checksums.txt. Runs only
+# AFTER a successful upload. DRY_RUN=1 previews.
+# Usage: make release-prune R2_DIR=r2/vigolium-dist/$(R2_PREFIX) DIST=build/dist
+RELEASE_KEEP?=3
+release-prune:
+	@KEEP="$(RELEASE_KEEP)" DRY_RUN="$(DRY_RUN)" \
+		bash build/scripts/release-prune.sh "$(or $(R2_DIR),r2/vigolium-dist/$(R2_PREFIX))" "$(or $(DIST),$(RELEASE_DIST))"
+
+# GoReleaser release and upload to R2. Order matters: verify locally, upload
+# archives + checksums + scripts, flip the version pointer (metadata.json)
+# LAST, then prune old archives. Installers resolve the version from
+# metadata.json first, so until the pointer flips they keep resolving the
+# previous version, whose archives are still in place. Old archives are only
+# pruned after the new release is fully live. The unit suite (incl. the static
+# benchmark-definition lint) runs first: a red tree never ships.
+release: test-unit prepare-release-scripts ensure-audit-dist ensure-jstangle-dist
 	@echo "$(PREFIX) Building release..."
 	VIGOLIUM_VERSION=$(GORELEASER_VERSION) goreleaser --verbose release --snapshot --clean --parallelism 1
 	@$(MAKE) restage-host-audit
 	@$(MAKE) generate-metadata
-	@echo "$(PREFIX) Cleaning old files on R2..."
-	@mc rm --recursive --force r2/vigolium-dist/$(R2_PREFIX)/ || true
-	@echo "$(PREFIX) Uploading to R2..."
+	@$(MAKE) release-verify DIST=build/dist RELEASE_REQUIRE="build/scripts/nightly-install.sh build/scripts/bootstrap.sh"
+	@$(MAKE) release-sign DIST=build/dist
+	@echo "$(PREFIX) Uploading to R2 (archives first, version pointer last)..."
 	@set -e; \
-		archives=$$(ls build/dist/*.tar.gz 2>/dev/null | wc -l | tr -d ' '); \
-		if [ "$$archives" -eq 0 ]; then \
-			echo "\033[31m[!] No tar.gz archives found in build/dist/ — goreleaser output appears to have been wiped before upload.\033[0m"; \
-			echo "\033[31m    Re-run 'make release' or investigate what is removing files from build/dist/.\033[0m"; \
-			exit 1; \
-		fi; \
-		for f in build/dist/checksums.txt build/dist/metadata.json build/scripts/nightly-install.sh build/scripts/bootstrap.sh; do \
-			if [ ! -f "$$f" ]; then \
-				echo "\033[31m[!] Missing required upload artifact: $$f\033[0m"; \
-				exit 1; \
-			fi; \
-		done; \
-		mc cp build/dist/*.tar.gz r2/vigolium-dist/$(R2_PREFIX)/; \
-		mc cp build/dist/checksums.txt r2/vigolium-dist/$(R2_PREFIX)/; \
-		mc cp build/dist/metadata.json r2/vigolium-dist/$(R2_PREFIX)/; \
+		mc cp build/dist/*.tar.gz build/dist/*.zip r2/vigolium-dist/$(R2_PREFIX)/; \
+		mc cp build/dist/checksums.txt build/dist/checksums.txt.minisig r2/vigolium-dist/$(R2_PREFIX)/; \
+		mc cp build/scripts/bootstrap.sh r2/vigolium-dist/$(R2_PREFIX)/; \
 		mc cp build/scripts/nightly-install.sh r2/vigolium-dist/$(R2_PREFIX)/install.sh; \
-		mc cp build/scripts/bootstrap.sh r2/vigolium-dist/$(R2_PREFIX)/
+		mc cp build/dist/metadata.json r2/vigolium-dist/$(R2_PREFIX)/
 	@echo "$(PREFIX) Release uploaded successfully!"
+	@$(MAKE) release-prune R2_DIR=r2/vigolium-dist/$(R2_PREFIX) DIST=build/dist \
+		|| echo "\033[33m[!] Prune of old archives failed; the release itself is live. Re-run: make release-prune\033[0m"
 
 # Build cross-platform binaries, tar, checksum, and upload to the public/stable
 # R2 prefix (cdn.vigolium.com/vigolium-release/). Mirrors `release` but keeps a
@@ -935,13 +1422,14 @@ public:
 	@echo "\033[31m[!] Use 'make public-release' for public release uploads.\033[0m"
 	@exit 1
 
-public-release: prepare-public-scripts ensure-audit-dist
+public-release: prepare-public-scripts ensure-audit-dist ensure-jstangle-dist
 	@echo "$(PREFIX) Building public artifacts for: $(PUBLIC_TARGETS)"
 	@rm -rf $(PUBLIC_DIST_DIR)
 	@mkdir -p $(PUBLIC_DIST_DIR)
 	@for target in $(PUBLIC_TARGETS); do \
 		GOOS=$${target%/*}; GOARCH=$${target#*/}; \
 		bin_name="vigolium"; \
+		if [ "$${GOOS}" = "windows" ]; then bin_name="vigolium.exe"; fi; \
 		pkg_name="vigolium_$(PUBLIC_VERSION)_$${GOOS}_$${GOARCH}"; \
 		stage_dir="$(PUBLIC_DIST_DIR)/$${pkg_name}"; \
 		echo "$(PREFIX)   -> $${GOOS}/$${GOARCH}"; \
@@ -951,26 +1439,59 @@ public-release: prepare-public-scripts ensure-audit-dist
 			$(GOBUILD) $(LDFLAGS) \
 			-o $${stage_dir}/$${bin_name} ./cmd/vigolium \
 			|| exit 1; \
-		COPYFILE_DISABLE=1 tar --no-xattrs -czf $(PUBLIC_DIST_DIR)/$${pkg_name}.tar.gz -C $${stage_dir} $${bin_name} \
-			|| exit 1; \
+		cp LICENSE THIRD_PARTY_NOTICES.md $${stage_dir}/ || exit 1; \
+		if [ "$${GOOS}" = "windows" ]; then \
+			(cd $${stage_dir} && zip -q -X ../$${pkg_name}.zip $${bin_name} LICENSE THIRD_PARTY_NOTICES.md) || exit 1; \
+		else \
+			COPYFILE_DISABLE=1 tar --no-xattrs -czf $(PUBLIC_DIST_DIR)/$${pkg_name}.tar.gz -C $${stage_dir} $${bin_name} LICENSE THIRD_PARTY_NOTICES.md \
+				|| exit 1; \
+		fi; \
 		rm -rf $${stage_dir}; \
 	done
 	@$(MAKE) restage-host-audit
 	@echo "$(PREFIX) Writing checksums.txt..."
 	@cd $(PUBLIC_DIST_DIR) && \
-		(command -v shasum >/dev/null 2>&1 && shasum -a 256 *.tar.gz > checksums.txt \
-		 || sha256sum *.tar.gz > checksums.txt)
+		(command -v shasum >/dev/null 2>&1 && shasum -a 256 *.tar.gz *.zip > checksums.txt \
+		 || sha256sum *.tar.gz *.zip > checksums.txt)
 	@echo "$(PREFIX) Writing metadata.json..."
 	@printf '{\n  "version": "%s",\n  "commit": "%s",\n  "build_time": "%s"\n}\n' \
 		"$(VERSION)" "$(COMMIT_HASH)" "$(BUILD_TIME)" > $(PUBLIC_DIST_DIR)/metadata.json
-	@echo "$(PREFIX) Cleaning old files at r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/..."
-	@mc rm --recursive --force r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/ || true
-	@echo "$(PREFIX) Uploading public artifacts to R2..."
-	mc cp $(PUBLIC_DIST_DIR)/*.tar.gz r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
-	mc cp $(PUBLIC_DIST_DIR)/checksums.txt r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
-	mc cp $(PUBLIC_DIST_DIR)/metadata.json r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
+	@$(MAKE) release-verify DIST=$(PUBLIC_DIST_DIR) RELEASE_REQUIRE="build/public-install.sh"
+	@$(MAKE) release-sign DIST=$(PUBLIC_DIST_DIR)
+	# Retain older versioned archives for installed package recipes and rollbacks.
+	# Same ordering as `release`: archives first, version pointer (metadata.json) last.
+	@echo "$(PREFIX) Uploading public artifacts to R2 (archives first, version pointer last)..."
+	mc cp $(PUBLIC_DIST_DIR)/*.tar.gz $(PUBLIC_DIST_DIR)/*.zip r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
+	mc cp $(PUBLIC_DIST_DIR)/checksums.txt $(PUBLIC_DIST_DIR)/checksums.txt.minisig r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
 	mc cp build/public-install.sh r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/install.sh
+	mc cp $(PUBLIC_DIST_DIR)/metadata.json r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
 	@echo "$(PREFIX) Public release uploaded to $(PUBLIC_INSTALL_BASE_URL)/"
+
+# Run the normal public release (build cross-platform tarballs + upload to R2),
+# then publish those same artifacts to a GitHub release via
+# build/scripts/github-release.sh. The release tag/title is the current version
+# ($(VERSION)) — the script creates + pushes that git tag if it does not exist —
+# and the body is that version's section pulled from CHANGELOG.md. Existing
+# releases are never replaced: downstream package managers pin archive hashes.
+github-release:
+	@command -v gh >/dev/null 2>&1 || { echo "GitHub CLI (gh) is required." >&2; exit 1; }
+	@if gh release view "$(VERSION)" >/dev/null 2>&1; then \
+		echo "Release $(VERSION) already exists. Bump VERSION before publishing new binaries." >&2; exit 1; \
+	fi
+	@$(MAKE) public-release
+	@VERSION="$(VERSION)" PUBLIC_DIST_DIR="$(PUBLIC_DIST_DIR)" bash build/scripts/github-release.sh
+
+# Generate recipes from verified public archives. No builds or publishing.
+.PHONY: packages packages-test packages-linux
+packages:
+	python3 build/packaging/generate.py --dist "$(PUBLIC_DIST_DIR)"
+
+packages-test:
+	python3 -m unittest discover -s build/packaging -p 'test_*.py'
+
+# Requires `make packages` and nFPM on PATH. Builds both Linux architectures.
+packages-linux:
+	python3 build/packaging/build_native.py
 
 # Sync scripts to R2 CDN without rebuilding
 cdn-sync: prepare-release-scripts generate-metadata
@@ -986,12 +1507,24 @@ cdn-sync: prepare-release-scripts generate-metadata
 # npm name, version-suffixed platform builds). See build/npm/build.mjs.
 NPM_OUT_DIR=build/dist-npm
 
-# "yes" when the goreleaser binaries are missing OR were built at a different
-# version than pkg/cli/version.go ($(VERSION)) — i.e. stale after a version
-# bump. Detected by grepping the ldflag-injected version string in each built
-# binary (no execution, cross-platform). Recursive (=) so it only runs when
-# referenced by the npm-build/npm-pack guards, not on every `make` invocation.
-NPM_NEEDS_BUILD=$(shell bins=$$(ls build/dist/vigolium_*_*/vigolium 2>/dev/null); if [ -z "$$bins" ]; then echo yes; else r=no; for b in $$bins; do grep -qaF -- "$(VERSION)" "$$b" 2>/dev/null || r=yes; done; echo $$r; fi)
+# Reads a publish back from registry.npmjs.org — see the script header for why
+# `npm publish` exiting 0 does not mean the version exists.
+NPM_VERIFY=bash build/scripts/npm-verify-publish.sh
+
+# "yes" when the goreleaser binaries are missing OR were built for a different
+# version than pkg/cli/version.go ($(VERSION)) — i.e. stale after a version bump.
+#
+# Detected via the goreleaser archive name, NOT by grepping the binary: goreleaser
+# names each archive `vigolium_<version>_<os>_<arch>.tar.gz` from the version it
+# actually built (archives.name_template in .goreleaser.yaml) and `--clean` wipes
+# build/dist at the start of every run, so the archive version is an authoritative
+# record of what the binaries are. The old substring grep for "$(VERSION)" in the
+# binary FALSE-MATCHED: a shipped binary carries newer version strings in its
+# embedded content (a v0.2.2 build literally contains "v0.2.3" 12x), so the guard
+# thought stale binaries were fresh and npm-publish shipped v0.2.2 binaries under
+# the 0.2.3 npm version. Recursive (=) so it only runs when referenced by the
+# npm-build/npm-pack guards, not on every `make` invocation.
+NPM_NEEDS_BUILD=$(shell bins=$$(ls build/dist/vigolium_*_*/vigolium 2>/dev/null); arcs=$$(ls build/dist/vigolium_$(GORELEASER_VERSION)_*.tar.gz 2>/dev/null); if [ -z "$$bins" ] || [ -z "$$arcs" ]; then echo yes; else echo no; fi)
 
 # Stage the npm packages from goreleaser output. Runs `make snapshot` first if
 # the binaries are missing OR stale (built at a different version than
@@ -1002,7 +1535,9 @@ npm-build:
 		$(MAKE) snapshot; \
 	fi
 	@echo "$(PREFIX) Staging npm packages (version $(GORELEASER_VERSION))..."
-	VIGOLIUM_VERSION=$(GORELEASER_VERSION) node build/npm/build.mjs
+	@VIGOLIUM_VERSION=$(GORELEASER_VERSION) \
+		VIGOLIUM_JSTANGLE_SOURCE_HASH=$$(cd platform/jstangle && bun scripts/source-fingerprint.ts) \
+		node build/npm/build.mjs
 
 # Stage + produce inspectable .tgz tarballs (npm pack) for each package.
 npm-pack:
@@ -1011,7 +1546,9 @@ npm-pack:
 		$(MAKE) snapshot; \
 	fi
 	@echo "$(PREFIX) Staging + packing npm tarballs (version $(GORELEASER_VERSION))..."
-	VIGOLIUM_VERSION=$(GORELEASER_VERSION) node build/npm/build.mjs --pack
+	@VIGOLIUM_VERSION=$(GORELEASER_VERSION) \
+		VIGOLIUM_JSTANGLE_SOURCE_HASH=$$(cd platform/jstangle && bun scripts/source-fingerprint.ts) \
+		node build/npm/build.mjs --pack
 	@echo "$(PREFIX) Tarballs written to $(NPM_OUT_DIR)/"
 
 # Publish to npm: platform packages FIRST (so the main package's
@@ -1019,6 +1556,15 @@ npm-pack:
 # `latest` dist-tag to the version being published (the main package is
 # published as `latest` and `latest` is re-asserted + verified afterward), so
 # `npm i -g @vigolium/vigolium` always installs this version.
+#
+# `npm publish` exiting 0 is NOT proof of publication: registry.npmjs.org
+# answers with 202 Accepted and processes the tarball asynchronously, and a
+# queued version can silently never land. That is how 0.4.6 shipped broken —
+# darwin-arm64, linux-arm64 and windows-x64 each got a clean 202, never
+# appeared, and left the main package pointing at optionalDependencies that
+# 404. So every publish is read back from the registry before the next one
+# goes out; a platform package that never lands stops the run *before* the
+# main package is published, instead of after.
 #
 # Auth is handled by your ~/.npmrc line:
 #   //registry.npmjs.org/:_authToken=${NPM_TOKEN}
@@ -1041,30 +1587,28 @@ npm-publish: npm-build
 		for d in $(NPM_OUT_DIR)/vigolium-*/; do \
 			ptag=$$(basename "$$d" | sed 's/^vigolium-//'); \
 			echo "$(PREFIX)   publishing platform package [$$ptag]"; \
+			if [ "$(DRY_RUN)" != "1" ] \
+				&& curl -sS -o /dev/null -w '%{http_code}' -H 'Cache-Control: no-cache' \
+					"https://registry.npmjs.org/@vigolium/vigolium/$(GORELEASER_VERSION)-$$ptag?cb=$$$$" \
+					2>/dev/null | grep -q '^200$$'; then \
+				echo "$(PREFIX)     already on registry — skipping"; \
+				continue; \
+			fi; \
 			( cd "$$d" && npm publish --access public --tag "$$ptag" $$DRY ) \
 				|| { echo "\033[31m[!] publish failed: $$ptag\033[0m"; exit 11; }; \
+			if [ "$(DRY_RUN)" != "1" ]; then \
+				$(NPM_VERIFY) version @vigolium/vigolium "$(GORELEASER_VERSION)-$$ptag" || exit 11; \
+			fi; \
 		done; \
 		echo "$(PREFIX)   publishing $(NPM_OUT_DIR)/vigolium/ (main) [tag=latest]"; \
 		( cd $(NPM_OUT_DIR)/vigolium && npm publish --access public --tag latest $$DRY ) \
 			|| { echo "\033[31m[!] publish failed: main\033[0m"; exit 12; }; \
 		if [ "$(DRY_RUN)" != "1" ]; then \
+			$(NPM_VERIFY) version @vigolium/vigolium "$(GORELEASER_VERSION)" || exit 12; \
 			echo "$(PREFIX)   pointing 'latest' dist-tag at $(GORELEASER_VERSION)"; \
 			npm dist-tag add @vigolium/vigolium@$(GORELEASER_VERSION) latest \
 				|| { echo "\033[31m[!] dist-tag add failed\033[0m"; exit 13; }; \
-			resolved=""; \
-			for i in 1 2 3 4 5 6; do \
-				resolved=$$(npm dist-tag ls @vigolium/vigolium --prefer-online 2>/dev/null \
-					| sed -n 's/^latest: //p'); \
-				[ "$$resolved" = "$(GORELEASER_VERSION)" ] && break; \
-				echo "$(PREFIX)   latest still '$$resolved' (npm registry cache lag) — retry $$i/6 in 10s"; \
-				sleep 10; \
-			done; \
-			if [ "$$resolved" != "$(GORELEASER_VERSION)" ]; then \
-				echo "\033[31m[!] latest resolved to '$$resolved', expected '$(GORELEASER_VERSION)' after retries\033[0m"; \
-				echo "\033[31m    Publish likely succeeded — verify: npm dist-tag ls @vigolium/vigolium\033[0m"; \
-				exit 14; \
-			fi; \
-			echo "$(PREFIX)   verified: latest -> $$resolved"; \
+			$(NPM_VERIFY) dist-tag @vigolium/vigolium latest "$(GORELEASER_VERSION)" || exit 14; \
 		fi
 	@echo "$(PREFIX) npm publish complete"
 
@@ -1089,8 +1633,9 @@ lint:
 	golangci-lint run
 
 # Verify checked-in, machine-managed sources are in sync with their generators.
-# Covers the deterministic artifacts: gofmt output and the go.mod/go.sum manifest.
-# (Binary assets — jsscan, the audit harness, UI bundles — are non-deterministic
+# Covers the deterministic artifacts: gofmt output, the go.mod/go.sum manifest,
+# and the OpenAPI spec (both copies) regenerated by `make swagger`.
+# (Binary assets — jstangle, the audit harness, UI bundles — are non-deterministic
 # build outputs regenerated by `make deps`, `make update-audit`, `make update-ui`;
 # they are not diff-verifiable here. See docs/development/generated-assets.md.)
 verify-generated:
@@ -1111,6 +1656,18 @@ verify-generated:
 	fi; \
 	mv go.mod.verify.bak go.mod; mv go.sum.verify.bak go.sum; \
 	exit $$status
+	@echo "$(PREFIX) Verifying the Swagger spec is regenerated..."
+	@tmp="$$(mktemp -d)"; \
+	$(GORUN) ./internal/tools/swaggergen -out "$$tmp" || { rm -rf "$$tmp"; exit 1; }; \
+	status=0; \
+	for f in $(SWAGGER_CANONICAL) $(SWAGGER_EMBEDDED); do \
+		if ! diff -q "$$f" "$$tmp/$$f" >/dev/null; then \
+			echo "$(PREFIX) $$f is stale — run 'make swagger' and commit the result."; \
+			status=1; \
+		fi; \
+	done; \
+	rm -rf "$$tmp"; \
+	exit $$status
 	@echo "$(PREFIX) Generated/managed sources are in sync."
 
 # Tidy dependencies
@@ -1118,11 +1675,37 @@ tidy:
 	@echo "$(PREFIX) Tidying dependencies..."
 	$(GOMOD) tidy
 
+# Regenerate the published JSON Schemas (docs/schema) from the registered
+# command, event and error shapes (pkg/contract). TestSchemaGolden fails until
+# this is re-run after a contract change; review the diff before committing.
+schema:
+	@echo "$(PREFIX) Regenerating docs/schema..."
+	VIGOLIUM_UPDATE_SCHEMA=1 $(GOTEST) -count=1 -run '^TestSchemaGolden$$' ./pkg/cli/
+	@echo "$(PREFIX) Done. Review the diff before committing."
+
+# Regenerate the coding-agent skill's flag reference from the cobra command
+# tree. The file is committed so the embedded skill bundle stays self-contained;
+# re-run this whenever a flag is added, renamed, or given a shorthand.
+skill-flags:
+	@echo "$(PREFIX) Regenerating skill flag reference..."
+	$(GORUN) ./cmd/vigolium skills gen-flags
+	@echo "$(PREFIX) Done. Review the diff before committing."
+
+# Fail when the committed flag reference no longer matches the command tree.
+# The generated file is what an agent reads to find out what exists, so a stale
+# copy is not a cosmetic problem: it is the difference between a flag being
+# discoverable and being invisible. The check is TestFlagsGeneratedIsCurrent,
+# which renders the reference in-process (it also runs in `make test-unit`);
+# this target is a wrapper for running it alone.
+skill-flags-check:
+	@echo "$(PREFIX) Checking skill flag reference is current..."
+	@$(GOTEST) -count=1 -run '^TestFlagsGeneratedIsCurrent$$' ./pkg/cli/
+
 # Helper scripts
 SCRIPTS_DIR := internal/resources/scripts
 
-# Download dependencies, build jsscan, and check Chromium
-deps: update-jsscan
+# Download dependencies, build jstangle, and check Chromium
+deps: update-jstangle
 	@echo "$(PREFIX) Downloading Go dependencies..."
 	$(GOMOD) download
 	@$(SCRIPTS_DIR)/deps-check.sh
@@ -1142,17 +1725,14 @@ deps-chrome-update: ## Update browser version+URL. Usage: make deps-chrome-updat
 SWAGGER_CANONICAL=docs/development/api-swagger.json
 SWAGGER_EMBEDDED=pkg/server/swagger_spec.json
 
-# Generate / sync Swagger spec: copy canonical spec into the embedded location
+# Regenerate the Swagger spec: components.schemas are rebuilt from the Go types
+# registered in pkg/server/swagger_types.go (paths and prose are hand-written in
+# $(SWAGGER_CANONICAL) and kept), then written to both the canonical and the
+# embedded copy. `make verify-generated` fails when either is stale.
 swagger:
-	@echo "$(PREFIX) Syncing Swagger spec from $(SWAGGER_CANONICAL) to $(SWAGGER_EMBEDDED)..."
-	@if [ ! -f "$(SWAGGER_CANONICAL)" ]; then \
-		echo "\033[31m[!] $(SWAGGER_CANONICAL) not found. Create the spec first.\033[0m"; \
-		exit 1; \
-	fi
-	@cp $(SWAGGER_CANONICAL) $(SWAGGER_EMBEDDED)
-	@echo "$(PREFIX) Validating JSON..."
-	@python3 -m json.tool $(SWAGGER_EMBEDDED) > /dev/null 2>&1 || { echo "\033[31m[!] Invalid JSON in swagger spec\033[0m"; exit 1; }
-	@echo "$(PREFIX) Swagger spec synced successfully"
+	@echo "$(PREFIX) Regenerating Swagger spec ($(SWAGGER_CANONICAL), $(SWAGGER_EMBEDDED))..."
+	$(GORUN) ./internal/tools/swaggergen
+	@echo "$(PREFIX) Swagger spec regenerated"
 
 # Help
 help:
@@ -1173,18 +1753,26 @@ help:
 	@echo "    make test-race        Run all tests with race detector"
 	@echo "    make test-unit        Run unit tests (fast, no external deps)"
 	@echo "    make test-integration Run integration tests (XSS gym benchmark)"
+	@echo "    make test-browser-conformance  Browser crawler integration contracts (needs a local Chrome/Chromium)"
 	@echo "    make test-benchmark   Run benchmark tests (alias for test-integration)"
 	@echo "    make test-e2e         Run E2E tests (requires Docker)"
 	@echo "    make test-e2e-api     Run API E2E tests only (server endpoints)"
 	@echo "    make test-e2e-agent   Run Agent API E2E tests only (agent endpoints)"
+	@echo "    make test-e2e-rest-scan  Native + agentic scan driven through the REST API (hermetic, no Docker/LLM)"
 	@echo "    make test-e2e-postgres  Run PostgreSQL E2E tests (requires make postgres-up)"
+	@echo "    make test-pg-full     Full PG validation cycle: e2e + canary (auto up/down)"
 	@echo "    make test-canary      Run canary tests: DVWA, VAmPI, Juice Shop (Docker)"
+	@echo "    make test-e2e-expect  Expectation kit: lab (hostile, no Docker) + live Docker targets"
+	@echo "    make test-e2e-expect-lab   Expectation kit, lab half only (no Docker)"
+	@echo "    make test-e2e-expect-live  Expectation kit, live Docker targets only"
+	@echo "    make e2e-expect-lab   Serve the expectation lab standalone (LAB_ARGS='-port-base 18000 -log')"
 	@echo "    make test-e2e-vampi   Run VAmPI canary tests only (SQLi)"
 	@echo "    make test-e2e-dvwa    Run DVWA canary tests only (XSS, SQLi, LFI)"
 	@echo "    make test-e2e-juiceshop  Run Juice Shop canary tests only"
+	@echo "    make test-e2e-autonomous  Autonomous full-chain scan canary (Docker)"
+	@echo "    make test-e2e-scorecard   Ground-truth coverage scorecard canary (Docker)"
 	@echo "    make test-e2e-browser-fallback  Browser fallback test (Docker multi-arch)"
 	@echo "    make test-e2e-piolium  Piolium audit e2e (requires pi + piolium installed)"
-	@echo "    make smoke-autopilot-auth  Smoke: agent autopilot --credentials against juice-shop"
 	@echo "    make test-xbow        Run all xbow validation benchmarks (Docker + XBOW_SOURCE_DIR)"
 	@echo "    make test-xbow-ssti   Run xbow SSTI benchmarks"
 	@echo "    make test-xbow-xss    Run xbow XSS benchmarks"
@@ -1205,15 +1793,30 @@ help:
 	@echo "    make test-coverage-check  Enforce the COVERAGE_MIN coverage floor (default $(COVERAGE_MIN)%)"
 	@echo "    make test-ci          Run tests with JUnit XML output"
 	@echo ""
+	@echo "\033[33m  SMOKE TESTS (real targets)\033[0m"
+	@echo "    make sanity-check     Real-target REST API + GCS storage smoke test (needs jq/tar/python3 + network)"
+	@echo "    make setup-agent-codex  Point agent.olium at the codex OAuth backend (prereq for autopilot smoke tests)"
+	@echo "    make test-smoke-autopilot  Durable-autopilot access-lab smoke test  \033[31m(REAL, PAID agent run)\033[0m"
+	@echo "    make test-smoke-autopilot-rest  Same run driven through the REST API (server + /api/agent/run/autopilot)  \033[31m(REAL, PAID)\033[0m"
+	@echo "    make test-smoke-autopilot-prior  Seed DB, then autopilot --prior-context (--burp-bridge-url sim)  \033[31m(REAL, PAID)\033[0m"
+	@echo "    make test-smoke-autopilot-ginandjuice  Autopilot vs ginandjuice.shop  \033[31m(REAL, PAID, EXTERNAL)\033[0m"
+	@echo "    make test-smoke-autopilot-crapi        Autopilot vs OWASP crAPI       \033[31m(REAL, PAID; brings crapi up)\033[0m"
+	@echo "    make test-smoke-autopilot-juiceshop    Autopilot vs OWASP Juice Shop  \033[31m(REAL, PAID; brings juiceshop up)\033[0m"
+	@echo "                          (MODEL=/MODE=/MAX_DURATION= override; default bound 15m)"
+	@echo ""
 	@echo "\033[33m  DEVELOPMENT\033[0m"
 	@echo "    make fmt              Format code"
 	@echo "    make lint             Run golangci-lint"
 	@echo "    make tidy             Tidy go.mod dependencies"
-	@echo "    make deps             Download dependencies + ensure jsscan binaries"
+	@echo "    make deps             Download dependencies + ensure jstangle binaries"
 	@echo "    make deps-chrome      Download Chromium browser archives from versions.go"
+	@echo "    make deps-chrome-cft  Download only Chrome for Testing (PLATFORM=linux64)"
 	@echo "    make deps-chrome-update  Update browser version+URL (NAME= PLATFORM= VERSION= URL=)"
-	@echo "    make swagger          Sync Swagger spec to embedded copy"
+	@echo "    make swagger          Regenerate Swagger schemas from Go types"
 	@echo "    make update-ui        Copy fresh UI builds into public/ (report template + dashboard)"
+	@echo "    make skill-flags      Regenerate the coding-agent skill's flag reference"
+	@echo "    make sync-platform    Sync platform sub-repos to their standalone repos"
+	@echo "    make sync-skills      Mirror public/skills/ into the sibling skills repo (no commit)"
 	@echo ""
 	@echo "\033[33m  VULNERABLE APPS (Docker)\033[0m"
 	@echo "    make apps-up          Start all vulnerable apps"
@@ -1260,6 +1863,10 @@ help:
 	@echo "    make snapshot         Build local snapshot release (no publish)"
 	@echo "    make release          Build and upload nightly artifacts to R2 (cdn.vigolium.com/vigolium-nightly-release/)"
 	@echo "    make public-release   Build cross-platform tarballs and upload to the public/stable R2 prefix (cdn.vigolium.com/vigolium-release/)"
+	@echo "    make github-release   Publish a new version to R2 and GitHub (existing GitHub releases are never replaced)"
+	@echo "    make packages         Verify public archives and generate AUR, DEB/RPM, Scoop, WinGet, Nix, and Snap recipes"
+	@echo "    make packages-linux   Build DEB/RPM packages from generated recipes (requires nFPM)"
+	@echo "    make packages-test    Run package generation and release protection tests"
 	@echo "    make cdn-sync         Sync nightly scripts (install.sh, bootstrap.sh) to R2 CDN"
 	@echo "    make bump-version     Bump pkg/cli/version.go (PART=patch|minor|major|pre|release, DRY_RUN=1)"
 	@echo "    make npm-build        Stage @vigolium/vigolium npm packages into build/dist-npm/"

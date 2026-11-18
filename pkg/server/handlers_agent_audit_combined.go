@@ -56,7 +56,7 @@ func (h *Handlers) startCombinedAuditRun(c fiber.Ctx, driver string, req AgentAu
 		return nil // 429 already sent
 	}
 
-	parentUUID, err := h.registerRunningAgenticScan("audit", driver, req.ScanUUID)
+	parentUUID, err := h.registerRunningAgenticScan("audit", driver, req.ScanUUID, projectUUID)
 	if err != nil {
 		h.releaseHeavyAgentSlotForProject(projectUUID)
 		if authCleanup != nil {
@@ -140,8 +140,13 @@ func (h *Handlers) runCombinedAuditBackground(plan combinedAuditPlan) {
 		defer setup.cleanup()
 	}
 
+	ctx, cancel := context.WithCancel(h.runContext())
+	defer cancel()
+	h.registerRunCancel(plan.parentUUID, cancel)
+	defer h.unregisterRunCancel(plan.parentUUID)
+
 	startedAt := time.Now()
-	results := h.runDriversSequentially(context.Background(), plan, setup, nil)
+	results := h.runDriversSequentially(ctx, plan, setup, nil)
 	h.finalizeCombinedAuditRun(plan, setup, results, startedAt)
 }
 
@@ -166,12 +171,17 @@ func (h *Handlers) handleCombinedAuditSSE(c fiber.Ctx, plan combinedAuditPlan) e
 			defer setup.cleanup()
 		}
 
+		ctx, cancel := context.WithCancel(h.runContext())
+		defer cancel()
+		h.registerRunCancel(plan.parentUUID, cancel)
+		defer h.unregisterRunCancel(plan.parentUUID)
+
 		startedAt := time.Now()
 		// w is shared with the per-driver SSE pump goroutine; the pump's
 		// pumpDone channel guarantees it has exited before we write the
 		// closing aggregate event below, so concurrent writes to w never
 		// overlap.
-		results := h.runDriversSequentially(context.Background(), plan, setup, w)
+		results := h.runDriversSequentially(ctx, plan, setup, w)
 		h.finalizeCombinedAuditRun(plan, setup, results, startedAt)
 
 		anyErr := false
@@ -259,6 +269,13 @@ func (h *Handlers) prepareCombinedAuditRun(plan combinedAuditPlan) (combinedAudi
 func (h *Handlers) runDriversSequentially(ctx context.Context, plan combinedAuditPlan, setup combinedAuditSetup, sseWriter *bufio.Writer) []driverResult {
 	results := make([]driverResult, 0, 2)
 
+	// Cancelling runCtx stops the in-flight driver and skips any remaining driver
+	// in the sequence. The SSE pump invokes runCancel on client disconnect so a
+	// dropped stream doesn't leave a 6–12h audit/piolium subprocess running (and
+	// pinning a heavy agent slot) against nobody.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
 	// For driver=auto/both a chain may contain modes only one driver
 	// understands; the other driver's filtered chain is empty and that
 	// leg is skipped rather than running a bogus mode.
@@ -282,7 +299,7 @@ func (h *Handlers) runDriversSequentially(ctx context.Context, plan combinedAudi
 
 	auditRan := false
 	if auditEligible {
-		auditRes := h.runOneCombinedDriver(ctx, agent.AuditDriverAudit, plan, setup, sseWriter)
+		auditRes := h.runOneCombinedDriver(runCtx, agent.AuditDriverAudit, plan, setup, sseWriter, runCancel)
 		results = append(results, auditRes)
 		auditRan = true
 	} else {
@@ -297,8 +314,13 @@ func (h *Handlers) runDriversSequentially(ctx context.Context, plan combinedAudi
 		return results
 	}
 
+	// Client disconnected (or run cancelled) during the audit leg — skip piolium.
+	if runCtx.Err() != nil {
+		return results
+	}
+
 	if pioliumHasModes {
-		results = append(results, h.runOneCombinedDriver(ctx, agent.AuditDriverPiolium, plan, setup, sseWriter))
+		results = append(results, h.runOneCombinedDriver(runCtx, agent.AuditDriverPiolium, plan, setup, sseWriter, runCancel))
 	} else {
 		zap.L().Info("Combined audit: piolium leg skipped — no piolium-supported modes in chain",
 			zap.String("agentic_scan_uuid", plan.parentUUID))
@@ -310,7 +332,7 @@ func (h *Handlers) runDriversSequentially(ctx context.Context, plan combinedAudi
 // run with its own per-driver timeout (so an audit hang doesn't burn
 // piolium's budget). Stream multiplexing for SSE is handled here so the
 // driver-end marker fires on subprocess exit.
-func (h *Handlers) runOneCombinedDriver(ctx context.Context, name string, plan combinedAuditPlan, setup combinedAuditSetup, sseWriter *bufio.Writer) driverResult {
+func (h *Handlers) runOneCombinedDriver(ctx context.Context, name string, plan combinedAuditPlan, setup combinedAuditSetup, sseWriter *bufio.Writer, onDisconnect func()) driverResult {
 	res := driverResult{
 		name:       name,
 		sessionDir: filepath.Join(setup.parentSessionDir, name),
@@ -375,7 +397,7 @@ func (h *Handlers) runOneCombinedDriver(ctx context.Context, name string, plan c
 		return res
 	}
 
-	pumpDone := runDriverSSEPump(sseWriter, pipeReader, name)
+	pumpDone := runDriverSSEPump(sseWriter, pipeReader, name, onDisconnect)
 
 	res.runErr = h.waitAuditRunner(driverCtx, res.runner)
 
@@ -408,18 +430,23 @@ func buildDriverStreamWriter(sseWriter *bufio.Writer, logFile *os.File) (io.Writ
 	}
 	pr, pw := io.Pipe()
 	if logFile != nil {
-		return io.MultiWriter(pw, logFile), pr, pw
+		// Log file FIRST so the per-driver runtime.log is never gated on the
+		// SSE client (runDriverSSEPump keeps draining pr after a disconnect, so
+		// pw.Write stays unblocked regardless).
+		return io.MultiWriter(logFile, pw), pr, pw
 	}
 	return pw, pr, pw
 }
 
 // runDriverSSEPump reads chunks from pipeReader and forwards them as
 // driver-tagged SSE events. On the first writeSSE error (typically
-// client disconnect) it stops forwarding but keeps draining the pipe so
-// the runner doesn't block on a full pipe — back-pressure stays at the
-// SSE socket, not on the audit subprocess. Returns a channel that
-// closes when the pump exits.
-func runDriverSSEPump(sseWriter *bufio.Writer, pipeReader *io.PipeReader, driver string) <-chan struct{} {
+// client disconnect) it invokes onDisconnect once — used to cancel the run so
+// the heavyweight audit/piolium subprocess stops instead of running to its
+// multi-hour timeout against nobody — then stops forwarding but keeps draining
+// the pipe so the runner doesn't block on a full pipe while it unwinds
+// (back-pressure stays at the SSE socket, not on the subprocess). Returns a
+// channel that closes when the pump exits.
+func runDriverSSEPump(sseWriter *bufio.Writer, pipeReader *io.PipeReader, driver string, onDisconnect func()) <-chan struct{} {
 	done := make(chan struct{})
 	if pipeReader == nil {
 		close(done)
@@ -427,19 +454,9 @@ func runDriverSSEPump(sseWriter *bufio.Writer, pipeReader *io.PipeReader, driver
 	}
 	go func() {
 		defer close(done)
-		buf := make([]byte, auditMuxBufferSize)
-		clientGone := false
-		for {
-			n, readErr := pipeReader.Read(buf)
-			if n > 0 && !clientGone {
-				if err := writeSSE(sseWriter, sseEvent{Type: "chunk", Driver: driver, Text: string(buf[:n])}); err != nil {
-					clientGone = true
-				}
-			}
-			if readErr != nil {
-				return
-			}
-		}
+		pumpChunks(pipeReader, auditMuxBufferSize, func(text string) error {
+			return writeSSE(sseWriter, sseEvent{Type: "chunk", Driver: driver, Text: text})
+		}, onDisconnect)
 	}()
 	return done
 }
@@ -531,9 +548,21 @@ func (h *Handlers) buildCombinedDriverCfg(name string, plan combinedAuditPlan, s
 	return agent.AuditAgentConfig{}, fmt.Errorf("unknown driver %q", name)
 }
 
+// combinedAuditStatus is the parent row's status; see
+// database.MultiDriverAgenticScanStatus.
+func combinedAuditStatus(results []driverResult) string {
+	failed := 0
+	for _, r := range results {
+		if r.runErr != nil {
+			failed++
+		}
+	}
+	return database.MultiDriverAgenticScanStatus(failed, len(results))
+}
+
 func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combinedAuditSetup, results []driverResult, startedAt time.Time) {
 	if !plan.req.NoDedup && h.repo != nil && plan.projectUUID != "" {
-		dedupCtx, cancel := context.WithTimeout(context.Background(), agent.AuditDedupTimeout)
+		dedupCtx, cancel := context.WithTimeout(h.runContext(), agent.AuditDedupTimeout)
 		_, _, dedupErr := h.repo.DeduplicateFindings(dedupCtx, plan.projectUUID)
 		cancel()
 		if dedupErr != nil {
@@ -546,7 +575,6 @@ func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combin
 	now := time.Now()
 	totalParsed := 0
 	totalSaved := 0
-	status := "completed"
 	var errMsg string
 	for _, r := range results {
 		if r.runner != nil {
@@ -555,13 +583,13 @@ func (h *Handlers) finalizeCombinedAuditRun(plan combinedAuditPlan, setup combin
 			totalSaved += stats.Saved
 		}
 		if r.runErr != nil {
-			status = "completed_with_errors"
 			if errMsg != "" {
 				errMsg += "; "
 			}
 			errMsg += r.name + ": " + r.runErr.Error()
 		}
 	}
+	status := combinedAuditStatus(results)
 
 	h.agentMu.Lock()
 	if memStatus := h.agenticScanStatus[plan.parentUUID]; memStatus != nil {

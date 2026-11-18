@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Actively triggers error responses in Express.js and NestJS applications to detect
-stack trace leakage and debug information exposure. When NODE_ENV is not set to
-production, Express and NestJS return detailed error responses including stack traces,
-file paths, and internal module information.
+	ModuleDesc = `**What it means:** This Express.js or NestJS app returns verbose error responses leaking internals. A request a real backend errors on (random 404, malformed JSON, non-numeric value in a numeric segment) exposed a Node.js stack trace, filesystem path, or NODE_ENV entry - production error handling is off.
 
-## Notes
-- Runs once per host
-- Probes: malformed JSON body, type-mismatch path parameters, random 404 endpoint
-- Detects NODE_ENV misconfiguration, stack trace leakage, file path disclosure
-- Fingerprints 404 to avoid false positives on custom error pages
+**How it's exploited:** An attacker triggers these errors to harvest absolute file paths, dependency layout (node_modules), and library versions, making path traversal and dependency-specific exploits more precise.
 
-## References
-- https://expressjs.com/en/guide/error-handling.html
-- https://docs.nestjs.com/exception-filters`
+**Fix:** Run with NODE_ENV set to production and add a global error handler returning generic messages without stack traces, file paths, or environment details.`
 
 	ModuleConfirmation = "Confirmed when an error response contains stack traces, file paths, or debug markers"
 	ModuleSeverity     = severity.Low

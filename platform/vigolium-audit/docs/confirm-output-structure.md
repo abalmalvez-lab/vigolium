@@ -173,7 +173,7 @@ the confirmation-rate denominator. Verified theoretical findings are not moved t
 | `intent-verdicts.json` | V1.5 | Per-finding `{ id, match: "yes"\|"partial"\|"no"\|"contested", corpus_refs[], confidence, quote }`. Annotate-only — never overrides `Confirm-Status`. Optional. |
 | `env-strategies.json` | V2 | Ranked startup strategies, build steps, ports + fallback ports, env vars, datastores, migrations/seeds, test framework, multi-tenancy hints. |
 | `auth-spec.json` | V2 | Auth scaffolding and identities to seed; `{"supported": false}` when no auth wiring detected. |
-| `env-connection.json` | V3 / `--target` | `{ status: "running"\|"failed"\|"remote", session, base_url, method_used, healthcheck_passed, actual_port, container_ids[], app_pid, cleanup_cmd, test_identities[], snapshot_spec, provisioning_attempts[] }` |
+| `env-connection.json` | V3 / `--target` | `{ status: "running"\|"failed"\|"remote", session, base_url, method_used, healthcheck_passed, actual_port, container_ids[], app_pid, test_identities[], snapshot_spec, provisioning_attempts[] }`. Cleanup uses only the structured session label and a session-stamped `app.pid`; command strings are never executed. |
 | `snapshot-spec.json` | V3 | Datastore restore commands keyed to `db-snapshot.*` for resetting state between PoC variants. |
 
 ### `vigolium-results/confirm-workspace/{report-ready,needs-review}/` staging
@@ -229,6 +229,28 @@ skipped — confirm mode never creates the file on its own.
 | `exploitability_class: non-exploitable` | Finding skips V4 entirely, lands in `report-ready/analytical/`. |
 | `exploitability_class: local-exploitable` | Finding skips V4, goes straight to V5 in `mode: local`. |
 | `Auth-Required: no` on a finding | Finding additionally appears in the report's `Pre-Auth Exposure` cross-cut table. Bucket placement is unchanged. |
+| `--keep-secrets` | On a successful run, retain `db-snapshot.*` and skip scrubbing secrets from `confirm-workspace/` JSON + logs. The junk sweep still runs. Default: redacted. |
+| `--keep-raw` | Skip the post-run prune entirely — raw workspaces, snapshots, and secrets are all retained for manual review. |
+
+## Redaction on cleanup
+
+A successful confirm run (and `vigolium-audit strip`) prunes raw byproducts and
+then **redacts secrets by default**:
+
+- `db-snapshot.sql` / `db-snapshot.sqlite` are deleted wholesale (a full DB dump
+  can't be reliably scrubbed). They're only needed intra-run to reset state
+  between PoC variants, so dropping them on completion is safe.
+- Secret values in `confirm-workspace/` JSON are masked to `***` by exact key
+  name — `env-connection.json:test_identities[].password` / `.token`,
+  `auth-spec.json` seeded credentials — preserving `null`/empty and JSON shape.
+- `confirm-workspace/*.log` (`setup.log`, `migration.log`, `seed.log`, …) have
+  `KEY=VALUE` secret assignments, inline-credential URLs, and well-known token
+  shapes (JWT, `sk-…`, `ghp_…`, `AKIA…`, `xox…`) masked.
+- A recursive sweep removes scanner scratch (`*.sarif`, `*.bqrs`, `tmp/`).
+
+Pass `--keep-secrets` to retain snapshots + secrets (junk is still swept), or
+`--keep-raw` to skip the prune entirely. See
+[output-structure.md](output-structure.md#cleanup--redaction) for the full matrix.
 
 ## What to read first
 

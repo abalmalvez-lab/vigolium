@@ -25,6 +25,12 @@ const (
 	prefixPending = "pending:" // pending:{timestamp}:{id} → "" (for ordered iteration)
 )
 
+// keySealed persists a segment's sealed state so it survives a restart. Without
+// it, a previously-sealed segment reloads as unsealed, so CanDelete (which
+// requires sealed) never fires and a fully-acked, non-active segment leaks its
+// empty directory across restarts.
+const keySealed = "meta:sealed"
+
 // Segment represents a single LevelDB database file containing tasks.
 // Each segment has a maximum capacity and is sealed when full.
 // marshalTask serializes a ScanTask using MessagePack for compact binary encoding.
@@ -66,7 +72,7 @@ type SegmentConfig struct {
 // NewSegment creates a new segment with a LevelDB database.
 func NewSegment(cfg SegmentConfig) (*Segment, error) {
 	segPath := filepath.Join(cfg.BaseDir, fmt.Sprintf("segment_%08d", cfg.ID))
-	if err := os.MkdirAll(segPath, 0755); err != nil {
+	if err := os.MkdirAll(segPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create segment directory: %w", err)
 	}
 
@@ -170,10 +176,20 @@ func (s *Segment) recoverState() error {
 	s.totalTasks.Store(total)
 	s.completedTasks.Store(completed)
 
+	// Restore the persisted sealed state so a sealed-then-emptied segment can still
+	// satisfy CanDelete after a restart instead of leaking its directory forever.
+	if _, err := s.db.Get([]byte(keySealed), nil); err == nil {
+		s.sealed.Store(true)
+	} else if !errors.Is(err, leveldb.ErrNotFound) {
+		zap.L().Warn("Failed to read segment sealed marker",
+			zap.Uint64("segment_id", s.id), zap.Error(err))
+	}
+
 	zap.L().Info("Segment state recovered",
 		zap.Uint64("segment_id", s.id),
 		zap.Int64("total", total),
 		zap.Int64("completed", completed),
+		zap.Bool("sealed", s.sealed.Load()),
 		zap.Int("reset_to_pending", len(processingToReset)))
 
 	return nil
@@ -225,9 +241,14 @@ func (s *Segment) IsSealed() bool {
 	return s.sealed.Load()
 }
 
-// Seal marks the segment as read-only.
+// Seal marks the segment as read-only and persists that state so it survives a
+// restart (see keySealed).
 func (s *Segment) Seal() {
 	s.sealed.Store(true)
+	if err := s.db.Put([]byte(keySealed), []byte("1"), nil); err != nil {
+		zap.L().Warn("Failed to persist segment sealed marker",
+			zap.Uint64("segment_id", s.id), zap.Error(err))
+	}
 	zap.L().Debug("Segment sealed",
 		zap.Uint64("segment_id", s.id),
 		zap.Int64("total_tasks", s.totalTasks.Load()))
@@ -386,38 +407,36 @@ func (s *Segment) GetNextPending() (*ScanTask, error) {
 	return nil, nil // No pending tasks
 }
 
-// AckTask marks a task as completed.
+// AckTask marks a task as completed by deleting its record.
+//
+// The previous implementation rewrote the task with status=completed, leaving
+// the (potentially large, RawRequest-bearing) record on disk until the entire
+// 10k-task segment became deletable — so a segment with one stuck task pinned
+// thousands of completed records. A completed record is never read again
+// (GetNextPending consults only the pending index, cleared at dequeue; the
+// Iterator method is unused), so we delete it outright and let LevelDB reclaim
+// the space incrementally. recoverState rebuilds totalTasks from the surviving
+// records, so deletion stays consistent with CanDelete (completed >= total) and
+// PendingTasks (total - completed) across restarts.
 func (s *Segment) AckTask(taskID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	taskKey := []byte(prefixTask + taskID)
-	taskData, err := s.db.Get(taskKey, nil)
-	if err != nil {
-		if errors.Is(err, leveldb.ErrNotFound) {
-			return ErrTaskNotFound
-		}
-		return err
-	}
-
-	var task ScanTask
-	if err := unmarshalTask(taskData, &task); err != nil {
-		return err
-	}
-
-	if task.Status == TaskStatusCompleted {
-		return nil // Already completed
-	}
-
-	task.Status = TaskStatusCompleted
-	task.UpdatedAt = time.Now()
-
-	newData, err := marshalTask(&task)
+	has, err := s.db.Has(taskKey, nil)
 	if err != nil {
 		return err
 	}
+	if !has {
+		// Already acked-and-deleted, or never existed: callers (HybridQueue.Ack)
+		// treat ErrTaskNotFound as an idempotent no-op.
+		return ErrTaskNotFound
+	}
 
-	if err := s.db.Put(taskKey, newData, nil); err != nil {
+	// Delete the task record. Any lingering pending key (a task acked without a
+	// prior dequeue) is self-healed by GetNextPending, which drops pending keys
+	// whose task record is missing.
+	if err := s.db.Delete(taskKey, nil); err != nil {
 		return err
 	}
 

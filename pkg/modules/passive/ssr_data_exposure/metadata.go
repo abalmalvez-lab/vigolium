@@ -9,24 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans server-side rendered (SSR) state blobs embedded in HTML pages for sensitive data
-exposure. Modern JS frameworks serialize application state into the HTML page for hydration,
-which may inadvertently include API keys, tokens, admin flags, email addresses,
-password hashes, or internal URLs.
+	ModuleDesc = `**What it means:** A framework serialized security-relevant data into client-visible hydration state. Routine identity/role data, internal addresses, and public credential identifiers are observations. Substantive private-token formats, hashes, or password-bearing service URLs are candidates.
 
-## Notes
-- Passive only — does not send any HTTP requests
-- Extracts state from: __NEXT_DATA__, __NUXT__, __INITIAL_STATE__, __APOLLO_STATE__
-- Scans extracted JSON for API keys, tokens, admin flags, emails, password hashes, internal IPs
-- Minimum token length of 16 characters to reduce false positives
-- Deduplicates by host+path
+**How it's exploited:** Anyone viewing the page source (no authentication) reads the leaked values - API keys, AWS keys, connection strings, internal IPs, emails, password hashes, or admin flags - then replays them against the relevant service.
 
-## References
-- https://nextjs.org/docs/pages/building-your-application/data-fetching
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/09-Testing_for_Weak_Cryptography/04-Testing_for_Weak_Encryption`
+**Fix:** Strip secrets, credentials, and internal infrastructure details from SSR state, serializing only non-sensitive data the client needs.`
 
-	ModuleConfirmation = "Confirmed when sensitive patterns (API keys, tokens, admin flags, credentials) are found in SSR state blobs"
+	ModuleConfirmation = "Candidate for substantive private credentials in parsed state; routine identity data and public identifiers remain observations until sensitivity and authorization are established"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"javascript", "info-disclosure", "light"}

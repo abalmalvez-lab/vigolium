@@ -9,21 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Tests for path normalization vulnerabilities by iteratively applying traversal payloads
-(with conditional auto-slashing) and checking response status codes and fingerprints
-against expected internal/public patterns.
+	ModuleDesc = `**What it means:** The reverse proxy and backend normalize traversal sequences (..%2f, ..;/, encoded dots) differently, so a crafted path reaches a resource the clean URL does not serve, bypassing path-based access controls or escaping a static handler's root.
 
-## Notes
-- Compares response fingerprints between public and internal path variations
-- Uses iterative payload application with auto-slashing heuristics
-- Targets middleware and reverse proxy path normalization inconsistencies
+**How it's exploited:** An attacker sends an over-encoded or matrix-parameter path so the front-end routes it to a permitted location while the backend resolves a restricted target, reaching endpoints past auth or reading files above the root like /etc/passwd or .env.
 
-## References
-- https://i.blackhat.com/us-18/Wed-August-8/us-18-Orange-Tsai-Breaking-Parser-Logic-Take-Your-Path-Normalization-Off-And-Pop-0days-Out-2.pdf`
+**Fix:** Normalize paths identically at every tier before routing and authorization, reject ambiguous encodings, and enforce a strict resolved-path boundary.`
 
-	ModuleConfirmation = "Confirmed when traversal payloads produce response fingerprints matching internal resources that differ from public access patterns"
+	ModuleConfirmation = "Confirmed either when an over-traversed path is rejected (HTTP 400) while the backed-off, traversal-bearing path reproducibly reaches a 2xx text resource that the clean URL cannot reach (access unlocked) or that differs substantially from the clean baseline (and is not the root/non-existent catch-all shell), or when a matrix-parameter/encoded-slash shell reproducibly reads a known file (or surfaces a directory/bucket listing) off the static root, with baseline-subtracted markers surviving a wildcard and decoy-filename negative"
 	ModuleSeverity     = severity.High
 	ModuleConfidence   = severity.Firm
-	ModuleTags         = []string{"misconfiguration", "lfi", "moderate"}
+	ModuleTags         = []string{"misconfiguration", "lfi", "traversal", "moderate"}
 )

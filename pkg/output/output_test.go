@@ -2,6 +2,7 @@ package output
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vigolium/vigolium/pkg/terminal"
+	"github.com/vigolium/vigolium/pkg/types"
 	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
@@ -86,6 +89,26 @@ func TestResultEventIDIgnoresUnhashedFields(t *testing.T) {
 	assert.Equal(t, baseID, ev.ID(), "URL/Host/Request/Name/Confidence are not part of the ID hash")
 }
 
+func TestResultEventRecordKindCompatibilityAndIdentity(t *testing.T) {
+	legacy := sampleEvent()
+	explicitFinding := sampleEvent()
+	explicitFinding.RecordKind = RecordKindFinding
+	candidate := sampleEvent()
+	candidate.RecordKind = RecordKindCandidate
+	observation := sampleEvent()
+	observation.RecordKind = RecordKindObservation
+
+	assert.True(t, legacy.IsFinding())
+	assert.Equal(t, RecordKindFinding, legacy.EffectiveRecordKind())
+	assert.Equal(t, legacy.ID(), explicitFinding.ID(), "explicit finding preserves historical IDs")
+	assert.NotEqual(t, legacy.ID(), candidate.ID(), "candidate IDs cannot collide with findings")
+	assert.NotEqual(t, candidate.ID(), observation.ID(), "retained signal kinds have separate identities")
+
+	unknown := sampleEvent()
+	unknown.RecordKind = RecordKind("future-value")
+	assert.Equal(t, RecordKindFinding, unknown.EffectiveRecordKind(), "unknown legacy values fail closed as findings")
+}
+
 func TestResultEventIDConcurrent(t *testing.T) {
 	// Exercises the sha1Pool under concurrency for a stable result.
 	ev := sampleEvent()
@@ -139,14 +162,19 @@ func TestFormatJSONStripsResponseByDefault(t *testing.T) {
 	data, err := w.formatJSON(ev)
 	require.NoError(t, err)
 
-	// Response is cleared on the event and absent from the marshaled JSON.
-	assert.Empty(t, ev.Response, "formatJSON clears Response when not included")
+	// The response is omitted from the marshaled JSON when not included...
 	assert.NotContains(t, string(data), "secret-body")
-
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(data, &decoded))
 	_, hasResponse := decoded["response"]
-	assert.False(t, hasResponse, "response key omitted when empty")
+	assert.False(t, hasResponse, "response key omitted from output")
+
+	// ...but the caller's event MUST keep its Response. The same *ResultEvent is
+	// written to output and then persisted to the DB (e.g. the known-issue scan
+	// callback runs before SaveFinding/SaveRecord); mutating it here would wipe
+	// the response body from the stored finding and HTTP record.
+	assert.Equal(t, "HTTP/1.1 200 OK\r\n\r\nsecret-body", ev.Response,
+		"formatJSON must not mutate the caller's event")
 }
 
 func TestStandardWriterWriteSetsDefaults(t *testing.T) {
@@ -184,6 +212,33 @@ func TestStandardWriterWriteToFile(t *testing.T) {
 	}
 }
 
+func TestStandardWriterConsoleOnlyWritesScreenNotJSON(t *testing.T) {
+	// Console-only path: no JSON stdout, no output file. Write must render screen
+	// text via formatScreen and must NOT emit JSON (the JSON marshal is skipped
+	// entirely on this path).
+	r, pipeW, err := os.Pipe()
+	require.NoError(t, err)
+	orig := os.Stdout
+	os.Stdout = pipeW
+
+	w := &StandardWriter{} // JSONOutput=false, DisableStdout=false, outputFile=nil
+	writeErr := w.Write(sampleEvent())
+
+	require.NoError(t, pipeW.Close())
+	out, readErr := io.ReadAll(r)
+	os.Stdout = orig
+	require.NoError(t, writeErr)
+	require.NoError(t, readErr)
+
+	text := terminal.StripANSI(string(out))
+	require.NotEmpty(t, text, "console-only Write must emit screen output")
+	assert.Contains(t, text, "[xss-reflected]", "screen output uses the bracketed module layout")
+	assert.NotContains(t, text, "template-id", "console path must not emit JSON keys")
+
+	var decoded map[string]any
+	assert.Error(t, json.Unmarshal(out, &decoded), "console output is screen text, not JSON")
+}
+
 func TestStandardWriterWriteFileOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/file-only.jsonl"
@@ -205,6 +260,96 @@ func TestStandardWriterWriteFileOnly(t *testing.T) {
 func TestStandardWriterCloseNilFileIsSafe(t *testing.T) {
 	w := &StandardWriter{}
 	assert.NotPanics(t, w.Close)
+}
+
+func TestStandardWriterShowsFindingsOnStdout(t *testing.T) {
+	cases := []struct {
+		name          string
+		disableStdout bool
+		jsonOutput    bool
+		want          bool
+	}{
+		{"console human stream", false, false, true},
+		{"silent / deferred suppresses stdout", true, false, false},
+		{"raw json on stdout is not human-readable", false, true, false},
+		{"both off", true, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := &StandardWriter{DisableStdout: c.disableStdout, JSONOutput: c.jsonOutput}
+			assert.Equal(t, c.want, w.ShowsFindingsOnStdout())
+		})
+	}
+}
+
+func TestMultiWriterShowsFindingsOnStdout(t *testing.T) {
+	// No sub-writer advertises stdout findings.
+	mw := NewMultiWriter(&StandardWriter{DisableStdout: true})
+	assert.False(t, mw.ShowsFindingsOnStdout())
+
+	// One sub-writer does → the aggregate does.
+	mw = NewMultiWriter(&StandardWriter{DisableStdout: true}, &StandardWriter{})
+	assert.True(t, mw.ShowsFindingsOnStdout())
+
+	// A writer that doesn't implement the predicate is ignored, not a panic.
+	mw = NewMultiWriter(&recordingWriter{})
+	assert.False(t, mw.ShowsFindingsOnStdout())
+}
+
+func TestFormatPhaseFindingLine(t *testing.T) {
+	ev := sampleEvent()
+	ev.ModuleType = "passive"
+	ev.Request = "GET /search?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	line := FormatPhaseFindingLine("dynamic-assessment", ev)
+	plain := terminal.StripANSI(line)
+
+	assert.True(t, strings.HasSuffix(line, "\n"), "line is newline-terminated")
+	assert.Contains(t, plain, "dynamic-assessment", "carries the phase tag")
+	// Mirrors formatScreen's bracketed [type] [module] [severity] layout.
+	assert.Contains(t, plain, "[passive]", "module type rendered in brackets")
+	assert.Contains(t, plain, "[xss-reflected]", "module id rendered in brackets")
+	assert.Contains(t, plain, "high]", "severity rendered in brackets")
+	assert.Contains(t, plain, "GET https://example.com/search?q=<script>",
+		"HTTP method prefixes the matched-at URL")
+
+	// The [type] bracket is suppressed when it duplicates the phase tag, matching
+	// formatScreen.
+	kis := sampleEvent()
+	kis.ModuleType = "known-issue-scan"
+	noType := terminal.StripANSI(FormatPhaseFindingLine("known-issue-scan", kis))
+	assert.NotContains(t, noType, "[known-issue-scan]",
+		"type bracket suppressed when it duplicates the phase tag")
+
+	// Extracted value is surfaced in brackets and truncated to the cap.
+	withVal := sampleEvent()
+	withVal.ExtractedResults = []string{strings.Repeat("A", liveFindingValueMax+20)}
+	withValue := terminal.StripANSI(FormatPhaseFindingLine("known-issue-scan", withVal))
+	assert.Contains(t, withValue, "[")
+	assert.NotContains(t, withValue, strings.Repeat("A", liveFindingValueMax+1),
+		"value snippet is truncated to the cap")
+
+	// A multi-line extracted snippet (e.g. a JS handler body) renders on one
+	// line: embedded newlines become literal \n escapes, never real breaks.
+	multiline := sampleEvent()
+	multiline.ExtractedResults = []string{"});\n  }\n}\n\nlet intervalId = null;"}
+	mlLine := FormatPhaseFindingLine("dynamic-assessment", multiline)
+	mlPlain := terminal.StripANSI(mlLine)
+	assert.Equal(t, 1, strings.Count(mlLine, "\n"), "only the trailing line terminator is a real newline")
+	assert.Contains(t, mlPlain, `});\n  }\n}\n\nlet intervalId`, "embedded newlines escaped to literal \\n")
+}
+
+func TestEscapeOneLine(t *testing.T) {
+	// Plain values pass through untouched (fast path).
+	assert.Equal(t, "no control chars", EscapeOneLine("no control chars"))
+	// Newlines, carriage returns, and tabs become literal escapes; a CRLF pair
+	// collapses to a single \n.
+	assert.Equal(t, `a\nb\tc\nd`, EscapeOneLine("a\nb\tc\r\nd"))
+	assert.Equal(t, `\r`, EscapeOneLine("\r"))
+	// The result never contains a real control character.
+	out := EscapeOneLine("x\ny\tz\r\nw")
+	assert.NotContains(t, out, "\n")
+	assert.NotContains(t, out, "\r")
+	assert.NotContains(t, out, "\t")
 }
 
 // recordingWriter is an in-memory Writer that records every event it receives.
@@ -274,4 +419,42 @@ func TestMultiWriterPropagatesError(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, "boom", err.Error())
 	assert.Empty(t, good.written, "later writers are skipped after an error")
+}
+
+// --silent: Silent is set, yet each finding is one plain line on stdout, with
+// no color and no phase prefix, even when a jsonl format set JSONOutput.
+func TestStandardWriterSilentFindingLines(t *testing.T) {
+	opts := types.DefaultOptions()
+	opts.Silent = true
+	opts.FindingLinesToStdout = true
+	opts.OutputFormats = []string{"jsonl"}
+	opts.JSONOutput = true
+	opts.DeferredJSONLExport = true
+	w, err := NewStandardWriter(opts)
+	require.NoError(t, err)
+	w.PhaseTag = "dynamic-assessment"
+
+	r, pipeW, err := os.Pipe()
+	require.NoError(t, err)
+	orig := os.Stdout
+	os.Stdout = pipeW
+	writeErr := w.Write(sampleEvent())
+	require.NoError(t, pipeW.Close())
+	out, readErr := io.ReadAll(r)
+	os.Stdout = orig
+	require.NoError(t, writeErr)
+	require.NoError(t, readErr)
+
+	text := string(out)
+	assert.Equal(t, 1, strings.Count(text, "\n"), "one line per finding")
+	assert.Equal(t, terminal.StripANSI(text), text, "no color")
+	assert.Contains(t, text, "[xss-reflected]")
+	assert.NotContains(t, text, "dynamic-assessment", "no phase prefix")
+	assert.NotContains(t, text, "template-id", "not JSON")
+
+	// Silent without the CLI's option stays silent (server, agent).
+	opts.FindingLinesToStdout = false
+	w2, err := NewStandardWriter(opts)
+	require.NoError(t, err)
+	assert.True(t, w2.DisableStdout)
 }

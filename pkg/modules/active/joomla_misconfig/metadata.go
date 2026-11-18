@@ -9,21 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Joomla-specific files and endpoints that should not be publicly
-accessible: configuration.php backups, exposed log and temp directories,
-Akeeba backup archives, debug mode artifacts, com_ajax information disclosure,
-and composer metadata files.
+	ModuleDesc = `**What it means:** The Joomla site exposes files that should never be web-reachable: configuration.php backups (.bak/.old/~), listable log/temp/backup directories, Akeeba archives, or composer metadata. This leaks anything from the core version to database credentials and the Joomla secret key.
 
-## Notes
-- Runs once per host to avoid redundant probing
-- Validates responses with content markers to reduce false positives
-- Fingerprints 404 responses to detect custom error pages
-- Checks both frontend and administrator paths
+**How it's exploited:** A configuration.php backup or Akeeba archive hands an attacker the database password and the secret key used for password resets and sessions, enabling database access or admin takeover. Listable directories expose uploads and site dumps.
 
-## References
-- https://docs.joomla.org/Security_Checklist
-- https://developer.joomla.org/security-centre.html`
+**Fix:** Remove backups, archives, and temp files from the webroot, disable directory listing, and block public access at the web server.`
 
 	ModuleConfirmation = "Confirmed when probed Joomla files return 200 with expected content markers"
 	ModuleSeverity     = severity.High

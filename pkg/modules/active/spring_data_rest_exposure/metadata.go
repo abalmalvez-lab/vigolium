@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Spring Data REST auto-exposed repository endpoints. Spring Data REST
-automatically creates RESTful endpoints for JPA repositories, which may expose
-entities without proper authorization. The module detects HAL-style API roots
-and ALPS profile endpoints that reveal the full data model.
+	ModuleDesc = `**What it means:** Spring Data REST is auto-exposing JPA repository endpoints over HTTP. The scanner confirmed a reachable HAL/HATEOAS API root (/api) or ALPS profile endpoint (/api/profile) returning discovery links that publish the entity catalog and per-entity CRUD URLs.
 
-## Notes
-- Runs once per host
-- Checks for HAL/HATEOAS discovery responses
-- Detects ALPS profile metadata endpoints
-- Validates using Spring Data REST JSON markers
-- Fingerprints 404 responses to reduce false positives
+**How it's exploited:** An attacker reads the HAL _links and ALPS profile to map every persisted entity, then follows them to read, page through, and (if write methods are not locked down) create, update, or delete records.
 
-## References
-- https://docs.spring.io/spring-data/rest/docs/current/reference/html/
-- https://spring.io/projects/spring-data-rest`
+**Fix:** Restrict repositories with authorization, disable auto-exposure for sensitive entities (@RepositoryRestResource(exported = false)), and require authentication on /api and profile endpoints.`
 
 	ModuleConfirmation = "Confirmed when HAL-style API root or ALPS profile endpoint returns Spring Data REST repository links"
 	ModuleSeverity     = severity.Medium

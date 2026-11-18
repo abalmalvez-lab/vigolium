@@ -41,6 +41,13 @@ func New() *Module {
 	return m
 }
 
+// VulnClass enables cross-module (param, class) dedup: once any ssti module
+// reports a parameter, the others in the class skip it.
+func (m *Module) VulnClass() string { return modkit.VulnClassSSTI }
+
+// ClassPriority orders this module within its vuln class (lower runs first).
+func (m *Module) ClassPriority() int { return modkit.ClassCostInBand + 1 }
+
 // ScanPerInsertionPoint performs SSTI detection scanning.
 func (m *Module) ScanPerInsertionPoint(
 	ctx *httpmsg.HttpRequestResponse,
@@ -59,6 +66,16 @@ func (m *Module) ScanPerInsertionPoint(
 	if rhm != nil && !rhm.ShouldCheckInsertionPoint(
 		urlx, ctx.Request(), paramName, ip.BaseValue(), paramType,
 	) {
+		return nil, nil
+	}
+
+	// Behavioral/error-diff SSTI detection on a cache/CDN-fronted response or a
+	// large rendered HTML page is unreliable: cache HIT/MISS swings and per-request
+	// dynamic content manufacture phantom softBase-vs-probe differentials. Skip such
+	// surfaces before the expensive baseline build. (Cosmetic/unconsumed insertion
+	// points are already handled downstream by the VerySimilar(softBase, crudeFuzz)
+	// baseline guard.)
+	if modkit.DifferentialSurfaceUnreliable(ctx.Response()) {
 		return nil, nil
 	}
 
@@ -117,18 +134,30 @@ func (m *Module) ScanPerInsertionPoint(
 		return nil, nil
 	}
 
-	bestSeverity := getBestSeverity(results)
+	// Same gate as smart_behavior_detection: every signal in that report is a
+	// response diff, so a non-deterministic endpoint makes the break and escape
+	// probes diverge on every metric the differ tracks — here reported as a
+	// confidently matched template engine.
+	if modkit.EndpointVolatile(scanCtx, ctx, httpClient) {
+		return nil, nil
+	}
 
 	zap.L().Info("SSTI: Found issues",
 		zap.String("param", paramName),
 		zap.Int("count", len(results)/2))
 
+	// All findings from this module are emitted at Info severity. Diff-based,
+	// error-response SSTI detection is an inherently false-positive-prone
+	// heuristic (reflection echoes, per-request volatility, generic error
+	// pages), so it is surfaced as an informational lead for a human to confirm
+	// rather than an actionable High. The per-probe severity and the matched
+	// engines remain in the report body for triage context.
 	return []*output.ResultEvent{{
 		URL:              urlx.String(),
 		Request:          string(ctx.Request().Raw()),
 		FuzzingParameter: paramName,
 		Info: output.Info{
-			Severity:    intToSeverity(bestSeverity),
+			Severity:    severity.Info,
 			Description: report,
 		},
 	}}, nil
@@ -473,15 +502,4 @@ func (m *Module) detectTemplateEngines(
 	}
 
 	return results
-}
-
-func intToSeverity(sev int) severity.Severity {
-	switch {
-	case sev >= 7:
-		return severity.High
-	case sev >= 3:
-		return severity.Medium
-	default:
-		return severity.Low
-	}
 }

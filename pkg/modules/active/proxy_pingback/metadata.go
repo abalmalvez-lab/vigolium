@@ -9,23 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for open proxy and callback endpoints by injecting OAST callback URLs into common
-proxy-related URL paths. This detects endpoints that forward or fetch user-supplied URLs
-(open proxy / blind SSRF).
+	ModuleDesc = `**What it means:** The server hosts an open proxy or callback endpoint that fetches a client-supplied URL, and it made an outbound request to a Vigolium-controlled OAST host the scanner injected. This is a confirmed Server-Side Request Forgery (SSRF) / open-proxy condition.
 
-## Notes
-- Requires an interactsh server (configured via oast settings)
-- Targets proxy-related paths: /proxy, /httpproxy, /callback, /url, /remote, etc.
-- Appends OAST URLs via query parameters: url, src, proxy, callback, email, etc.
-- Sends 54 probe requests per host covering path and parameter patterns
-- Each host is tested only once (DiskSet dedup)
-- Findings arrive asynchronously via the OAST polling callback
-- OWASP Top 10 2021: A10 (SSRF)
+**How it's exploited:** An attacker swaps the OAST URL for an internal target to reach cloud metadata (169.254.169.254 to steal credentials), admin panels, or firewalled hosts, or relays attacks through the server.
 
-## References
-- https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
-- https://portswigger.net/burp/documentation/collaborator`
+**Fix:** Do not fetch arbitrary client-supplied URLs; if required, enforce a strict destination allowlist and block private ranges.`
 
 	ModuleConfirmation = "Confirmed when target server makes outbound DNS or HTTP request to OAST callback URL via proxy endpoint"
 	ModuleSeverity     = severity.High

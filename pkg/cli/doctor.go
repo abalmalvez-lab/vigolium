@@ -1,10 +1,11 @@
 package cli
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -12,139 +13,343 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/apicontract"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/diagnostics"
 	"github.com/vigolium/vigolium/pkg/terminal"
-	"go.uber.org/zap"
 )
 
 var (
-	doctorFix  bool
-	doctorOnly []string
+	doctorFix    bool
+	doctorOnly   []string
+	doctorStrict bool
+	// doctorFor scopes the verdict to one purpose (scan, agent, server).
+	doctorFor string
+	// doctorTarget adds DNS/TCP/TLS reachability checks for a URL (--for scan).
+	doctorTarget string
+	// doctorYes consents to vendor installers (curl | bash, global agent tools).
+	doctorYes bool
+	// doctorDryRun lists what --fix would install without installing it.
+	doctorDryRun bool
 )
+
+// doctorRunDiagnostics is diagnostics.Run, replaced in tests: a real run spawns
+// a browser and extracts embedded binaries.
+var doctorRunDiagnostics = diagnostics.Run
 
 var doctorCmd = &cobra.Command{
 	Use:   "doctor",
 	Short: "Check system readiness and diagnose configuration issues",
-	Long:  "Run diagnostic checks on database, agent backends, third-party tools, and other dependencies to verify the scanner is ready to operate.",
-	RunE:  runDoctorCmd,
+	Long: "Run diagnostic checks on database, agent backends, third-party tools, scope rules, OAST reachability, the proxy, and other dependencies to verify the scanner is ready to operate.\n\n" +
+		"The verdict comes first, then one line per check; -v adds each check's detail lines. " +
+		"-j lists the checks flat in items (id, group, status, message, affects, fix_argv, and on a failing check the setting it tested and where that came from), with the verdict as status and what still works as capabilities " +
+		"(scan, spidering, known_issue_scan, out_of_band, agent, audit). --json-legacy-keys keeps the old nested report. " +
+		"--only runs only the named checks (the others, their probes included, never run), the verdict counts only those, and with --fix only they are repaired. An agent provider behind an endpoint is reported unverified; --for agent probes it.\n\n" +
+		"--fix --dry-run lists each install --fix would run: what, how, where to and roughly how large.\n\n" +
+		"Exits 1 (error.code not_ready) when the verdict is not_ready; with --strict also when it is degraded. " +
+		"The report is written first either way, so -j consumers always get it on stdout.",
+	Args: cobra.NoArgs,
+	RunE: runDoctorCmd,
 }
 
 func init() {
 	rootCmd.AddCommand(doctorCmd)
 	doctorCmd.Flags().BoolVar(&doctorFix, "fix", false, "Auto-install/fix failing checks")
-	doctorCmd.Flags().StringSliceVar(&doctorOnly, "only", nil, "Fix only specific items (nuclei,chrome,bun,claude,agent-browser,pi,piolium)")
+	doctorCmd.Flags().StringSliceVar(&doctorOnly, "only", nil, "Run (and with --fix, repair) only these checks: a check id or fix key (nuclei,chrome,bun,claude,agent-browser,pi,piolium,skill,oast,agent,proxy,…)")
+	doctorCmd.Flags().BoolVar(&doctorDryRun, "dry-run", false, "With --fix: list each install (method, destination, approximate size) without running it")
+	doctorCmd.Flags().BoolVar(&doctorStrict, "strict", false, "Exit 1 when the verdict is degraded, not only when it is not_ready")
+	doctorCmd.Flags().BoolVarP(&doctorYes, "yes", "y", false, "With --fix: also run vendor installers piped into a shell and global agent tooling installs (bun, claude, agent-browser, pi, piolium) without asking")
+	doctorCmd.Flags().StringVar(&doctorFor, "for", "", "Scope the verdict to one purpose: "+strings.Join(diagnostics.Purposes, "|")+" (checks that do not affect it are reported but not counted)")
+	doctorCmd.Flags().StringVarP(&doctorTarget, "target", "t", "", "With --for scan: also check DNS, TCP and TLS reachability of this URL")
+	doctorCmd.Flags().BoolVarP(&globalStateless, "stateless", "S", false, "With --for scan: the scan will use a temporary database, so the database check is skipped")
 }
 
-// doctorOutput is the JSON structure when --fix is used with --json.
-type doctorOutput struct {
-	Report  *diagnostics.Report     `json:"report"`
-	Fixes   []diagnostics.FixResult `json:"fixes,omitempty"`
-	Updated *diagnostics.Report     `json:"updated,omitempty"`
+// doctorScoped builds the --for report from the full one (nil without --for).
+func doctorScoped(report *diagnostics.Report, settings *config.Settings) *diagnostics.ScopedReport {
+	if doctorFor == "" || report == nil {
+		return nil
+	}
+	deps := diagnostics.ScopedDeps{
+		Settings:  settings,
+		Stateless: globalStateless,
+		Proxy:     globalProxy,
+		Target:    doctorTarget,
+		Include:   doctorInclude(),
+	}
+	if settings != nil && settings.Database.Driver == "sqlite" && !globalStateless {
+		deps.DBDir = filepath.Dir(config.ExpandPath(settings.Database.SQLite.Path))
+	}
+	scoped, err := diagnostics.Scoped(doctorFor, report, deps)
+	if err != nil {
+		return nil
+	}
+	return scoped
+}
+
+// printScopedReport renders a --for report.
+func printScopedReport(s *diagnostics.ScopedReport) {
+	fmt.Println()
+	fmt.Printf("  %s %s\n", terminal.BoldCyan("Vigolium Doctor"), terminal.White("— ready for "+s.For+"?"))
+	fmt.Println()
+	for _, c := range s.Checks {
+		status := diagnostics.StatusOK
+		switch c.Status {
+		case diagnostics.ScopedNotReady:
+			status = diagnostics.StatusError
+		case diagnostics.ScopedDegraded, diagnostics.ScopedWarning:
+			status = diagnostics.StatusWarning
+		}
+		msg := c.Message
+		if !c.Counts && c.Status != diagnostics.ScopedOK {
+			msg += " (not counted)"
+		}
+		if c.Status == diagnostics.ScopedSkipped {
+			msg = "skipped — " + c.Message
+		}
+		printCheck(c.ID, status, msg)
+		if len(c.Affects) > 0 && c.Status != diagnostics.ScopedOK {
+			printDetails(true, []string{"affects: " + strings.Join(c.Affects, "; ")})
+		}
+		if len(c.FixArgv) > 0 && c.Status != diagnostics.ScopedOK {
+			printTip("`" + strings.Join(c.FixArgv, " ") + "`")
+		}
+	}
+	fmt.Println()
+	fmt.Printf("  %s %s\n", terminal.BoldCyan("Verdict:"), terminal.White(string(s.Status)))
+	fmt.Println()
 }
 
 func runDoctorCmd(cmd *cobra.Command, args []string) error {
 	defer syncLogger()
 
-	if len(doctorOnly) > 0 && !doctorFix {
-		fmt.Printf("  %s --only has no effect without --fix\n", terminal.Yellow(terminal.SymbolWarning))
-		return nil
+	if doctorFor != "" && !diagnostics.ValidPurpose(doctorFor) {
+		return usageErrorf("invalid --for %q (want one of: %s)", doctorFor, strings.Join(diagnostics.Purposes, ", "))
+	}
+	if doctorTarget != "" && doctorFor != diagnostics.PurposeScan {
+		return usageErrorf("--target checks scan reachability; use it with --for scan")
+	}
+	if doctorDryRun && !doctorFix {
+		return usageErrorf("--dry-run previews --fix; add --fix to list the installs it would run")
 	}
 
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
+	// doctor is the one command that must not fail on a broken config: reporting
+	// that the config is broken is its job. The error is carried into the report
+	// as a failed check rather than warned into a logger and then contradicted by
+	// a green readout.
+	settings, cfgErr := clicommon.LoadSettings(globalConfig)
+	overlayProject := ""
+	if cfgErr != nil {
 		settings = config.DefaultSettings()
+	} else if project, perr := overlayProjectUUID(); perr == nil {
+		// The scope checks judge the scope a scan would run under, which
+		// includes the project's overlay. A broken overlay is reported as the
+		// config failure it is; the global settings stay in use for the rest.
+		overlayProject = project
+		cfgErr = config.ApplyProjectOverlay(settings, project)
 	}
 
-	deps := diagnostics.Deps{Settings: settings}
+	// --only names checks; an unknown name is a typo, not an empty report.
+	// Judged against every check doctor can run, before any of them runs.
+	if err := validateDoctorOnly(doctorAllChecks()); err != nil {
+		return err
+	}
+
+	deps := diagnostics.Deps{
+		Settings:           settings,
+		ConfigErr:          cfgErr,
+		ConfigPath:         effectiveConfigPath(),
+		ProbeBrowserLaunch: true,
+		// The OAST resolution is the one probe that leaves the machine; it
+		// runs only when the oast check is selected (Include says so too).
+		ProbeNetwork: doctorOnlyIncludes("oast"),
+		// --only names the checks a caller asked about: the others never run
+		// (no chromium launch, no jstangle extraction), and the verdict is over
+		// the checks that did.
+		Include: doctorInclude(),
+	}
 
 	// Try to open DB (optional — report error if it fails). The error is
 	// passed through to diagnostics so a postgres connect failure surfaces as
 	// the real driver error instead of "not configured".
-	db, dbErr := getDB()
-	if dbErr == nil {
-		deps.DB = db
-		defer closeDatabaseOnExit()
-	} else {
-		deps.DBErr = dbErr
+	// A stateless scan never opens the project database, so `--for scan -S`
+	// does not either.
+	if (!globalStateless || doctorFor != diagnostics.PurposeScan) && doctorOnlyIncludes("database") {
+		db, dbErr := getDB()
+		if dbErr == nil {
+			deps.DB = db
+			defer closeDatabaseOnExit()
+		} else {
+			deps.DBErr = dbErr
+		}
 	}
 
-	report := diagnostics.Run(deps)
+	report := doctorRunDiagnostics(deps)
+	if doctorOnlyIncludes("skill") {
+		attachDoctorSkillCheck(report)
+	}
+	ctxInfo := newDoctorContext(settings, overlayProject)
 
 	// Backfill the first-run marker only when the mandatory native-scan deps are
 	// actually present (chromium + nuclei-templates). A read-only doctor on a
 	// machine missing them must NOT stamp it, or the next scan would skip the
-	// first-run auto-install. The --fix path re-checks below after RunFixes.
+	// first-run notice. The --fix path re-checks below after RunFixes.
 	ensureInitMarkerIfDepsPresent(report)
 
 	if !doctorFix {
+		scoped := doctorScoped(report, settings)
+		if scoped != nil && len(doctorOnly) > 0 {
+			scoped.Narrow(func(id string) bool { return doctorOnlyIncludes(diagnostics.ScopedSelectorID(id)) })
+		}
 		if globalJSON {
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			return enc.Encode(report)
+			// Through the shared writer so this counts as the invocation's one
+			// result document and the error path does not append a second.
+			if err := emitDoctorJSON(cmd, ctxInfo, report, nil, nil, scoped); err != nil {
+				return err
+			}
+			return doctorVerdict(report, scoped)
 		}
-		printDoctorReport(report)
-		return nil
+		switch {
+		case scoped != nil:
+			printScopedReport(scoped)
+		case len(doctorOnly) > 0:
+			printDoctorChecks(report, ctxInfo.filter(ctxInfo.checks(report)))
+		default:
+			printDoctorReport(report, ctxInfo)
+		}
+		return doctorVerdict(report, scoped)
 	}
 
-	// --fix mode: print initial report, fix, then recheck. When --only narrows
-	// the run to specific components, render a focused view of just those
-	// components (no full report, shown once) instead of the whole doctor log.
-	focused := len(doctorOnly) > 0
-	if !globalJSON {
-		if focused {
-			fmt.Println()
-			fmt.Printf("  %s %s\n", terminal.BoldCyan("Vigolium Doctor"),
-				terminal.White("— fixing "+strings.Join(focusedLabels(report, doctorOnly), ", ")))
-		} else {
-			printDoctorReport(report)
-			fmt.Printf("  %s\n", terminal.BoldCyan("Fixing issues..."))
-			fmt.Println()
-		}
-	}
-
+	// --fix: repair, then report the re-checked state once. The report before
+	// the fix is not printed: it is the same report minus the repairs, and
+	// printing both doubled the output for nothing.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	fixes := diagnostics.RunFixes(ctx, report, settings, doctorOnly)
+	fixOnly := doctorFixKeys(doctorOnly)
+	if !globalJSON && !doctorDryRun {
+		label := "Fixing issues..."
+		if len(doctorOnly) > 0 {
+			label = "Fixing " + strings.Join(focusedLabels(report, doctorOnly), ", ") + "..."
+		}
+		fmt.Println()
+		fmt.Printf("  %s\n", terminal.BoldCyan(label))
+		fmt.Println()
+	}
+	fixes := diagnostics.RunFixesWith(ctx, report, settings, fixOnly, diagnostics.FixOptions{
+		AssumeYes: doctorYes,
+		Confirm:   doctorVendorConfirm(),
+		DryRun:    doctorDryRun,
+	})
+	// The skill reinstall is CLI-side: it needs this binary's embedded bundle
+	// and version, which pkg/diagnostics cannot import.
+	if doctorSkillFixSelected(doctorOnly) {
+		if doctorDryRun {
+			fixes = append(fixes, diagnostics.FixResult{Key: doctorSkillFixKey, Label: "Agent skill", Planned: true,
+				Method: "copy the embedded skill bundle", Destination: "the skill directories of installed coding agents", Size: "<1 MB", Message: "would reinstall"})
+		} else {
+			fixes = append(fixes, fixStaleSkills(Version, Commit)...)
+		}
+	}
+
+	if doctorDryRun {
+		if globalJSON {
+			return emitDoctorDryRun(cmd, ctxInfo, report, fixes)
+		}
+		printFixPlan(fixes)
+		return nil
+	}
 
 	if !globalJSON && len(fixes) > 0 {
-		fmt.Println()
 		printFixResults(fixes)
 	}
 
 	// Re-run checks to show updated status.
-	updated := diagnostics.Run(deps)
+	updated := doctorRunDiagnostics(deps)
+	if doctorOnlyIncludes("skill") {
+		attachDoctorSkillCheck(updated)
+	}
 
 	// If --fix just installed chromium + nuclei-templates, backfill the marker
 	// so subsequent scans skip the redundant first-run check.
 	ensureInitMarkerIfDepsPresent(updated)
 
+	scopedUpdated := doctorScoped(updated, settings)
 	if globalJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(doctorOutput{
-			Report:  report,
-			Fixes:   fixes,
-			Updated: updated,
-		})
+		if err := emitDoctorJSON(cmd, ctxInfo, report, fixes, updated, scopedUpdated); err != nil {
+			return err
+		}
+		return doctorVerdict(updated, scopedUpdated)
 	}
 
 	fmt.Println()
-	fmt.Printf("  %s\n", terminal.BoldCyan("Updated status:"))
-	if focused {
-		printDoctorFocused(updated, doctorOnly)
-		fmt.Println()
-	} else {
-		printDoctorReport(updated)
+	switch {
+	case scopedUpdated != nil:
+		printScopedReport(scopedUpdated)
+		return doctorVerdict(updated, scopedUpdated)
+	case len(doctorOnly) > 0:
+		printDoctorChecks(updated, ctxInfo.filter(ctxInfo.checks(updated)))
+	default:
+		printDoctorReport(updated, ctxInfo)
+	}
+	return doctorVerdictError(updated)
+}
+
+// doctorVerdictError turns the report's verdict into the exit status, after
+// the report has been written: not_ready exits 1 (error.code not_ready), and
+// so does degraded under --strict. doctor always exited 0 before, so a script
+// gating on it could not tell a working install from one with no database.
+// Under --fix it is called with the re-checked report, so a fix that worked
+// exits 0.
+func doctorVerdictError(r *diagnostics.Report) error {
+	switch {
+	case r == nil:
+		return nil
+	case r.Status == "not_ready":
+		return clicommon.CodedErrorf(apicontract.CodeNotReady, "doctor: system not ready (%s)", doctorBlockers(r))
+	case doctorStrict && r.Status == "degraded":
+		return clicommon.CodedErrorf(apicontract.CodeNotReady, "doctor: system degraded (--strict)")
 	}
 	return nil
+}
+
+// doctorVerdict is doctorVerdictError, scoped by --for when given: the
+// scoped verdict (the worst counted check) decides the exit.
+func doctorVerdict(r *diagnostics.Report, scoped *diagnostics.ScopedReport) error {
+	if scoped == nil {
+		return doctorVerdictError(r)
+	}
+	var blockers []string
+	for _, c := range scoped.Checks {
+		if c.Counts && c.Status == diagnostics.ScopedNotReady {
+			blockers = append(blockers, c.ID+": "+c.Message)
+		}
+	}
+	switch {
+	case scoped.Status == "not_ready":
+		return clicommon.CodedErrorf(apicontract.CodeNotReady, "doctor: not ready for %s (%s)", scoped.For, strings.Join(blockers, "; "))
+	case doctorStrict && scoped.Status == "degraded":
+		return clicommon.CodedErrorf(apicontract.CodeNotReady, "doctor: degraded for %s (--strict)", scoped.For)
+	}
+	return nil
+}
+
+// doctorBlockers names the failing check behind a not_ready verdict.
+func doctorBlockers(r *diagnostics.Report) string {
+	if r.Database != nil && r.Database.Status == diagnostics.StatusError {
+		if r.Database.Message != "" {
+			return "database: " + r.Database.Message
+		}
+		return "database unavailable"
+	}
+	return "see the report"
 }
 
 func printFixResults(results []diagnostics.FixResult) {
 	for _, r := range results {
 		if r.Success {
 			fmt.Printf("  %s %-20s %s\n", terminal.Green(terminal.SymbolSuccess), terminal.Green(r.Label), terminal.White(r.Message))
+		} else if r.Skipped {
+			fmt.Printf("  %s %-20s %s\n", terminal.Yellow(terminal.SymbolWarning), terminal.Yellow(r.Label), terminal.White(r.Message))
 		} else {
 			fmt.Printf("  %s %-20s %s\n", terminal.Red(terminal.SymbolError), terminal.Red(r.Label), terminal.White(r.Message))
 		}
@@ -193,6 +398,14 @@ func focusedCheck(r *diagnostics.Report, name string) (label string, c *diagnost
 		if r.Piolium != nil {
 			return "Piolium", r.Piolium, true
 		}
+	case "vigolium-audit":
+		if c := r.EmbeddedBinaries["vigolium-audit"]; c != nil {
+			return "vigolium-audit helper", c, true
+		}
+	case doctorSkillFixKey, "skills":
+		if r.Skill != nil {
+			return "Agent skill", r.Skill, true
+		}
 	}
 	return "", nil, false
 }
@@ -211,25 +424,20 @@ func focusedLabels(r *diagnostics.Report, only []string) []string {
 	return labels
 }
 
-// printDoctorFocused renders only the checks named in `only` (e.g.
-// --only nuclei,chrome) rather than the full grouped report. Used by the --fix
-// path so a targeted fix shows just the components it touched, once. Verbose
-// per-check details are omitted here (the focused view is meant to be concise);
-// the remediation tip is kept so a still-failing component says what to do.
-func printDoctorFocused(r *diagnostics.Report, only []string) {
-	for _, name := range only {
-		label, c, ok := focusedCheck(r, name)
-		if !ok {
-			printCheck(name, diagnostics.StatusWarning, "unknown component")
-			continue
-		}
-		printCheck(label, c.Status, c.Message)
-		printTip(c.Tip)
-	}
+// detailsVisible reports whether the verbose `▸` detail lines should render for
+// a check with the given status. Plain `vigolium doctor` stays fully verbose;
+// `vigolium doctor --fix` runs compact — OK checks collapse to their single
+// status row (the status message already carries the key facts) — unless
+// `--verbose` is passed to expand them again.
+func detailsVisible(diagnostics.Status) bool {
+	return globalVerbose
 }
 
-// printDoctorReport renders the grouped human-readable report. Details are
-// always shown (verbose-by-default) — there's no `--brief` toggle today.
+// printDoctorReport renders the grouped human-readable report. Plain
+// `vigolium doctor` shows every check's `▸` detail lines (verbose-by-default).
+// `vigolium doctor --fix` renders compact — OK checks collapse to their single
+// status row so the twice-rendered fix output stays short — while `--verbose`
+// restores the full detail lines. The gating lives in detailsVisible().
 //
 // The layout intentionally mirrors how users invoke the scanner:
 //   - "Core" surfaces the only true blocker (database).
@@ -238,21 +446,50 @@ func printDoctorFocused(r *diagnostics.Report, only []string) {
 //     and the single-shot query mode), the optional audit mode with its
 //     two independent driver paths, and a tail bucket of informational
 //     tools that don't gate any feature.
-func printDoctorReport(r *diagnostics.Report) {
+func printDoctorReport(r *diagnostics.Report, dc *doctorContext) {
 	fmt.Println()
 	fmt.Printf("  %s %s\n", terminal.BoldCyan("Vigolium Doctor"), terminal.White("— system readiness check"))
+	fmt.Println()
+	printDoctorVerdict(r)
+	sources := map[string]string{}
+	if dc != nil {
+		for _, ch := range dc.checks(r) {
+			if ch.Source != "" {
+				sources[ch.ID] = ch.Source
+			}
+		}
+	}
 
 	// ── Core ──
 	printDoctorSection("Core", "")
+	if r.Config != nil {
+		printCheck("Config", r.Config.Status, r.Config.Message)
+		printDetails(detailsVisible(r.Config.Status), r.Config.Details)
+		printTip(r.Config.Tip)
+	}
+	if r.Scope != nil {
+		printCheck("Scope", r.Scope.Status, r.Scope.Message)
+		printDetails(detailsVisible(r.Scope.Status), r.Scope.Details)
+		printTip(r.Scope.Tip)
+	}
 	if r.Database != nil {
 		printCheck("Database", r.Database.Status, r.Database.Message)
-		printDetails(true, r.Database.Details)
+		if src := sources["database"]; src != "" {
+			printDetails(true, []string{"setting: " + src})
+		}
+		printDetails(detailsVisible(r.Database.Status), r.Database.Details)
 		printTip(r.Database.Tip)
 	}
 	if r.Initialized != nil {
 		printCheck("Initialized", r.Initialized.Status, r.Initialized.Message)
-		printDetails(true, r.Initialized.Details)
+		printDetails(detailsVisible(r.Initialized.Status), r.Initialized.Details)
 		printTip(r.Initialized.Tip)
+	}
+	if dc != nil {
+		pc := diagnostics.ProxyCheck(dc.proxy, dc.proxySource)
+		printCheck("Proxy", pc.Status, pc.Message)
+		printDetails(detailsVisible(pc.Status), pc.Details)
+		printTip(pc.Tip)
 	}
 
 	// ── Native scan ──
@@ -260,21 +497,28 @@ func printDoctorReport(r *diagnostics.Report) {
 	if t := r.Tools["chromium"]; t != nil {
 		printCheck("Chromium", t.Status, toolMessage(t))
 		printDoctorPurpose(doctorDetailIndent, "powers headless rendering for the spidering phase")
-		printDetails(true, t.Details)
+		printDetails(detailsVisible(t.Status), t.Details)
 		printTip(t.Tip)
 	}
 	if r.NucleiTemplates != nil {
 		printCheck("Nuclei Templates", r.NucleiTemplates.Status, r.NucleiTemplates.Message)
 		printDoctorPurpose(doctorDetailIndent, "drives the KnownIssueScan phase")
-		printDetails(true, r.NucleiTemplates.Details)
+		printDetails(detailsVisible(r.NucleiTemplates.Status), r.NucleiTemplates.Details)
 		printTip(r.NucleiTemplates.Tip)
 	}
-	if c := embeddedBinaryCheck(r, "jsscan"); c != nil {
-		printCheck("Embedded jsscan", c.Status, c.Message)
-		if c.Status != diagnostics.StatusOK {
-			printDetails(true, c.Details)
-			printTip(c.Tip)
+	if c := embeddedBinaryCheck(r, "jstangle"); c != nil {
+		printCheck("Embedded jstangle", c.Status, c.Message)
+		printDetails(detailsVisible(c.Status), c.Details)
+		printTip(c.Tip)
+	}
+	if r.OAST != nil {
+		printCheck("OAST", r.OAST.Status, r.OAST.Message)
+		if src := sources["oast"]; src != "" {
+			printDetails(true, []string{"setting: " + src})
 		}
+		printDoctorPurpose(doctorDetailIndent, "callback channel for blind (out-of-band) checks")
+		printDetails(detailsVisible(r.OAST.Status), r.OAST.Details)
+		printTip(r.OAST.Tip)
 	}
 
 	// ── Agentic scan ──
@@ -282,23 +526,27 @@ func printDoctorReport(r *diagnostics.Report) {
 
 	printDoctorSubsection("Olium-based modes (autopilot + swarm)")
 	if r.Agent != nil {
-		printSubCheck("Olium agent", r.Agent.Status, formatAgentMessage(r.Agent))
-		printSubDetails(true, r.Agent.Details)
+		agentStatus := r.Agent.Status
+		if r.Agent.Unverified {
+			agentStatus = diagnostics.StatusWarning
+		}
+		printSubCheck("Olium agent", agentStatus, formatAgentMessage(r.Agent))
+		printSubDetails(detailsVisible(r.Agent.Status), r.Agent.Details)
 		printSubTip(r.Agent.Tip)
 	}
 	if r.SessionsDir != nil {
 		printSubCheck("Sessions Dir", r.SessionsDir.Status, r.SessionsDir.Message)
-		printSubDetails(true, r.SessionsDir.Details)
+		printSubDetails(detailsVisible(r.SessionsDir.Status), r.SessionsDir.Details)
 		printSubTip(r.SessionsDir.Tip)
 	}
 	if r.TemplatesDir != nil {
 		printSubCheck("Templates Dir", r.TemplatesDir.Status, r.TemplatesDir.Message)
-		printSubDetails(true, r.TemplatesDir.Details)
+		printSubDetails(detailsVisible(r.TemplatesDir.Status), r.TemplatesDir.Details)
 		printSubTip(r.TemplatesDir.Tip)
 	}
 	if r.Browser != nil {
 		printSubCheck("Agent Browser", r.Browser.Status, r.Browser.Message)
-		printSubDetails(true, r.Browser.Details)
+		printSubDetails(detailsVisible(r.Browser.Status), r.Browser.Details)
 		printSubTip(r.Browser.Tip)
 	}
 
@@ -314,23 +562,24 @@ func printDoctorReport(r *diagnostics.Report) {
 	printDoctorSubsection("Tools (informational)")
 	printInfoTools(r)
 
-	fmt.Println()
-	switch r.Status {
-	case "ready":
-		fmt.Printf("  %s %s\n", terminal.BoldGreen(terminal.SymbolSuccess), terminal.BoldGreen("All systems ready"))
-	case "degraded":
-		fmt.Printf("  %s %s\n", terminal.BoldYellow(terminal.SymbolWarning), terminal.BoldYellow("System degraded — some scan modes unavailable"))
-	default:
-		// "not_ready" can only mean Database failed under the new status
-		// rules; native and agentic checks degrade rather than block.
-		fmt.Printf("  %s %s\n", terminal.BoldRed(terminal.SymbolError), terminal.BoldRed("System not ready — database unavailable"))
+	// ── Coding agent ──
+	if r.Skill != nil {
+		printDoctorSection("Coding agent", "vigolium skills install")
+		printCheck("Agent skill", r.Skill.Status, r.Skill.Message)
+		printDetails(detailsVisible(r.Skill.Status), r.Skill.Details)
+		printTip(r.Skill.Tip)
 	}
-	if !doctorFix && diagnostics.HasFixableIssues(r) {
+
+	fmt.Println()
+	if !globalVerbose {
+		fmt.Printf("  %s %s\n", terminal.Yellow(terminal.SymbolTip), terminal.White("-v shows each check's detail lines"))
+	}
+	if !doctorFix && (diagnostics.HasFixableIssues(r) || doctorSkillStale()) {
 		fmt.Printf("  %s %s%s%s\n",
 			terminal.Yellow(terminal.SymbolTip),
 			terminal.White("re-run with "),
-			terminal.BoldCyan("vigolium doctor --fix"),
-			terminal.White(" to attempt auto-installation of missing components"),
+			terminal.BoldCyan("vigolium doctor --fix --only chrome,nuclei"),
+			terminal.White(" to install the scan dependencies (add --yes for agent tooling)"),
 		)
 	}
 	fmt.Println()
@@ -473,7 +722,7 @@ func printInfoTools(r *diagnostics.Report) {
 	for _, name := range names {
 		t := r.Tools[name]
 		printSubCheck(name, t.Status, toolMessage(t))
-		printSubDetails(true, t.Details)
+		printSubDetails(detailsVisible(t.Status), t.Details)
 		printSubTip(t.Tip)
 	}
 }
@@ -625,5 +874,63 @@ func formatAgentMessage(a *diagnostics.AgentCheck) string {
 	if a.PingResponse != "" {
 		msg += ", ping=ok"
 	}
+	if a.Unverified {
+		msg += " — unverified: " + a.Message
+	}
 	return msg
+}
+
+// doctorVendorConfirm returns the interactive consent prompt for vendor
+// installers, or nil when there is no terminal to ask on (-j, piped stdin):
+// then only --only and --yes consent.
+func doctorVendorConfirm() func(label, source string) bool {
+	if globalJSON || !stdinIsTerminal() || !terminal.StderrIsTerminal() {
+		return nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	return func(label, source string) bool {
+		fmt.Fprintf(os.Stderr, "  %s Install %s by running `%s`? [y/N] ", terminal.Yellow(terminal.SymbolTip), label, source)
+		line, _ := reader.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "y", "yes":
+			return true
+		}
+		return false
+	}
+}
+
+// doctorInclude is --only as diagnostics' Include predicate: nil (every
+// check) without it.
+func doctorInclude() func(id string) bool {
+	if len(doctorOnly) == 0 {
+		return nil
+	}
+	return doctorOnlyIncludes
+}
+
+// doctorAllChecks is every check doctor can report, by id: what an --only
+// token is validated against before anything runs. proxy is the CLI's own row
+// (doctorContext.checks) and a --for row; the scoped-only ids run under --for.
+func doctorAllChecks() []diagnostics.Check {
+	ids := append(diagnostics.AllCheckIDs(), "proxy")
+	ids = append(ids, diagnostics.ScopedOnlyCheckIDs()...)
+	out := make([]diagnostics.Check, len(ids))
+	for i, id := range ids {
+		out[i] = diagnostics.Check{ID: id}
+	}
+	return out
+}
+
+// doctorOnlyIncludes reports whether a check runs under --only: always without
+// it, and with it only when one of its tokens names the check.
+func doctorOnlyIncludes(id string) bool {
+	if len(doctorOnly) == 0 {
+		return true
+	}
+	for _, tok := range doctorOnly {
+		if doctorOnlyCheckID(tok, []diagnostics.Check{{ID: id}}) == id {
+			return true
+		}
+	}
+	return false
 }

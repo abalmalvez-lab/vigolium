@@ -78,16 +78,23 @@ func (m *Module) ScanPerRequest(
 	host := service.Host()
 
 	// Dedup by host
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
 	// Fingerprint 404 response body hash
 	notFoundHash := get404Hash(ctx, httpClient)
 
+	// Host-wide catch-all guard: if a random, guaranteed-nonexistent directory
+	// already "lists", the host renders a directory-listing-shaped body for any
+	// path (an SPA shell, a wildcard rewrite, a templated soft-404) and every
+	// per-directory finding below is spurious.
+	if modkit.RandomDirCatchAll(scanCtx, ctx, httpClient, isDirectoryListing) {
+		return nil, nil
+	}
+
 	var results []*output.ResultEvent
-	target := ctx.Target()
+	base := modkit.ServiceBaseURL(service)
 
 	for _, probe := range probePaths {
 		probeRaw, err := httpmsg.SetPath(ctx.Request().Raw(), probe.path)
@@ -96,11 +103,8 @@ func (m *Module) ScanPerRequest(
 		}
 		probeRaw, _ = httpmsg.SetMethod(probeRaw, "GET")
 
-		probeReq, err := httpmsg.ParseRawRequest(string(probeRaw))
-		if err != nil {
-			continue
-		}
-		probeReq = probeReq.WithService(ctx.Service())
+		// probeRaw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+		probeReq := httpmsg.NewRequestResponseRaw(probeRaw, ctx.Service())
 
 		resp, _, err := httpClient.Execute(probeReq, http.Options{})
 		if err != nil {
@@ -128,9 +132,18 @@ func (m *Module) ScanPerRequest(
 			continue
 		}
 
+		// Catch-all / SPA shell guard: these probe paths are static-asset
+		// directories (/public, /assets, /static, ...) — exactly where a catch-all
+		// reverse proxy serves the application index shell. A probe whose body is
+		// the observed page is that shell, not a listing.
+		if modkit.ResemblesObservedPage(ctx, body) {
+			resp.Close()
+			continue
+		}
+
 		// Check for directory listing indicators
 		if isDirectoryListing(body) {
-			results = append(results, buildResult(target, host, probe, string(probeRaw), resp.FullResponseString()))
+			results = append(results, buildResult(base, host, probe, string(probeRaw), resp.FullResponseString()))
 		}
 
 		resp.Close()
@@ -140,42 +153,49 @@ func (m *Module) ScanPerRequest(
 }
 
 // isDirectoryListing checks the response body for directory listing indicators.
+//
+// A genuine auto-generated listing (serve-index, Nginx autoindex, Apache
+// autoindex) is a bare, machine-emitted index. The checks below therefore
+// require an unmistakable autoindex signature — the "Index of" / "listing
+// directory" phrase, or a parent-directory ("../") link inside a file table/pre
+// block — and first reject application / CMS / single-page-app content pages,
+// which routinely carry a heading, a table, and links yet are not listings.
 func isDirectoryListing(body string) bool {
 	lower := strings.ToLower(body)
 
-	// serve-index markers: HTML title containing "listing directory" or "Index of"
-	if strings.Contains(lower, "<title>") {
-		if strings.Contains(lower, "listing directory") || strings.Contains(lower, "index of") {
-			return true
-		}
+	// Negative guard: a rendered application/CMS/SPA content page (e.g. a Gatsby,
+	// Next.js, or React route) is never an auto-generated directory listing, even
+	// though it commonly has an <h1>, a <table>, and <a href=> links. Framework,
+	// SSG/CMS, and SEO/social markers are absent from every real autoindex, so
+	// their presence rules a listing out.
+	if modkit.LooksLikeAppPage(lower) {
+		return false
 	}
 
-	// serve-index: table-based file listing with <h1> containing directory path
-	if strings.Contains(body, "<h1>") && strings.Contains(body, "<table") && strings.Contains(body, "<a href=") {
+	// serve-index / Nginx / Apache autoindex name the directory with an unmistakable
+	// phrase in BOTH the <title> and the <h1>. Requiring both — not the title alone —
+	// is what separates a real autoindex from an ordinary content page merely titled
+	// "Index of Publications" (whose <h1> is real page content), the same title-only
+	// false positive modkit.DetectDirectoryListingServer guards against.
+	titleListing := strings.Contains(lower, "<title>") &&
+		(strings.Contains(lower, "listing directory") || strings.Contains(lower, "index of"))
+	h1Listing := strings.Contains(lower, "<h1>index of") || strings.Contains(lower, "<h1>listing directory")
+	if titleListing && h1Listing {
 		return true
 	}
 
-	// Nginx autoindex: <html><head><title>Index of
-	if strings.Contains(lower, "<html>") && strings.Contains(lower, "<head>") && strings.Contains(lower, "<title>index of") {
+	// Nginx autoindex: a <pre> block of file links anchored by a parent-directory
+	// ("../") entry. The parent link is required so an ordinary <pre> code block
+	// that happens to contain a link does not match.
+	if strings.Contains(lower, "<pre>") && strings.Contains(lower, "<a href=") && modkit.HasParentDirLink(lower) {
 		return true
 	}
 
-	// Apache autoindex: <h1>Index of
-	if strings.Contains(lower, "<h1>index of") {
-		return true
-	}
-
-	// <pre> blocks with file listings (common in simple directory listing implementations)
-	if strings.Contains(body, "<pre>") && strings.Contains(body, "<a href=") {
-		return true
-	}
-
-	// Body contains <a href= links AND looks like a directory listing (not a normal page)
-	// A directory listing typically has multiple href links and lacks normal page structure
-	if strings.Contains(body, "<a href=") &&
-		(strings.Contains(lower, "directory") || strings.Contains(lower, "listing")) &&
-		!strings.Contains(lower, "<nav") &&
-		!strings.Contains(lower, "<footer") {
+	// Custom / Express middleware listings that lack an "Index of" heading: a file
+	// table or list whose entries include a parent-directory ("../") link — the
+	// structural hallmark of a generated index, absent from normal content pages.
+	if modkit.HasParentDirLink(lower) && strings.Contains(lower, "<a href=") &&
+		(strings.Contains(lower, "<table") || strings.Contains(lower, "<ul")) {
 		return true
 	}
 
@@ -191,11 +211,8 @@ func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) st
 	}
 	raw, _ = httpmsg.SetMethod(raw, "GET")
 
-	req, err := httpmsg.ParseRawRequest(string(raw))
-	if err != nil {
-		return ""
-	}
-	req = req.WithService(ctx.Service())
+	// raw is well-formed raw, so wrap directly instead of re-parsing on this hot path.
+	req := httpmsg.NewRequestResponseRaw(raw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(req, http.Options{})
 	if err != nil {
@@ -206,12 +223,13 @@ func get404Hash(ctx *httpmsg.HttpRequestResponse, httpClient *http.Requester) st
 	return utils.Sha1(resp.Body().String())
 }
 
-func buildResult(target, host string, probe probePath, request, response string) *output.ResultEvent {
+func buildResult(base, host string, probe probePath, request, response string) *output.ResultEvent {
+	matched := fmt.Sprintf("%s%s", base, probe.path)
 	return &output.ResultEvent{
 		ModuleID: ModuleID,
 		Host:     host,
-		URL:      target,
-		Matched:  fmt.Sprintf("%s%s", target, probe.path),
+		URL:      matched,
+		Matched:  matched,
 		Request:  request,
 		Response: response,
 		ExtractedResults: []string{

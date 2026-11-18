@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Drupal installations from HTML responses and HTTP headers.
-Detects core version generation (Drupal 7 vs 8+) via asset path patterns (/misc/ vs /core/),
-X-Drupal-Cache and X-Drupal-Dynamic-Cache headers, generator meta tags, and drupalSettings
-JavaScript objects. Enumerates contributed modules from asset URL paths.
+	ModuleDesc = `**What it means:** The target runs Drupal, identified passively from X-Drupal-Cache headers, the generator meta tag, the drupalSettings object, and core asset paths. The check also infers the major generation (Drupal 7 versus 8+) and lists contributed modules. Informational technology disclosure, not a vulnerability itself.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects Drupal via X-Drupal-Cache, X-Drupal-Dynamic-Cache headers
-- Distinguishes Drupal 7 (/misc/, /sites/all/modules/) from Drupal 8+ (/core/, /modules/contrib/)
-- Extracts contrib module names from asset URL paths
-- Deduplicates by host
+**How it's exploited:** An attacker uses the platform, generation, and module names to target version- and module-specific exploits and known CVEs (such as Drupalgeddon-class core flaws) instead of probing blindly.
 
-## References
-- https://www.drupal.org/docs
-- https://www.drupal.org/security`
+**Fix:** Remove the generator meta tag and X-Generator header, and keep Drupal core and contributed modules patched to current secure releases.`
 
 	ModuleConfirmation = "Confirmed when Drupal-specific headers, asset paths, or meta tags are detected in the response"
 	ModuleSeverity     = severity.Info

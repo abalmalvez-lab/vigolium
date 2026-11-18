@@ -9,20 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-For requests that contain a CSRF token, this module verifies whether the server
-actually enforces it. It removes, empties, or randomizes the token value and
-checks if the server still accepts the request.
+	ModuleDesc = `**What it means:** A state-changing request (POST, PUT, DELETE) carried a CSRF token, but the server still processed it after the scanner removed, emptied, or randomized it. The token is present but not enforced, leaving the action open to cross-site request forgery.
 
-## Notes
-- Only targets requests that already have a CSRF token parameter
-- Three probe strategies: token removed, token emptied, token randomized
-- Stops probing early if the server returns 4xx/5xx (properly validated)
-- Deduplicates by method + host + path
+**How it's exploited:** An attacker hosts a page that auto-submits a forged request while the victim is logged in. The server ignores the token, so it runs with the victim's session, triggering actions like settings changes or fund transfers.
 
-## References
-- https://owasp.org/www-community/attacks/csrf
-- https://portswigger.net/web-security/csrf/bypassing-token-validation`
+**Fix:** Reject any state-changing request whose CSRF token is missing, empty, or invalid, and add SameSite cookies.`
 
 	ModuleConfirmation = "Confirmed when the server accepts a request with a removed, emptied, or randomized CSRF token"
 	ModuleSeverity     = severity.High

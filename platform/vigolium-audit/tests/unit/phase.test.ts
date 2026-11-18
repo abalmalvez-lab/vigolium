@@ -6,9 +6,10 @@ import { parseCommandDef, topologicalOrder } from "../../src/engine/phase.js";
 const COMMAND_DEFS_DIR = join(import.meta.dir, "../../src/content/command-defs");
 
 const expectedPhaseCount: Record<string, number> = {
-  lite: 3,
-  balanced: 9,
-  deep: 12,
+  lite: 4,
+  balanced: 10,
+  deep: 13,
+  "knowledge-base": 3,
   diff: 1,
   confirm: 7,
   merge: 7,
@@ -67,6 +68,73 @@ phases:
 
 body`;
     expect(() => parseCommandDef(bad, "bad.md")).toThrow(/cycle/);
+  });
+
+  test("parses deterministic completion contracts with defaults", () => {
+    const src = `---
+description: gate
+mode: lite
+phases:
+  - id: L1
+    title: Recon
+    agent: null
+    completion:
+      artifacts:
+        - kind: file
+          path: attack-surface/recon.md
+          contains: ["## Recon"]
+---
+
+body`;
+    const def = parseCommandDef(src, "gate.md");
+    expect(def.phases[0]?.completion?.repair_attempts).toBe(1);
+    expect(def.phases[0]?.completion?.enforcement).toBe("required");
+    expect(def.phases[0]?.completion?.artifacts[0]).toEqual({
+      kind: "file",
+      path: "attack-surface/recon.md",
+      min_bytes: 1,
+      contains: ["## Recon"],
+      json: false,
+    });
+  });
+
+  test("revisit consolidation waits for both variant branches", () => {
+    const src = readFileSync(join(COMMAND_DEFS_DIR, "revisit.md"), "utf8");
+    const def = parseCommandDef(src, "revisit.md");
+    expect(def.phases.find((phase) => phase.id === "7")?.depends_on.sort()).toEqual(["5", "6"]);
+  });
+
+  test("lite finalization waits for the secrets scan", () => {
+    const src = readFileSync(join(COMMAND_DEFS_DIR, "lite.md"), "utf8");
+    const def = parseCommandDef(src, "lite.md");
+    expect(def.phases.find((phase) => phase.id === "L3")?.depends_on.sort()).toEqual(["L1", "L2"]);
+    expect(def.phases.find((phase) => phase.id === "L2")?.parallel_with).toEqual([]);
+  });
+
+  test("knowledge-base intake is conditional and precedes source discovery", () => {
+    const src = readFileSync(join(COMMAND_DEFS_DIR, "knowledge-base.md"), "utf8");
+    const def = parseCommandDef(src, "knowledge-base.md");
+    expect(def.phases.find((phase) => phase.id === "KB0")?.requires_knowledge_base).toBe(true);
+    expect(def.phases.find((phase) => phase.id === "K1")?.depends_on).toEqual(["KB0"]);
+    expect(def.phases.find((phase) => phase.id === "K2")?.depends_on).toEqual(["K1"]);
+  });
+
+  test("rejects artifact paths outside the results directory", () => {
+    const src = `---
+description: bad gate
+mode: lite
+phases:
+  - id: L1
+    title: Recon
+    agent: null
+    completion:
+      artifacts:
+        - kind: file
+          path: ../outside.md
+---
+
+body`;
+    expect(() => parseCommandDef(src, "bad-gate.md")).toThrow(/inside the results directory/);
   });
 });
 

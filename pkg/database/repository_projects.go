@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/vigolium/vigolium/pkg/apicontract"
+
 	"github.com/uptrace/bun"
 )
 
@@ -91,13 +93,26 @@ func (r *Repository) GetProjectByName(ctx context.Context, name string) (*Projec
 	}
 	switch len(projects) {
 	case 0:
-		return nil, fmt.Errorf("no project found with name %q", name)
+		return nil, &ProjectNameError{msg: fmt.Sprintf("no project found with name %q", name), code: apicontract.CodeProjectNotFound}
 	case 1:
 		return projects[0], nil
 	default:
-		return nil, fmt.Errorf("multiple projects (%d) found with name %q; use --project-uuid to specify by UUID", len(projects), name)
+		return nil, &ProjectNameError{
+			msg:  fmt.Sprintf("multiple projects (%d) found with name %q; use --project-uuid to specify by UUID", len(projects), name),
+			code: apicontract.CodeAmbiguousID,
+		}
 	}
 }
+
+// ProjectNameError is a --project-name lookup that did not resolve to exactly
+// one project; Code says whether none or several matched.
+type ProjectNameError struct {
+	msg  string
+	code apicontract.ErrorCode
+}
+
+func (e *ProjectNameError) Error() string               { return e.msg }
+func (e *ProjectNameError) Code() apicontract.ErrorCode { return e.code }
 
 // ListProjects returns projects, optionally filtered by owner.
 func (r *Repository) ListProjects(ctx context.Context, ownerUUID string) ([]*Project, error) {
@@ -124,19 +139,59 @@ func (r *Repository) UpdateProject(ctx context.Context, project *Project) error 
 	return nil
 }
 
+// projectOwnedTables is the single source of truth for every table carrying a
+// project_uuid column, used by both reassignment and purge so the two can never
+// drift (reassignment previously omitted agentic_scans and authentication_hostnames
+// that purge included). finding_records is intentionally absent: it has no
+// project_uuid and stays linked to its finding by id, so it moves implicitly on
+// reassignment and is deleted by finding id on purge.
+var projectOwnedTables = []string{
+	"scans",
+	"http_records",
+	"analysis_artifacts",
+	"findings",
+	"scopes",
+	"oast_interactions",
+	"agentic_scans",
+	"authentication_hostnames",
+	"scan_logs",
+	// Per-run host observations are project-scoped evidence like any other row:
+	// they reassign and purge with the project rather than outliving it.
+	"host_observations",
+	// Durable-autopilot child tables also carry project_uuid so they reassign /
+	// purge with the project instead of orphaning.
+	"agent_sections",
+	"agent_finding_candidates",
+	// Finding history and OAST payload context carry project_uuid of their own
+	// (denormalized from the finding / scan), so they move and purge with it.
+	"finding_observations",
+	"finding_status_events",
+	"finding_hash_aliases",
+	"oast_payloads",
+	"oast_sessions",
+	// The coverage ledger is per (scan, record) of the project.
+	"scan_record_progress",
+}
+
 // ReassignProjectData moves all data owned by sourceUUID to targetUUID.
 // This should be called before deleting a project so its records are not orphaned.
 func (r *Repository) ReassignProjectData(ctx context.Context, sourceUUID, targetUUID string) error {
-	tables := []string{"scans", "http_records", "findings", "scopes", "oast_interactions", "scan_logs"}
-	for _, table := range tables {
-		_, err := r.db.ExecContext(ctx,
-			fmt.Sprintf("UPDATE %s SET project_uuid = ? WHERE project_uuid = ?", table),
-			targetUUID, sourceUUID)
-		if err != nil {
-			return fmt.Errorf("failed to reassign %s: %w", table, err)
+	// One transaction: either every project-owned table moves or none does. The
+	// previous per-table loop (no transaction, and missing agentic_scans /
+	// authentication_hostnames) could half-move data if a later table failed — e.g.
+	// a target project's unique (project_uuid, finding_hash) collision — leaving the
+	// source project partially emptied. The transaction rolls the whole move back on
+	// any error, so a collision is a clean failure rather than corruption.
+	return r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		for _, table := range projectOwnedTables {
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf("UPDATE %s SET project_uuid = ? WHERE project_uuid = ?", table),
+				targetUUID, sourceUUID); err != nil {
+				return fmt.Errorf("failed to reassign %s: %w", table, err)
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // DeleteProject deletes a project by UUID.
@@ -160,17 +215,8 @@ func (r *Repository) PurgeProjectData(ctx context.Context, projectUUID string) e
 			Exec(ctx); err != nil {
 			return fmt.Errorf("failed to delete finding_records: %w", err)
 		}
-		tables := []string{
-			"findings",
-			"http_records",
-			"scans",
-			"scopes",
-			"oast_interactions",
-			"agentic_scans",
-			"authentication_hostnames",
-			"scan_logs",
-		}
-		for _, table := range tables {
+		// Same central table list as reassignment, so the two can't drift.
+		for _, table := range projectOwnedTables {
 			if _, err := tx.ExecContext(ctx,
 				fmt.Sprintf("DELETE FROM %s WHERE project_uuid = ?", table),
 				projectUUID); err != nil {
@@ -248,6 +294,7 @@ func (r *Repository) GetProjectStats(ctx context.Context, projectUUID string) (*
 		ColumnExpr("SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) AS low").
 		ColumnExpr("SUM(CASE WHEN severity = 'info' THEN 1 ELSE 0 END) AS info").
 		Where("project_uuid = ?", projectUUID).
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
 		Scan(ctx, &fr)
 	if err != nil {
 		return nil, fmt.Errorf("finding stats: %w", err)
@@ -338,6 +385,7 @@ func (r *Repository) GetAllProjectsStats(ctx context.Context) (map[string]*Proje
 		ColumnExpr("SUM(CASE WHEN severity = 'medium' THEN 1 ELSE 0 END) AS medium").
 		ColumnExpr("SUM(CASE WHEN severity = 'low' THEN 1 ELSE 0 END) AS low").
 		ColumnExpr("SUM(CASE WHEN severity = 'info' THEN 1 ELSE 0 END) AS info").
+		Where("(record_kind IS NULL OR record_kind = '' OR record_kind = ?)", RecordKindFinding).
 		Group("project_uuid").
 		Scan(ctx, &findingRows)
 	if err != nil {

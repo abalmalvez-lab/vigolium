@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Laravel installations by analyzing HTTP response headers,
-cookies (laravel_session, XSRF-TOKEN), body patterns (csrf-token meta tag,
-Illuminate error strings), and Sanctum/Passport indicators. Requires 2+
-independent signals to avoid false positives.
+	ModuleDesc = `**What it means:** The app is built on the Laravel PHP framework, identified from at least two signals such as laravel_session or XSRF-TOKEN cookies, a csrf-token meta tag, Illuminate error strings, an Ignition or Whoops debug handler, or Sanctum/Passport. Informational recon, not a vulnerability.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Deduplicates by host to avoid redundant processing
-- Extracts version hints from error pages and headers when available
-- Reports as informational severity
+**How it's exploited:** An attacker targets Laravel-specific weaknesses - known CVEs in Laravel, Ignition (CVE-2021-3129 RCE), or Passport. An exposed Ignition or Whoops handler signals debug mode that can leak source, config, and environment details.
 
-## References
-- https://laravel.com/docs/csrf
-- https://laravel.com/docs/session
-- https://laravel.com/docs/sanctum`
+**Fix:** Remove the X-Powered-By header and verbose error pages, and disable debug mode (APP_DEBUG) in production.`
 
 	ModuleConfirmation = "Confirmed when 2+ independent Laravel-specific signals are detected in the response"
 	ModuleSeverity     = severity.Info

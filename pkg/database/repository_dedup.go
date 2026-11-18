@@ -4,11 +4,127 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"slices"
+	"strings"
 
 	"github.com/uptrace/bun"
 
+	"github.com/vigolium/vigolium/pkg/output"
 	"go.uber.org/zap"
 )
+
+// secretDetectModuleID mirrors secret_detect.ModuleID. The URL-keyed finding
+// dedup (DeduplicateFindings) collapses findings that share (module, severity,
+// URL) — correct for a module like input-behavior-probe that fires many times on
+// one endpoint with incidental per-payload values, but WRONG for the secret
+// detector, whose extracted value IS the finding's identity: a client_id,
+// client_secret, and access_token leaked in the same response are three distinct
+// secrets on one URL, not duplicates. URL-merging them keeps only one value and
+// buries the rest as redundant Additional Evidence. So secret-detect is excluded
+// from the URL pass and deduped instead by the value-keyed pass
+// (GroupFindingsByValue), which collapses identical secrets across URLs.
+// Hardcoded (not imported) to avoid a modules→database import cycle, mirroring
+// the existing 'deparos' source literals in this file.
+const secretDetectModuleID = "secret-detect"
+
+// Every record-dedup pass below partitions on (hostname, scheme, port, …) rather
+// than hostname alone. A hostname is not an origin: http://h/x and https://h/x,
+// or https://h/x and https://h:8443/x, are different services that routinely
+// return byte-identical responses (a shared error page, a redirect stub, an
+// identical 401). Keying on hostname collapsed them into one survivor and threw
+// away the other origin's evidence entirely. Both columns are NOT NULL
+// (schema_ddl.go), so they are safe to key on without a COALESCE.
+
+// recordUnreferencedSQL is the predicate that holds for an http_record no
+// finding and no analysis artifact points at. The automatic discovery-cleanup
+// passes delete only records satisfying it, so pruning noise can never remove an
+// exchange that some finding cites as its evidence (or that JSTangle and friends
+// derived an artifact from). Both sub-selects are index-backed —
+// idx_finding_records_record_uuid and the analysis_artifacts record index — and
+// the form is dialect-agnostic (SQLite and PostgreSQL).
+const recordUnreferencedSQL = `NOT EXISTS (
+		SELECT 1 FROM finding_records fr WHERE fr.record_uuid = http_records.uuid
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM analysis_artifacts aa WHERE aa.http_record_uuid = http_records.uuid
+	)`
+
+// deleteRecordsByUUIDsTx deletes the http_records identified by uuids and their
+// finding_records junction rows inside tx, chunking the IN lists so a large set
+// never exceeds the bound-parameter limit.
+//
+// This is the DESTRUCTIVE variant: it removes a record even when a finding cites
+// it, severing that evidence link. It is reserved for the operator-driven traffic
+// delete (query.go), where removing evidence is the point. The automatic
+// discovery-cleanup passes use deleteUnreferencedRecords instead.
+func deleteRecordsByUUIDsTx(ctx context.Context, tx bun.Tx, uuids []string) error {
+	for chunk := range slices.Chunk(uuids, SQLChunkSize) {
+		res, err := tx.NewRaw("DELETE FROM finding_records WHERE record_uuid IN (?)", bun.List(chunk)).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to delete finding_records: %w", err)
+		}
+		noteDeleted(ctx, "finding_records", res)
+		res, err = tx.NewDelete().Model((*HTTPRecord)(nil)).Where("uuid IN (?)", bun.List(chunk)).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to delete records: %w", err)
+		}
+		noteDeleted(ctx, "http_records", res)
+	}
+	return nil
+}
+
+// migrateFindingRecordsTx re-points the evidence links (finding_records junction
+// rows) of the duplicate findings onto the survivor BEFORE the duplicates are
+// deleted, so the survivor can still reach every HTTP record that proved a folded
+// variant — for replay, Burp export, and `finding --with-records`. Without this,
+// deleting a duplicate finding orphaned its exact request/response record: the
+// survivor's merged AdditionalEvidence kept a text copy but carried no record
+// identity, so those exchanges became unreachable for replay/export.
+//
+// The INSERT ... SELECT ... WHERE NOT EXISTS form is dialect-agnostic (SQLite and
+// PostgreSQL) and cannot violate the finding_records PRIMARY KEY (finding_id,
+// record_uuid): DISTINCT collapses a record linked by more than one duplicate, and
+// NOT EXISTS skips any record the survivor already links. The duplicates' own
+// junction rows are removed afterward by deleteFindingsByIDsTx.
+func migrateFindingRecordsTx(ctx context.Context, tx bun.Tx, survivorID int64, dupIDs []int64) error {
+	if len(dupIDs) == 0 {
+		return nil
+	}
+	for chunk := range slices.Chunk(dupIDs, SQLChunkSize) {
+		if _, err := tx.NewRaw(
+			`INSERT INTO finding_records (finding_id, record_uuid)
+			 SELECT DISTINCT ?, fr.record_uuid
+			 FROM finding_records fr
+			 WHERE fr.finding_id IN (?)
+			   AND NOT EXISTS (
+			       SELECT 1 FROM finding_records s
+			       WHERE s.finding_id = ? AND s.record_uuid = fr.record_uuid
+			   )`,
+			survivorID, bun.List(chunk), survivorID,
+		).Exec(ctx); err != nil {
+			return fmt.Errorf("failed to migrate finding_records to survivor: %w", err)
+		}
+	}
+	return nil
+}
+
+// deleteFindingsByIDsTx deletes the findings identified by ids and their
+// findingChildTables rows (evidence junction, observations, status history)
+// inside tx, chunking the IN lists. Shared by the finding-dedup passes.
+func deleteFindingsByIDsTx(ctx context.Context, tx bun.Tx, ids []int64) error {
+	if err := deleteFindingChildrenTx(ctx, tx, ids); err != nil {
+		return err
+	}
+	for chunk := range slices.Chunk(ids, SQLChunkSize) {
+		res, err := tx.NewDelete().Model((*Finding)(nil)).Where("id IN (?)", bun.List(chunk)).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to delete findings: %w", err)
+		}
+		noteDeleted(ctx, "findings", res)
+	}
+	return nil
+}
 
 // DeduplicateRecordsBySource removes duplicate HTTP records for a given source that share
 // identical (hostname, method, status_code, response_content_length, response_hash).
@@ -22,7 +138,7 @@ func (r *Repository) DeduplicateRecordsBySource(ctx context.Context, projectUUID
 	dupQuery := `
 		SELECT uuid FROM (
 			SELECT uuid, ROW_NUMBER() OVER (
-				PARTITION BY hostname, method, status_code, response_content_length, response_hash
+				PARTITION BY hostname, scheme, port, method, status_code, response_content_length, response_hash
 				ORDER BY LENGTH(path) ASC, created_at ASC
 			) AS rn
 			FROM http_records
@@ -41,23 +157,13 @@ func (r *Repository) DeduplicateRecordsBySource(ctx context.Context, projectUUID
 		return 0, nil
 	}
 
-	// Delete junction rows and records in a transaction
-	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		// Clean up finding_records junction rows
-		if _, err := tx.NewRaw("DELETE FROM finding_records WHERE record_uuid IN (?)", bun.List(uuids)).Exec(ctx); err != nil {
-			return fmt.Errorf("failed to delete finding_records: %w", err)
-		}
-		// Delete the duplicate records
-		if _, err := tx.NewDelete().Model((*HTTPRecord)(nil)).Where("uuid IN (?)", bun.List(uuids)).Exec(ctx); err != nil {
-			return fmt.Errorf("failed to delete duplicate records: %w", err)
-		}
-		return nil
-	})
+	// Records a finding or artifact references are kept (see deleteUnreferencedRecords).
+	res, err := r.deleteUnreferencedRecords(ctx, uuids)
 	if err != nil {
 		return 0, err
 	}
 
-	return int64(len(uuids)), nil
+	return res.Deleted, nil
 }
 
 // DeduplicateDeparosRecords removes duplicate deparos HTTP records.
@@ -67,11 +173,15 @@ func (r *Repository) DeduplicateDeparosRecords(ctx context.Context, projectUUID 
 }
 
 // DeduplicateSoftDeparosRecords removes deparos HTTP records that are "soft duplicates":
-// same response characteristics (status, size, word count, content type) under the same
+// same response characteristics (status, word count, content type) under the same
 // 2-segment path prefix. This catches cases where the server echoes part of the URL in the
 // response body, causing different response_hash values for functionally identical pages.
+// Exact response_content_length is deliberately NOT part of the key: a reflected URL/path
+// shifts the body length by a handful of bytes per probe, which would otherwise split an
+// otherwise-identical family into singletons (the very case this pass exists to collapse) —
+// word count + content type + status + path prefix is the stable shape signal.
 // Only groups with 3+ members are collapsed. The shortest path per group is kept.
-func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectUUID string) (int64, map[int]int64, error) {
+func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectUUID string) (RecordCleanupResult, error) {
 	projectUUID = defaultProjectUUID(projectUUID)
 
 	// Path prefix extraction: first 2 segments (SQLite/PG compatible).
@@ -85,12 +195,12 @@ func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectU
 		SELECT uuid FROM (
 			SELECT uuid,
 				ROW_NUMBER() OVER (
-					PARTITION BY hostname, method, status_code, response_content_length,
+					PARTITION BY hostname, scheme, port, method, status_code,
 						response_words, response_content_type, %s
 					ORDER BY LENGTH(path) ASC, created_at ASC
 				) AS rn,
 				COUNT(*) OVER (
-					PARTITION BY hostname, method, status_code, response_content_length,
+					PARTITION BY hostname, scheme, port, method, status_code,
 						response_words, response_content_type, %s
 				) AS group_size
 			FROM http_records
@@ -101,44 +211,382 @@ func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectU
 
 	var uuids []string
 	if err := r.db.NewRaw(dupQuery, projectUUID).Scan(ctx, &uuids); err != nil {
-		return 0, nil, fmt.Errorf("failed to identify soft-duplicate deparos records: %w", err)
+		return RecordCleanupResult{}, fmt.Errorf("failed to identify soft-duplicate deparos records: %w", err)
 	}
 
 	if len(uuids) == 0 {
-		return 0, nil, nil
+		return RecordCleanupResult{}, nil
+	}
+	return r.deleteUnreferencedRecords(ctx, uuids)
+}
+
+// DeparosStatusPolicy controls how discovery client-error (4xx) records are
+// retained. It replaces a blanket "drop all 4xx" with priority tiers so that
+// distinct route identities carrying real attack-surface signal survive, while
+// fuzz noise (nonexistent paths → 404/400) is still pruned. Statuses in neither
+// tier are dropped entirely.
+type DeparosStatusPolicy struct {
+	// KeepOnePerHost statuses collapse to a single representative per
+	// (hostname, status_code) — the shortest path. Use where "this host has one"
+	// is enough signal: authentication/authorization walls (401/403) and pacing
+	// (429). Route identity across paths is intentionally NOT preserved here — an
+	// authz wall is a host-level fact, and keeping every 403 would reintroduce
+	// catch-all floods.
+	KeepOnePerHost []int
+	// KeepPerPath statuses preserve every DISTINCT path (only exact-duplicate
+	// paths collapse), capped at PerPathCap records per (hostname, status_code) to
+	// bound pathological floods. Use for "endpoint exists" evidence where the path
+	// itself is the attack surface: 405/415/422 mean the route is real but the
+	// method/payload was wrong, so dynamic assessment should retry it with the
+	// right method. Routers only emit these for matched routes, so fuzz-flood risk
+	// is low — the cap is a backstop, not the primary control.
+	KeepPerPath []int
+	// PerPathCap bounds the KeepPerPath tier per (hostname, status_code). <=0
+	// disables the cap (keep all distinct paths).
+	PerPathCap int
+	// AuthWallCap is the tighter per-(hostname, status_code) cap applied to
+	// 401/403 in the KeepPerPath tier: /admin, /backup and /.git at 403 are each
+	// worth a forbidden-bypass attempt, but a host that answers 403 for
+	// everything must not flood the store. <=0 = use PerPathCap.
+	AuthWallCap int
+}
+
+// authWallStatuses are the KeepPerPath statuses AuthWallCap applies to.
+var authWallStatuses = []int{401, 403}
+
+func dedupeInts(in []int) []int {
+	seen := make(map[int]struct{}, len(in))
+	out := make([]int, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+// ApplyDeparosStatusPolicy enforces the discovery status-retention policy on
+// stored deparos records. A fuzzed path the server answers with a 4xx is usually
+// not a discovered resource — it's a rejection (malformed/ambiguous path → 400,
+// not-found → 404). But some 4xx statuses carry real attack surface: 401/403
+// prove an authz boundary exists, 405/415/422 prove a route exists but was hit
+// with the wrong method/payload, and 429 is a pacing signal. The policy retains
+// those (see DeparosStatusPolicy) and drops the rest, rather than deleting every
+// 4xx and losing the signal.
+//
+// Returns the number of deleted records and a status-code breakdown of them.
+func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID string, policy DeparosStatusPolicy) (RecordCleanupResult, error) {
+	projectUUID = defaultProjectUUID(projectUUID)
+
+	keepOne := dedupeInts(policy.KeepOnePerHost)
+	keepPath := dedupeInts(policy.KeepPerPath)
+
+	// A status can only belong to one tier; if it appears in both, KeepPerPath
+	// (finer-grained) wins so we don't over-collapse.
+	if len(keepPath) > 0 && len(keepOne) > 0 {
+		pathSet := make(map[int]struct{}, len(keepPath))
+		for _, s := range keepPath {
+			pathSet[s] = struct{}{}
+		}
+		filtered := keepOne[:0]
+		for _, s := range keepOne {
+			if _, ok := pathSet[s]; !ok {
+				filtered = append(filtered, s)
+			}
+		}
+		keepOne = filtered
 	}
 
-	// Collect status code breakdown before deleting
+	// The full set of statuses spared from the blanket drop.
+	kept := append(append([]int{}, keepOne...), keepPath...)
+
+	uuidSet := make(map[string]struct{})
+
+	// (1) Drop all 4xx that are not retained by either tier.
+	dropQuery := `
+		SELECT uuid FROM http_records
+		WHERE source = 'deparos' AND project_uuid = ?
+		  AND status_code >= 400 AND status_code < 500`
+	dropArgs := []any{projectUUID}
+	if len(kept) > 0 {
+		dropQuery += ` AND status_code NOT IN (?)`
+		dropArgs = append(dropArgs, bun.List(kept))
+	}
+	var dropUUIDs []string
+	if err := r.db.NewRaw(dropQuery, dropArgs...).Scan(ctx, &dropUUIDs); err != nil {
+		return RecordCleanupResult{}, fmt.Errorf("failed to identify client-error deparos records: %w", err)
+	}
+	for _, u := range dropUUIDs {
+		uuidSet[u] = struct{}{}
+	}
+
+	// (2) KeepOnePerHost: collapse to a single representative per (host, status).
+	if len(keepOne) > 0 {
+		collapseQuery := `
+			SELECT uuid FROM (
+				SELECT uuid, ROW_NUMBER() OVER (
+					PARTITION BY hostname, scheme, port, status_code
+					ORDER BY LENGTH(path) ASC, created_at ASC
+				) AS rn
+				FROM http_records
+				WHERE source = 'deparos' AND project_uuid = ?
+				  AND status_code IN (?)
+			) sub WHERE rn > 1`
+		var collapseUUIDs []string
+		if err := r.db.NewRaw(collapseQuery, projectUUID, bun.List(keepOne)).Scan(ctx, &collapseUUIDs); err != nil {
+			return RecordCleanupResult{}, fmt.Errorf("failed to identify collapsible deparos records: %w", err)
+		}
+		for _, u := range collapseUUIDs {
+			uuidSet[u] = struct{}{}
+		}
+	}
+
+	// (3) KeepPerPath: keep every distinct path, but (3a) collapse exact-duplicate
+	// paths to one record and (3b) cap distinct paths per (host, status).
+	if len(keepPath) > 0 {
+		// (3a) Exact-duplicate paths → keep the earliest, drop the rest.
+		pathDupQuery := `
+			SELECT uuid FROM (
+				SELECT uuid, ROW_NUMBER() OVER (
+					PARTITION BY hostname, scheme, port, status_code, path
+					ORDER BY created_at ASC
+				) AS rn
+				FROM http_records
+				WHERE source = 'deparos' AND project_uuid = ?
+				  AND status_code IN (?)
+			) sub WHERE rn > 1`
+		var pathDupUUIDs []string
+		if err := r.db.NewRaw(pathDupQuery, projectUUID, bun.List(keepPath)).Scan(ctx, &pathDupUUIDs); err != nil {
+			return RecordCleanupResult{}, fmt.Errorf("failed to identify duplicate-path deparos records: %w", err)
+		}
+		for _, u := range pathDupUUIDs {
+			uuidSet[u] = struct{}{}
+		}
+
+		// (3b) Cap the number of DISTINCT paths kept per (host, status). DENSE_RANK
+		// gives identical paths the same rank, so pr > cap drops paths beyond the
+		// cap while path-dupes (removed in 3a) don't consume separate ranks.
+		// Auth walls (401/403) get the tighter AuthWallCap.
+		if policy.PerPathCap > 0 || policy.AuthWallCap > 0 {
+			const unbounded = math.MaxInt32
+			perCap := policy.PerPathCap
+			if perCap <= 0 {
+				perCap = unbounded
+			}
+			authCap := policy.AuthWallCap
+			if authCap <= 0 {
+				authCap = perCap
+			}
+			capQuery := `
+				SELECT uuid FROM (
+					SELECT uuid, status_code, DENSE_RANK() OVER (
+						PARTITION BY hostname, scheme, port, status_code
+						ORDER BY LENGTH(path) ASC, path ASC
+					) AS pr
+					FROM http_records
+					WHERE source = 'deparos' AND project_uuid = ?
+					  AND status_code IN (?)
+				) sub WHERE pr > CASE WHEN status_code IN (?) THEN ? ELSE ? END`
+			var capUUIDs []string
+			if err := r.db.NewRaw(capQuery, projectUUID, bun.List(keepPath),
+				bun.List(authWallStatuses), authCap, perCap).Scan(ctx, &capUUIDs); err != nil {
+				return RecordCleanupResult{}, fmt.Errorf("failed to identify over-cap deparos records: %w", err)
+			}
+			for _, u := range capUUIDs {
+				uuidSet[u] = struct{}{}
+			}
+		}
+	}
+
+	if len(uuidSet) == 0 {
+		return RecordCleanupResult{}, nil
+	}
+	uuids := make([]string, 0, len(uuidSet))
+	for u := range uuidSet {
+		uuids = append(uuids, u)
+	}
+	return r.deleteUnreferencedRecords(ctx, uuids)
+}
+
+// DeduplicateDeparosByNormHash collapses deparos records whose NORMALIZED
+// response body is identical — records that differ only by a reflected request
+// URL/path or per-request dynamic tokens (timestamps, ids). This is the case the
+// exact (hostname, status, content_length, response_hash) dedup misses: an error
+// or echo page that mirrors the requested URI gives every probed path a distinct
+// body, length, and hash, so they all survive as separate records even though
+// they are the same page. response_norm_hash (computed at storage time with the
+// reflected URL/path stripped and dynamic runs collapsed) makes them identical.
+//
+// Grouping is on (hostname, method, status_code, response_content_type,
+// response_norm_hash); the shortest path per group survives. Records with no
+// normalized hash (empty bodies) are left to exact-hash dedup. Statuses in
+// keepPerPath are exempt: their distinct paths ARE the signal (each 403 is a
+// forbidden-bypass target) and ApplyDeparosStatusPolicy already caps them.
+// Returns the number of deleted records and a status-code breakdown.
+func (r *Repository) DeduplicateDeparosByNormHash(ctx context.Context, projectUUID string, keepPerPath ...int) (RecordCleanupResult, error) {
+	projectUUID = defaultProjectUUID(projectUUID)
+
+	exempt := ""
+	args := []any{projectUUID}
+	if len(keepPerPath) > 0 {
+		exempt = " AND status_code NOT IN (?)"
+		args = append(args, bun.List(dedupeInts(keepPerPath)))
+	}
+	dupQuery := `
+		SELECT uuid FROM (
+			SELECT uuid, ROW_NUMBER() OVER (
+				PARTITION BY hostname, scheme, port, method, status_code, response_content_type, response_norm_hash
+				ORDER BY LENGTH(path) ASC, created_at ASC
+			) AS rn
+			FROM http_records
+			WHERE source = 'deparos'
+			  AND project_uuid = ?
+			  AND has_response = true
+			  AND response_norm_hash IS NOT NULL
+			  AND response_norm_hash != ''` + exempt + `
+		) sub WHERE rn > 1`
+
+	var uuids []string
+	if err := r.db.NewRaw(dupQuery, args...).Scan(ctx, &uuids); err != nil {
+		return RecordCleanupResult{}, fmt.Errorf("failed to identify reflected-URL-duplicate deparos records: %w", err)
+	}
+	if len(uuids) == 0 {
+		return RecordCleanupResult{}, nil
+	}
+	return r.deleteUnreferencedRecords(ctx, uuids)
+}
+
+// RecordCleanupResult reports what one discovery record-cleanup pass removed and
+// what it deliberately spared.
+type RecordCleanupResult struct {
+	// Deleted is the number of http_records rows actually removed.
+	Deleted int64
+	// KeptReferenced counts records the pass selected as redundant but left in
+	// place because a finding or an analysis artifact still references them.
+	KeptReferenced int64
+	// ByStatus breaks Deleted down by HTTP status code, for operator feedback.
+	ByStatus map[int]int64
+}
+
+// deleteUnreferencedRecords deletes the subset of uuids that no finding and no
+// analysis artifact references, counting them by status code for operator
+// feedback. Records that ARE referenced are left in place with their links
+// intact — a dedup pass may consider an exchange redundant traffic, but a finding
+// that cites it still needs it for replay, export, and `finding --with-records`.
+//
+// Counting and deleting share one transaction and the same predicate, so the
+// breakdown always describes exactly what was removed.
+//
+// Shared by the discovery record-dedup passes. For the destructive operator-driven
+// delete see deleteRecordsByUUIDsTx.
+func (r *Repository) deleteUnreferencedRecords(ctx context.Context, uuids []string) (RecordCleanupResult, error) {
+	if len(uuids) == 0 {
+		return RecordCleanupResult{}, nil
+	}
 	type statusCount struct {
 		StatusCode int   `bun:"status_code"`
 		Count      int64 `bun:"cnt"`
 	}
-	var counts []statusCount
-	if err := r.db.NewRaw(
-		"SELECT status_code, COUNT(*) AS cnt FROM http_records WHERE uuid IN (?) GROUP BY status_code",
-		bun.List(uuids),
-	).Scan(ctx, &counts); err != nil {
-		zap.L().Debug("Failed to collect status code stats for soft-dedup", zap.Error(err))
-	}
-	statusCodes := make(map[int]int64, len(counts))
-	for _, c := range counts {
-		statusCodes[c.StatusCode] = c.Count
-	}
-
+	var (
+		deleted     int64
+		statusCodes = make(map[int]int64)
+	)
 	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		if _, err := tx.NewRaw("DELETE FROM finding_records WHERE record_uuid IN (?)", bun.List(uuids)).Exec(ctx); err != nil {
-			return fmt.Errorf("failed to delete finding_records: %w", err)
-		}
-		if _, err := tx.NewDelete().Model((*HTTPRecord)(nil)).Where("uuid IN (?)", bun.List(uuids)).Exec(ctx); err != nil {
-			return fmt.Errorf("failed to delete soft-duplicate records: %w", err)
+		for chunk := range slices.Chunk(uuids, SQLChunkSize) {
+			var counts []statusCount
+			if err := tx.NewRaw(
+				"SELECT status_code, COUNT(*) AS cnt FROM http_records WHERE uuid IN (?) AND "+
+					recordUnreferencedSQL+" GROUP BY status_code",
+				bun.List(chunk),
+			).Scan(ctx, &counts); err != nil {
+				zap.L().Debug("Failed to collect status code stats for dedup", zap.Error(err))
+			}
+			res, err := tx.NewRaw(
+				"DELETE FROM http_records WHERE uuid IN (?) AND "+recordUnreferencedSQL,
+				bun.List(chunk),
+			).Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to delete records: %w", err)
+			}
+			if n, err := res.RowsAffected(); err == nil {
+				deleted += n
+			}
+			for _, c := range counts {
+				statusCodes[c.StatusCode] += c.Count
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return 0, nil, err
+		return RecordCleanupResult{}, err
 	}
+	return RecordCleanupResult{
+		Deleted:        deleted,
+		KeptReferenced: int64(len(uuids)) - deleted,
+		ByStatus:       statusCodes,
+	}, nil
+}
 
-	return int64(len(uuids)), statusCodes, nil
+// findingHostnameFilter builds an optional "AND hostname IN (?)" SQL fragment and
+// its bind argument(s) for scoping a findings query to a set of hostnames. The
+// fragment is empty (project-wide) for an empty/all-blank list, so callers can
+// always concatenate it immediately after the project_uuid predicate. Scoping the
+// per-round dynamic-assessment dedup to the hosts being scanned keeps it from
+// re-scanning the whole project's findings table every feedback round — which is
+// what makes a long scan with a big findings table O(rounds × table) instead of
+// O(rounds × this-scan's-hosts).
+func findingHostnameFilter(hostnames []string) (string, []any) {
+	seen := make(map[string]struct{}, len(hostnames))
+	clean := make([]string, 0, len(hostnames))
+	for _, h := range hostnames {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if _, dup := seen[h]; dup {
+			continue
+		}
+		seen[h] = struct{}{}
+		clean = append(clean, h)
+	}
+	if len(clean) == 0 {
+		return "", nil
+	}
+	return " AND hostname IN (?)", []any{bun.List(clean)}
+}
+
+// findingBody holds a finding's heavy request/response body text, loaded in the
+// two-pass dedup passes' second pass.
+type findingBody struct {
+	ID       int64  `bun:"id"`
+	Request  string `bun:"request"`
+	Response string `bun:"response"`
+}
+
+// loadFindingBodies fetches the request/response body text for the given finding
+// IDs, keyed by ID. It is the shared "pass 2" of the two-pass dedup passes
+// (DeduplicateFindings / GroupFindingsByValue), which defer body loads to the
+// few findings in groups that actually have duplicates.
+func (r *Repository) loadFindingBodies(ctx context.Context, ids []int64) (map[int64]findingBody, error) {
+	m := make(map[int64]findingBody, len(ids))
+	// Chunk the IN list: ids here is the survivor + every duplicate id (a
+	// superset of the delete set), so it can exceed the bound-parameter limit on
+	// the same large dedups the delete legs chunk for.
+	for chunk := range slices.Chunk(ids, SQLChunkSize) {
+		var rows []findingBody
+		if err := r.db.NewSelect().Model((*Finding)(nil)).
+			Column("id", "request", "response").
+			Where("id IN (?)", bun.List(chunk)).
+			Scan(ctx, &rows); err != nil {
+			return nil, err
+		}
+		for _, br := range rows {
+			m[br.ID] = br
+		}
+	}
+	return m, nil
 }
 
 // DeduplicateFindings merges duplicate findings that share the same
@@ -147,46 +595,76 @@ func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectU
 // payloads (e.g., input-behavior-probe producing dozens of results per endpoint).
 // Within each group, the earliest finding is kept and the request/response pairs
 // from duplicates are collected into its AdditionalEvidence field.
+//
+// When one or more hostnames are passed, the pass is scoped to findings on those
+// hosts (an empty/omitted list dedupes the whole project). The dynamic-assessment
+// feedback loop scopes each round to the hosts being scanned — coverage-equivalent
+// there, since every finding produced during DA is on an in-scope host — so a
+// growing findings table isn't full-scanned once per round.
 // Returns the count of deleted findings and the number of groups that were merged.
-func (r *Repository) DeduplicateFindings(ctx context.Context, projectUUID string) (deleted int64, grouped int64, err error) {
+func (r *Repository) DeduplicateFindings(ctx context.Context, projectUUID string, hostnames ...string) (deleted int64, grouped int64, err error) {
 	projectUUID = defaultProjectUUID(projectUUID)
+	hostFilter, hostArgs := findingHostnameFilter(hostnames)
 
-	// Identify duplicate groups: for each group, get the survivor (rn=1) and duplicates (rn>1).
+	// Pass 1 — identify duplicate groups WITHOUT loading the heavy request/response
+	// body columns. Most findings are singletons (no duplicate), so loading their
+	// bodies here would be pure waste, repeated every feedback round. We fetch only
+	// id, rn, group_key, and the (small) additional_evidence jsonb.
+	//
+	// The matched URL is extracted once in a CTE rather than evaluating
+	// json_extract(matched_at, '$[0]') twice (PARTITION BY + group_key) per row —
+	// SQLite does not common-subexpression-eliminate across a query.
 	groupQuery := `
-		SELECT id, request, response, additional_evidence, ROW_NUMBER() OVER (
-			PARTITION BY module_id, severity, json_extract(matched_at, '$[0]')
-			ORDER BY created_at ASC
+		WITH base AS (
+				SELECT id, additional_evidence, module_id, severity, COALESCE(NULLIF(record_kind, ''), 'finding') AS record_kind, created_at,
+			       COALESCE(scan_uuid, '') AS scan_uuid,
+			       json_extract(matched_at, '$[0]') AS matched_url
+			FROM findings
+			WHERE project_uuid = ?` + hostFilter + `
+			  AND matched_at IS NOT NULL
+			  AND matched_at != '[]'
+			  AND matched_at != ''
+			  AND module_id != '` + secretDetectModuleID + `'
+		)
+		SELECT id, additional_evidence, scan_uuid, ROW_NUMBER() OVER (
+				PARTITION BY record_kind, module_id, severity, matched_url
+				ORDER BY created_at ASC, id ASC
 		) AS rn,
 		-- Stable group key for matching survivors to duplicates
-		module_id || '|' || severity || '|' || COALESCE(json_extract(matched_at, '$[0]'), '') AS group_key
-		FROM findings
-		WHERE project_uuid = ?
-		  AND matched_at IS NOT NULL
-		  AND matched_at != '[]'
-		  AND matched_at != ''`
+			record_kind || '|' || module_id || '|' || severity || '|' || COALESCE(matched_url, '') AS group_key
+		FROM base`
 
 	type findingRow struct {
 		ID                 int64    `bun:"id"`
-		Request            string   `bun:"request"`
-		Response           string   `bun:"response"`
 		AdditionalEvidence []string `bun:"additional_evidence,type:jsonb"`
+		ScanUUID           string   `bun:"scan_uuid"`
 		RN                 int64    `bun:"rn"`
 		GroupKey           string   `bun:"group_key"`
 	}
 
+	queryArgs := append([]any{projectUUID}, hostArgs...)
 	var rows []findingRow
-	if err := r.db.NewRaw(groupQuery, projectUUID).Scan(ctx, &rows); err != nil {
+	if err := r.db.NewRaw(groupQuery, queryArgs...).Scan(ctx, &rows); err != nil {
 		return 0, 0, fmt.Errorf("failed to identify duplicate findings: %w", err)
 	}
 
-	// Build survivor map and collect evidence from duplicates per group.
+	type dupRow struct {
+		id       int64
+		evidence []string
+	}
 	type groupData struct {
 		survivorID       int64
+		survivorRequest  string
+		survivorResponse string
 		existingEvidence []string
 		newEvidence      []string
-		dupIDs           []int64
+		dups             []dupRow
+		// scans tracks the survivor's scan_uuid and the newest member's, so the
+		// survivor stays attributed to the latest scan that observed the issue.
+		scans newestScan
 	}
-	groups := make(map[string]*groupData)
+	// Group count is bounded by row count; sizing up front avoids rehashing.
+	groups := make(map[string]*groupData, len(rows))
 	for _, row := range rows {
 		g, ok := groups[row.GroupKey]
 		if !ok {
@@ -196,42 +674,93 @@ func (r *Repository) DeduplicateFindings(ctx context.Context, projectUUID string
 		if row.RN == 1 {
 			g.survivorID = row.ID
 			g.existingEvidence = row.AdditionalEvidence
+			g.scans.survivor = row.ScanUUID
 		} else {
-			g.dupIDs = append(g.dupIDs, row.ID)
-			ev := buildEvidence(row.Request, row.Response)
-			if ev != "" {
-				g.newEvidence = append(g.newEvidence, ev)
-			}
-			// Carry forward any evidence the duplicate already had.
-			g.newEvidence = append(g.newEvidence, row.AdditionalEvidence...)
+			g.dups = append(g.dups, dupRow{id: row.ID, evidence: row.AdditionalEvidence})
 		}
+		g.scans.observe(row.RN, row.ScanUUID)
 	}
 
-	// Collect all duplicate IDs and count groups that actually had duplicates.
+	// Collect the groups that actually have duplicates, plus the finding IDs whose
+	// bodies we must load (each dup group's survivor + its duplicates).
 	var allDupIDs []int64
+	var bodyIDs []int64
 	var groupCount int64
+	dupGroups := make([]*groupData, 0)
 	for _, g := range groups {
-		if len(g.dupIDs) == 0 {
+		if len(g.dups) == 0 {
 			continue
 		}
 		groupCount++
-		allDupIDs = append(allDupIDs, g.dupIDs...)
+		dupGroups = append(dupGroups, g)
+		bodyIDs = append(bodyIDs, g.survivorID)
+		for _, d := range g.dups {
+			allDupIDs = append(allDupIDs, d.id)
+			bodyIDs = append(bodyIDs, d.id)
+		}
 	}
 
 	if len(allDupIDs) == 0 {
 		return 0, 0, nil
 	}
 
-	// Update survivors with merged evidence, then delete duplicates.
+	// Pass 2 — load request/response bodies only for findings in groups that have
+	// duplicates, then build the merged evidence.
+	bodyByID, err := r.loadFindingBodies(ctx, bodyIDs)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to load finding bodies for dedup: %w", err)
+	}
+	for _, g := range dupGroups {
+		sb := bodyByID[g.survivorID]
+		g.survivorRequest = sb.Request
+		g.survivorResponse = sb.Response
+		// Pre-size: each dup contributes at most its own buildEvidence string
+		// plus any evidence it already carried.
+		evCap := 0
+		for _, d := range g.dups {
+			evCap += 1 + len(d.evidence)
+		}
+		g.newEvidence = make([]string, 0, evCap)
+		for _, d := range g.dups {
+			db := bodyByID[d.id]
+			if ev := buildEvidence(db.Request, db.Response); ev != "" {
+				g.newEvidence = append(g.newEvidence, ev)
+			}
+			// Carry forward any evidence the duplicate already had.
+			g.newEvidence = append(g.newEvidence, d.evidence...)
+		}
+	}
+
+	// Update survivors with merged evidence, migrate the duplicates' evidence
+	// links onto the survivor, then delete duplicates.
 	err = r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		for _, g := range groups {
+		for _, g := range dupGroups {
+			// Preserve exact evidence links regardless of whether there is new
+			// text evidence to merge — the duplicate's record must stay reachable
+			// from the survivor after it's deleted.
+			dupIDs := make([]int64, len(g.dups))
+			for i, d := range g.dups {
+				dupIDs[i] = d.id
+			}
+			if err := migrateFindingRecordsTx(ctx, tx, g.survivorID, dupIDs); err != nil {
+				return err
+			}
+			// Likewise their history: every scan that observed a folded
+			// duplicate observed the survivor's issue.
+			if err := migrateFindingHistoryTx(ctx, tx, g.survivorID, dupIDs); err != nil {
+				return err
+			}
+			if err := g.scans.applyTx(ctx, tx, g.survivorID); err != nil {
+				return err
+			}
+
 			if len(g.newEvidence) == 0 {
 				continue
 			}
-			merged := append(g.existingEvidence, g.newEvidence...)
-			const maxAdditionalEvidence = 10
-			if len(merged) > maxAdditionalEvidence {
-				merged = merged[:maxAdditionalEvidence]
+			primary := buildEvidence(g.survivorRequest, g.survivorResponse)
+			merged := appendUniqueEvidence(g.existingEvidence, primary, g.newEvidence...)
+			if len(merged) == len(g.existingEvidence) {
+				continue // nothing new after dropping duplicates of the primary pair
 			}
 			if _, err := tx.NewUpdate().Model((*Finding)(nil)).
 				Set("additional_evidence = ?", merged).
@@ -240,17 +769,424 @@ func (r *Repository) DeduplicateFindings(ctx context.Context, projectUUID string
 				return fmt.Errorf("failed to update survivor evidence: %w", err)
 			}
 		}
-		if _, err := tx.NewRaw("DELETE FROM finding_records WHERE finding_id IN (?)", bun.List(allDupIDs)).Exec(ctx); err != nil {
-			return fmt.Errorf("failed to delete finding_records: %w", err)
-		}
-		if _, err := tx.NewDelete().Model((*Finding)(nil)).Where("id IN (?)", bun.List(allDupIDs)).Exec(ctx); err != nil {
-			return fmt.Errorf("failed to delete duplicate findings: %w", err)
-		}
-		return nil
+		return deleteFindingsByIDsTx(ctx, tx, allDupIDs)
 	})
 	if err != nil {
 		return 0, 0, err
 	}
 
 	return int64(len(allDupIDs)), groupCount, nil
+}
+
+// GroupFindingOptions configures value-based finding grouping (see
+// GroupFindingsByValue).
+type GroupFindingOptions struct {
+	// PerHost groups within each hostname — a value seen on two hosts stays two
+	// findings. When false, grouping is project-wide regardless of host.
+	PerHost bool
+	// Tags, when non-empty, restricts grouping to findings carrying at least one
+	// matching tag (case-insensitive).
+	Tags []string
+	// ByModule lists module IDs whose findings collapse to a single finding per
+	// (module, severity[, host]) regardless of the per-URL extracted value — for
+	// modules that fire once per asset (e.g. sourcemap-detect, one .map filename
+	// per JS bundle). These bypass the value-identity requirement and the Tags
+	// gate; module + severity is the guardrail.
+	ByModule []string
+	// ByRule lists module IDs whose findings collapse per (module, rule_name,
+	// severity[, host]) regardless of value — like ByModule, but the rule
+	// (module_name) stays part of the key, so DISTINCT rules remain distinct
+	// findings while repeats of the SAME rule fold together. This is for
+	// secret-detect, whose one module_id carries many rule_names (secret-scan
+	// rules): a "Looker Client ID" rule matching every chunk hash in a minified
+	// bundle's content-hash map yields dozens of identical findings differing only
+	// by value, which collapse to one finding (all values unioned on), while a
+	// genuinely different secret — an AWS key, a Slack token — keeps its own row.
+	ByRule []string
+	// BundleSuspect lists module IDs whose GENERIC Suspect-severity findings
+	// collapse by (module, severity[, host]) — the rule dropped from the key — so
+	// the family-less low-signal noise on a host folds into ONE bundle. Only
+	// findings carrying output.SuspectBundleTag qualify (secret-detect sets it on
+	// its generic-namespace rules); a NAMED provider family at Suspect severity is
+	// left untagged and stays per-rule via ByRule, so distinct families are never
+	// merged into one rollup. The module's higher-severity findings also stay
+	// per-rule. The bundle survivor's module_name is relabeled to
+	// suspectBundleFindingName and its description to suspectBundleDescription so it
+	// isn't mislabeled with just the first rule's name/text. Default: secret-detect.
+	BundleSuspect []string
+	// MaxURLs caps the merged matched-URL list on the survivor (0 = unlimited).
+	MaxURLs int
+	// Hostnames, when non-empty, scopes the pass to findings on those hosts. The
+	// dynamic-assessment feedback loop sets it to the hosts being scanned so a
+	// growing findings table isn't loaded in full each round. Empty = project-wide.
+	Hostnames []string
+}
+
+// GroupFindingsByValue collapses findings that share an identical extracted value
+// (e.g. the same leaked secret reported once per URL) into a single finding. The
+// survivor (earliest by created_at) absorbs every duplicate's matched URLs into
+// MatchedAt and a sample of their request/response pairs into AdditionalEvidence;
+// the duplicates are then deleted. Grouping is keyed on
+// (module_id, severity[, hostname], normalized extracted_results) — the value
+// must match byte-for-byte, so findings with distinct or empty extracted values
+// are never merged.
+//
+// Modules listed in opts.ByModule are an exception: their findings collapse on
+// (module_id, severity[, hostname]) alone, regardless of (or absent) an extracted
+// value, and skip the Tags gate. This is for modules that fire once per asset
+// where the per-URL value is noise (e.g. sourcemap-detect, a distinct .map
+// filename per JS bundle).
+//
+// Modules listed in opts.ByRule collapse on (module_id, rule_name, severity[,
+// hostname]) — the same as ByModule but with the rule (module_name) kept in the
+// key, so a module whose single id fronts many rules (secret-detect) folds
+// repeats of one rule while keeping different rules apart. Their distinct values
+// are unioned onto the survivor just like ByModule.
+//
+// Returns the count of deleted findings and the number of groups that were
+// collapsed.
+func (r *Repository) GroupFindingsByValue(ctx context.Context, projectUUID string, opts GroupFindingOptions) (deleted int64, grouped int64, err error) {
+	projectUUID = defaultProjectUUID(projectUUID)
+
+	// Pass 1 loads grouping inputs WITHOUT the heavy request/response body columns;
+	// they are fetched in pass 2 only for groups that actually have duplicates.
+	type findingRow struct {
+		ID                 int64    `bun:"id"`
+		Hostname           string   `bun:"hostname"`
+		ModuleID           string   `bun:"module_id"`
+		ModuleName         string   `bun:"module_name"`
+		Severity           string   `bun:"severity"`
+		RecordKind         string   `bun:"record_kind"`
+		Description        string   `bun:"description"`
+		MatchedAt          []string `bun:"matched_at,type:jsonb"`
+		ExtractedResults   []string `bun:"extracted_results,type:jsonb"`
+		Tags               []string `bun:"tags,type:jsonb"`
+		AdditionalEvidence []string `bun:"additional_evidence,type:jsonb"`
+		ScanUUID           string   `bun:"scan_uuid"`
+	}
+
+	// Only findings with a non-empty extracted value can be value-grouped — except
+	// by-module and by-rule modules, which group regardless of value (so they are
+	// pulled in even with an empty extracted_results). Order by created_at so the
+	// earliest finding in each group becomes the survivor.
+	byModule := output.NormalizeStringSet(opts.ByModule)
+	byRule := output.NormalizeStringSet(opts.ByRule)
+	bundleSuspect := output.NormalizeStringSet(opts.BundleSuspect)
+	const valueCond = "(extracted_results IS NOT NULL AND extracted_results != '[]' AND extracted_results != '')"
+	where := valueCond
+	queryArgs := []any{projectUUID}
+	// Host scope binds right after project_uuid so its placeholder precedes the
+	// optional module_id IN (?) below — keep the arg order matching the SQL text.
+	hostFilter, hostArgs := findingHostnameFilter(opts.Hostnames)
+	queryArgs = append(queryArgs, hostArgs...)
+	// By-module, by-rule, and bundle-suspect modules all bypass the value condition
+	// (their value is noise or merely a sub-key), so pull them in even with an empty
+	// value. A module listed under several sets lands in the IN clause more than
+	// once, which is harmless.
+	moduleList := make([]string, 0, len(byModule)+len(byRule)+len(bundleSuspect))
+	for id := range byModule {
+		moduleList = append(moduleList, id)
+	}
+	for id := range byRule {
+		moduleList = append(moduleList, id)
+	}
+	for id := range bundleSuspect {
+		moduleList = append(moduleList, id)
+	}
+	if len(moduleList) > 0 {
+		where = "(" + valueCond + " OR module_id IN (?))"
+		queryArgs = append(queryArgs, bun.List(moduleList))
+	}
+	loadQuery := `
+			SELECT id, hostname, module_id, module_name, severity, COALESCE(NULLIF(record_kind, ''), 'finding') AS record_kind, description, matched_at, extracted_results, tags,
+		       additional_evidence, COALESCE(scan_uuid, '') AS scan_uuid
+		FROM findings
+		WHERE project_uuid = ?` + hostFilter + ` AND ` + where + `
+		ORDER BY created_at ASC, id ASC`
+
+	var rows []findingRow
+	if err := r.db.NewRaw(loadQuery, queryArgs...).Scan(ctx, &rows); err != nil {
+		return 0, 0, fmt.Errorf("failed to load findings for value grouping: %w", err)
+	}
+
+	tagFilter := output.NormalizeTagSet(opts.Tags)
+
+	type dupRow struct {
+		id       int64
+		evidence []string
+	}
+	type groupData struct {
+		survivorID          int64
+		survivorRequest     string // filled in pass 2
+		survivorResponse    string // filled in pass 2
+		survivorDescription string
+		survivorMatched     []string
+		survivorExtracted   []string
+		existingEvidence    []string
+		dupEvidence         []string // filled in pass 2
+		extraMatched        []string
+		extraExtracted      []string
+		dups                []dupRow
+		// mergeValues marks a group collapsed regardless of value — a by-module
+		// group (keyed on module+severity) or a by-rule group (keyed on
+		// module+rule+severity). Only these merge the differing per-URL extracted
+		// values onto the survivor; plain value groups share an identical value, so
+		// there is nothing to merge.
+		mergeValues bool
+		// suspectBundle marks a Suspect-tier bundle (a BundleSuspect module collapsed
+		// by module) whose survivor is relabeled to suspectBundleFindingName so a
+		// bundle of many low-confidence rules isn't titled with just the first rule.
+		suspectBundle bool
+		scans         newestScan
+	}
+	groups := make(map[string]*groupData)
+	var order []string
+
+	for i := range rows {
+		row := &rows[i]
+		moduleKey, valueKey, groupable := output.GroupingBranch(
+			row.ModuleID, row.ModuleName, output.NormalizedValueKey(row.ExtractedResults), row.Severity, row.Tags, byModule, byRule, bundleSuspect, tagFilter)
+		if !groupable {
+			continue
+		}
+		// An emptied value key marks a by-module/by-rule group — every value folds
+		// into one finding, so the distinct values are unioned onto the survivor.
+		mergeValues := valueKey == ""
+		key := row.RecordKind + "|" + output.GroupingKey(moduleKey, row.Severity, valueKey, row.Hostname, opts.PerHost)
+		g, ok := groups[key]
+		if !ok {
+			groups[key] = &groupData{
+				survivorID:          row.ID,
+				survivorDescription: row.Description,
+				survivorMatched:     row.MatchedAt,
+				survivorExtracted:   row.ExtractedResults,
+				existingEvidence:    row.AdditionalEvidence,
+				mergeValues:         mergeValues,
+				suspectBundle:       output.IsSuspectBundle(row.ModuleID, row.Severity, row.Tags, bundleSuspect),
+				scans:               newestScan{survivor: row.ScanUUID, newest: row.ScanUUID},
+			}
+			order = append(order, key)
+			continue
+		}
+		// Rows load oldest first, so each later member is the newest so far.
+		if row.ScanUUID != "" {
+			g.scans.newest = row.ScanUUID
+		}
+		// Duplicate: fold its URLs and evidence into the survivor (body-derived
+		// evidence is built in pass 2).
+		g.dups = append(g.dups, dupRow{id: row.ID, evidence: row.AdditionalEvidence})
+		g.extraMatched = append(g.extraMatched, row.MatchedAt...)
+		// For by-module/by-rule groups the differing values are signal the operator
+		// wants to keep — union them onto the survivor so the collapsed finding lists
+		// every matched value, not just the first occurrence's.
+		if g.mergeValues {
+			g.extraExtracted = append(g.extraExtracted, row.ExtractedResults...)
+		}
+	}
+
+	// Collect duplicates and the finding IDs whose bodies pass 2 must load.
+	var allDupIDs []int64
+	var bodyIDs []int64
+	for _, key := range order {
+		g := groups[key]
+		if len(g.dups) == 0 {
+			continue
+		}
+		grouped++
+		bodyIDs = append(bodyIDs, g.survivorID)
+		for _, d := range g.dups {
+			allDupIDs = append(allDupIDs, d.id)
+			bodyIDs = append(bodyIDs, d.id)
+		}
+	}
+	if len(allDupIDs) == 0 {
+		return 0, 0, nil
+	}
+
+	// Pass 2 — load request/response bodies only for dup-group members and build
+	// the survivor's body-derived evidence.
+	bodyByID, err := r.loadFindingBodies(ctx, bodyIDs)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to load finding bodies for value grouping: %w", err)
+	}
+	for _, key := range order {
+		g := groups[key]
+		if len(g.dups) == 0 {
+			continue
+		}
+		sb := bodyByID[g.survivorID]
+		g.survivorRequest = sb.Request
+		g.survivorResponse = sb.Response
+		for _, d := range g.dups {
+			db := bodyByID[d.id]
+			if ev := buildEvidence(db.Request, db.Response); ev != "" {
+				g.dupEvidence = append(g.dupEvidence, ev)
+			}
+			g.dupEvidence = append(g.dupEvidence, d.evidence...)
+		}
+	}
+
+	err = r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		for _, key := range order {
+			g := groups[key]
+			if len(g.dups) == 0 {
+				continue
+			}
+			// Migrate the duplicates' evidence links onto the survivor before they
+			// are deleted, so a value-grouped survivor still reaches every proving
+			// record (replay / Burp / --with-records).
+			dupIDs := make([]int64, len(g.dups))
+			for i, d := range g.dups {
+				dupIDs[i] = d.id
+			}
+			if err := migrateFindingRecordsTx(ctx, tx, g.survivorID, dupIDs); err != nil {
+				return err
+			}
+			// Every scan that observed a folded duplicate observed the survivor.
+			if err := migrateFindingHistoryTx(ctx, tx, g.survivorID, dupIDs); err != nil {
+				return err
+			}
+			if err := g.scans.applyTx(ctx, tx, g.survivorID); err != nil {
+				return err
+			}
+			mergedMatched := mergeUniqueStrings(g.survivorMatched, g.extraMatched)
+			if opts.MaxURLs > 0 && len(mergedMatched) > opts.MaxURLs {
+				mergedMatched = mergedMatched[:opts.MaxURLs]
+			}
+			primary := buildEvidence(g.survivorRequest, g.survivorResponse)
+			mergedEvidence := appendUniqueEvidence(g.existingEvidence, primary, g.dupEvidence...)
+			upd := tx.NewUpdate().Model((*Finding)(nil)).Where("id = ?", g.survivorID)
+			if len(mergedMatched) > 0 {
+				upd = upd.Set("matched_at = ?", mergedMatched)
+			}
+			if len(mergedEvidence) > 0 {
+				upd = upd.Set("additional_evidence = ?", mergedEvidence)
+			}
+			// By-module/by-rule groups: merge the distinct extracted values onto the
+			// survivor (bounded by MaxURLs) and note the rollup in the description so
+			// the collapsed finding reflects every occurrence, not just the first.
+			if g.mergeValues {
+				mergedExtracted := filterEmpty(mergeUniqueStrings(g.survivorExtracted, g.extraExtracted))
+				if opts.MaxURLs > 0 && len(mergedExtracted) > opts.MaxURLs {
+					mergedExtracted = mergedExtracted[:opts.MaxURLs]
+				}
+				if len(mergedExtracted) > 0 {
+					upd = upd.Set("extracted_results = ?", mergedExtracted)
+				}
+				// A Suspect bundle folds several DISTINCT generic rules under one
+				// survivor, so the survivor's own (single-rule) description would
+				// misdescribe the mix — describe the bundle generically instead. A
+				// by-rule group is single-rule, so it keeps the survivor's description.
+				descBase := g.survivorDescription
+				if g.suspectBundle {
+					descBase = suspectBundleDescription
+				}
+				if desc := withGroupRollup(descBase, len(mergedMatched), len(mergedExtracted)); desc != "" {
+					upd = upd.Set("description = ?", desc)
+				}
+			}
+			// A collapsed Suspect bundle folds many distinct rules into one survivor,
+			// so retitle it rather than leave it labeled with the first rule's name.
+			if g.suspectBundle {
+				upd = upd.Set("module_name = ?", suspectBundleFindingName)
+			}
+			if _, err := upd.Exec(ctx); err != nil {
+				return fmt.Errorf("failed to update grouped survivor: %w", err)
+			}
+		}
+		return deleteFindingsByIDsTx(ctx, tx, allDupIDs)
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return int64(len(allDupIDs)), grouped, nil
+}
+
+// newestScan carries a duplicate group's scan attribution. The survivor of a
+// merge is the oldest row (its id and triage are kept), but its scan_uuid must
+// be the newest member's: a re-detection whose prose differed (a measured delay
+// in a description) lands as a new row, and keeping the oldest scan_uuid hides
+// it from the current scan's --fail-on gate, summary and report.
+type newestScan struct {
+	survivor string
+	newest   string
+	newestRN int64
+}
+
+// observe records a member by its oldest-first row number.
+func (n *newestScan) observe(rn int64, scanUUID string) {
+	if scanUUID != "" && rn >= n.newestRN {
+		n.newest, n.newestRN = scanUUID, rn
+	}
+}
+
+// applyTx moves the survivor's scan_uuid to the newest member's when it differs.
+func (n *newestScan) applyTx(ctx context.Context, tx bun.Tx, survivorID int64) error {
+	if n.newest == "" || n.newest == n.survivor {
+		return nil
+	}
+	if _, err := tx.NewUpdate().Model((*Finding)(nil)).
+		Set("scan_uuid = ?", n.newest).
+		Where("id = ?", survivorID).
+		Exec(ctx); err != nil {
+		return fmt.Errorf("failed to update survivor scan_uuid: %w", err)
+	}
+	return nil
+}
+
+// suspectBundleFindingName is the module_name given to a collapsed Suspect-tier
+// secret bundle survivor (see GroupFindingOptions.BundleSuspect), so a bundle of
+// many distinct low-confidence rules reads as one "secret-shaped matches" rollup
+// rather than being mislabeled with whichever rule happened to appear first.
+const suspectBundleFindingName = "Low-confidence secret-shaped matches"
+
+// suspectBundleDescription is the survivor description for a collapsed Suspect
+// bundle. The bundle mixes several DISTINCT generic rules (a "Generic Password"
+// folded together with a "Generic API Key"), so the first rule's own description
+// would misrepresent the group; this generic text matches the relabeled
+// suspectBundleFindingName title and points the reviewer at the merged value list.
+const suspectBundleDescription = `**What it means:** Several low-confidence, secret-shaped strings — generic API-key, password, and token patterns that name no specific provider — were served in responses on this host and are collapsed here to keep the noise in one place. These are unverified pattern matches, not confirmed live credentials.
+
+**How it's exploited:** Each value may or may not be a real secret. Review the matched values listed below; any that is a genuine live credential can be replayed against its service for account takeover or data access.
+
+**Fix:** Triage the listed values — rotate and remove any that are real secrets, and keep credentials out of client-facing responses. Recognisable provider keys (Google, AWS, Slack, …) are reported as their own findings, not bundled here.`
+
+// groupRollupMarker delimits the appended rollup note on a by-module grouped
+// survivor's description. It is a stable sentinel so re-running the grouping pass
+// (each phase calls it) rewrites the note in place rather than stacking it.
+const groupRollupMarker = "· grouped:"
+
+// withGroupRollup returns desc with a trailing note summarising how far a by-module
+// survivor was collapsed (distinct URLs and values it now represents). Any prior
+// note from an earlier pass is stripped first so the result stays idempotent.
+func withGroupRollup(desc string, urlCount, valueCount int) string {
+	base := desc
+	if i := strings.Index(base, groupRollupMarker); i >= 0 {
+		base = base[:i]
+	}
+	base = strings.TrimRight(base, " ")
+	if urlCount <= 0 && valueCount <= 0 {
+		return base
+	}
+	note := fmt.Sprintf("collapsed across %d URL(s)", urlCount)
+	if valueCount > 1 {
+		note += fmt.Sprintf(", %d distinct value(s)", valueCount)
+	}
+	prefix := ""
+	if base != "" {
+		prefix = base + " "
+	}
+	return prefix + groupRollupMarker + " " + note
+}
+
+// filterEmpty drops empty/whitespace-only strings, preserving order.
+func filterEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }

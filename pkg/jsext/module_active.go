@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/grafana/sobek"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -13,7 +16,61 @@ import (
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
+	"github.com/vigolium/vigolium/pkg/yamlext"
 )
+
+// jsCallTimeout hard-bounds a single JS extension callable. Sobek runs JS
+// synchronously with no built-in cancellation, so an extension containing an
+// infinite loop would otherwise pin a worker goroutine and a CPU core forever —
+// even after the executor's per-module watchdog abandons the goroutine. The
+// watchdog below interrupts the VM at this deadline.
+const defaultJSCallTimeout = 60 * time.Second
+
+// jsCallTimeoutNanos is the bound in force; NewEngine sets it from
+// extensions.limits.timeout.
+var jsCallTimeoutNanos atomic.Int64
+
+// SetCallTimeout sets the per-call JS timeout; d <= 0 restores the default.
+func SetCallTimeout(d time.Duration) {
+	if d <= 0 {
+		d = defaultJSCallTimeout
+	}
+	jsCallTimeoutNanos.Store(int64(d))
+}
+
+// jsCallTimeout is the per-call bound in force.
+func jsCallTimeout() time.Duration {
+	if n := jsCallTimeoutNanos.Load(); n > 0 {
+		return time.Duration(n)
+	}
+	return defaultJSCallTimeout
+}
+
+// callJSWithTimeout invokes a JS extension callable under jsCallTimeout. A timer
+// goroutine calls vm.Interrupt (safe to call from another goroutine) when the
+// deadline elapses, unblocking a runaway loop. The returned poisoned bool is
+// true whenever the VM was interrupted: an interrupted runtime carries a sticky
+// interrupt flag, so the caller MUST discard it instead of returning it to the
+// pool (the pool then builds a fresh VM on the next Get).
+func callJSWithTimeout(vm *sobek.Runtime, callable sobek.Callable, this sobek.Value, args ...sobek.Value) (val sobek.Value, err error, poisoned bool) {
+	var interrupted atomic.Bool
+	limit := jsCallTimeout()
+	timer := time.AfterFunc(limit, func() {
+		interrupted.Store(true)
+		vm.Interrupt("vigolium: JS extension exceeded execution timeout")
+	})
+	val, err = callable(this, args...)
+	timer.Stop()
+	if interrupted.Load() {
+		if err != nil {
+			return nil, fmt.Errorf("JS extension exceeded %s execution timeout: %w", limit, err), true
+		}
+		// Completed right at the deadline: the result is usable, but the VM was
+		// still interrupted, so discard it.
+		return val, nil, true
+	}
+	return val, err, false
+}
 
 // JSActiveModule wraps a JS active extension as an ActiveModule.
 // No mutex needed — sync.Pool is thread-safe and each VM is an independent runtime.
@@ -40,7 +97,7 @@ func NewJSActiveModule(script *LoadedScript, opts APIOptions) (*JSActiveModule, 
 		"JS extension: "+script.Metadata.Name,
 		script.Metadata.ConfirmationCriteria,
 		sev,
-		severity.Firm,
+		yamlext.ParseConfidence(script.Metadata.Confidence, severity.Firm),
 		scanTypes,
 		modkit.AllInsertionPointTypes,
 	)
@@ -60,7 +117,8 @@ func (m *JSActiveModule) ScanPerInsertionPoint(
 	scanCtx *modkit.ScanContext,
 ) ([]*output.ResultEvent, error) {
 	vm := m.pool.Get()
-	defer m.pool.Put(vm)
+	poisoned := false
+	defer func() { m.pool.PutUnlessPoisoned(vm, poisoned) }()
 
 	// Build context object for JS
 	ctxObj := buildRequestContext(vm, ctx)
@@ -79,7 +137,8 @@ func (m *JSActiveModule) ScanPerInsertionPoint(
 		return nil, fmt.Errorf("scanPerInsertionPoint is not a function in %s", m.script.Path)
 	}
 
-	result, err := callable(exports, ctxObj, ipObj)
+	result, err, timedOut := callJSWithTimeout(vm, callable, exports, ctxObj, ipObj)
+	poisoned = timedOut
 	if err != nil {
 		return nil, fmt.Errorf("JS error in %s: %w", m.script.Path, err)
 	}
@@ -93,7 +152,8 @@ func (m *JSActiveModule) ScanPerRequest(
 	scanCtx *modkit.ScanContext,
 ) ([]*output.ResultEvent, error) {
 	vm := m.pool.Get()
-	defer m.pool.Put(vm)
+	poisoned := false
+	defer func() { m.pool.PutUnlessPoisoned(vm, poisoned) }()
 
 	ctxObj := buildRequestContext(vm, ctx)
 	enrichRecordContext(vm, ctxObj, ctx, scanCtx, m.pool.opts.Repository)
@@ -109,7 +169,8 @@ func (m *JSActiveModule) ScanPerRequest(
 		return nil, fmt.Errorf("scanPerRequest is not a function in %s", m.script.Path)
 	}
 
-	result, err := callable(exports, ctxObj)
+	result, err, timedOut := callJSWithTimeout(vm, callable, exports, ctxObj)
+	poisoned = timedOut
 	if err != nil {
 		return nil, fmt.Errorf("JS error in %s: %w", m.script.Path, err)
 	}
@@ -123,7 +184,8 @@ func (m *JSActiveModule) ScanPerHost(
 	scanCtx *modkit.ScanContext,
 ) ([]*output.ResultEvent, error) {
 	vm := m.pool.Get()
-	defer m.pool.Put(vm)
+	poisoned := false
+	defer func() { m.pool.PutUnlessPoisoned(vm, poisoned) }()
 
 	ctxObj := buildRequestContext(vm, ctx)
 	enrichRecordContext(vm, ctxObj, ctx, scanCtx, m.pool.opts.Repository)
@@ -139,7 +201,8 @@ func (m *JSActiveModule) ScanPerHost(
 		return nil, fmt.Errorf("scanPerHost is not a function in %s", m.script.Path)
 	}
 
-	result, err := callable(exports, ctxObj)
+	result, err, timedOut := callJSWithTimeout(vm, callable, exports, ctxObj)
+	poisoned = timedOut
 	if err != nil {
 		return nil, fmt.Errorf("JS error in %s: %w", m.script.Path, err)
 	}
@@ -291,11 +354,7 @@ func buildRequestContext(vm *sobek.Runtime, ctx *httpmsg.HttpRequestResponse) so
 			_ = reqObj.Set("scheme", svc.Protocol())
 		}
 
-		headersObj := vm.NewObject()
-		for _, h := range ctx.Request().Headers() {
-			_ = headersObj.Set(h.Name, h.Value)
-		}
-		_ = reqObj.Set("headers", headersObj)
+		_ = reqObj.Set("headers", newHeadersObject(vm, ctx.Request().Headers()))
 	}
 	_ = obj.Set("request", reqObj)
 
@@ -306,11 +365,7 @@ func buildRequestContext(vm *sobek.Runtime, ctx *httpmsg.HttpRequestResponse) so
 		_ = respObj.Set("body", ctx.Response().BodyToString())
 		_ = respObj.Set("raw", string(ctx.Response().Raw()))
 
-		headersObj := vm.NewObject()
-		for _, h := range ctx.Response().Headers() {
-			_ = headersObj.Set(h.Name, h.Value)
-		}
-		_ = respObj.Set("headers", headersObj)
+		_ = respObj.Set("headers", newHeadersObject(vm, ctx.Response().Headers()))
 	}
 	_ = obj.Set("response", respObj)
 
@@ -388,6 +443,29 @@ func parseSingleJSResult(vm *sobek.Runtime, obj *sobek.Object, ctx *httpmsg.Http
 	if v := obj.Get("severity"); v != nil && !sobek.IsUndefined(v) {
 		result.Info.Severity = ParseSeverity(v.String())
 	}
+	// Per-result overrides. Anything left unset is filled from the module
+	// defaults (confidence, tags) by the executor.
+	if v := obj.Get("confidence"); isSet(v) {
+		result.Info.Confidence = yamlext.ParseConfidence(v.String(), severity.ConfidenceUndefined)
+	}
+	if v := obj.Get("tags"); isSet(v) {
+		for _, tag := range jsStringSlice(vm, v) {
+			result.Info.Tags = append(result.Info.Tags, strings.ToLower(tag))
+		}
+	}
+	if v := obj.Get("cwe"); isSet(v) {
+		if cwe := v.String(); cwe != "" {
+			result.Metadata = map[string]interface{}{"cwe": cwe}
+		}
+	}
+	if v := obj.Get("fuzzingParameter"); isSet(v) {
+		result.FuzzingParameter = v.String()
+	} else if v := obj.Get("param"); isSet(v) {
+		result.FuzzingParameter = v.String()
+	}
+	if v := obj.Get("evidence"); isSet(v) {
+		result.AdditionalEvidence = jsEvidence(vm, v)
+	}
 
 	// Fill defaults from context
 	if result.URL == "" && ctx != nil {
@@ -397,6 +475,64 @@ func parseSingleJSResult(vm *sobek.Runtime, obj *sobek.Object, ctx *httpmsg.Http
 		result.Matched = result.URL
 	}
 
-	_ = vm // suppress unused warning in future
 	return []*output.ResultEvent{result}
+}
+
+// isSet reports whether a JS property value is present (not undefined/null).
+func isSet(v sobek.Value) bool {
+	return v != nil && !sobek.IsUndefined(v) && !sobek.IsNull(v)
+}
+
+// jsStringSlice reads a JS string or array of strings into a Go slice.
+func jsStringSlice(vm *sobek.Runtime, v sobek.Value) []string {
+	if s, ok := v.Export().(string); ok {
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	}
+	obj := v.ToObject(vm)
+	length := obj.Get("length")
+	if length == nil || sobek.IsUndefined(length) {
+		return nil
+	}
+	n := int(length.ToInteger())
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		if item := obj.Get(strconv.Itoa(i)); isSet(item) {
+			out = append(out, item.String())
+		}
+	}
+	return out
+}
+
+// jsEvidence reads a result's `evidence` field: a string, or an array whose
+// items are strings or objects ({request, response, note}). Objects are kept
+// as compact JSON so nothing the script attached is lost.
+func jsEvidence(vm *sobek.Runtime, v sobek.Value) []string {
+	toString := func(item sobek.Value) string {
+		if s, ok := item.Export().(string); ok {
+			return s
+		}
+		if b, err := json.Marshal(item.Export()); err == nil {
+			return string(b)
+		}
+		return item.String()
+	}
+	if _, ok := v.Export().(string); ok {
+		return []string{v.String()}
+	}
+	obj := v.ToObject(vm)
+	length := obj.Get("length")
+	if length == nil || sobek.IsUndefined(length) {
+		return []string{toString(v)}
+	}
+	n := int(length.ToInteger())
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		if item := obj.Get(strconv.Itoa(i)); isSet(item) {
+			out = append(out, toString(item))
+		}
+	}
+	return out
 }

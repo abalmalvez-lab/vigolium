@@ -3,9 +3,32 @@ package aspnet_sensitive_files
 import "github.com/vigolium/vigolium/pkg/types/severity"
 
 type sensitiveFile struct {
-	path        string
-	name        string
-	markers     []string
+	path string
+	name string
+	// title, when set, replaces the "ASP.NET Sensitive File: <name>" finding
+	// title. Used for files (e.g. cross-domain policies) that are not actually
+	// ASP.NET-specific so the finding name is not misleading.
+	title string
+	// markers is a pure-OR indicator list: any single hit confirms (used for
+	// directory listings and other files whose signal is any-of-several
+	// alternative tokens). Weak/common words must NOT go here — a single generic
+	// word (e.g. "password") lets a reflecting/catch-all host that echoes the
+	// request forge a match. For files identified by the CO-OCCURRENCE of specific
+	// structural tokens, use requireAll instead.
+	markers []string
+	// requireAll is an AND-of-OR group set (see modkit.MatchAllGroups): the body
+	// must contain at least one substring from EVERY group. Prefer this over
+	// markers for a classic ASP include / config file whose real content always
+	// carries several distinct tokens together (e.g. ADODB + Connection +
+	// password), so no single reflected word can trigger the finding. When set,
+	// markers is ignored.
+	requireAll [][]string
+	// confirmAny, when non-empty, requires the response body to additionally
+	// contain at least one of these strings before a finding is raised. This
+	// distinguishes a genuinely insecure file (e.g. an overly permissive
+	// cross-domain policy) from the benign, near-ubiquitous presence of the
+	// file itself.
+	confirmAny  []string
 	antiMarkers []string
 	sev         severity.Severity
 	desc        string
@@ -137,18 +160,22 @@ var sensitiveFiles = []sensitiveFile{
 	{
 		path:        "/clientaccesspolicy.xml",
 		name:        "Silverlight Client Access Policy",
+		title:       "Overly Permissive Silverlight Client Access Policy",
 		markers:     []string{"<access-policy>", "<cross-domain-access>"},
+		confirmAny:  []string{`uri="*"`, `uri='*'`, `uri="http://*"`, `uri="https://*"`},
 		antiMarkers: defaultAntiMarkers,
-		sev:         severity.Medium,
-		desc:        "Silverlight client access policy file found with potentially overly permissive cross-domain settings",
+		sev:         severity.Low,
+		desc:        "Silverlight client access policy (clientaccesspolicy.xml) grants cross-origin access from any domain via a wildcard `<domain uri=\"*\"/>`. A policy scoped to specific domains is not flagged. Note: this is a Silverlight policy file and is not specific to ASP.NET.",
 	},
 	{
 		path:        "/crossdomain.xml",
 		name:        "Flash Cross-Domain Policy",
+		title:       "Overly Permissive Flash Cross-Domain Policy",
 		markers:     []string{"<cross-domain-policy>", "<allow-access-from"},
+		confirmAny:  []string{`domain="*"`, `domain='*'`, `permitted-cross-domain-policies="all"`, `permitted-cross-domain-policies='all'`},
 		antiMarkers: defaultAntiMarkers,
-		sev:         severity.Medium,
-		desc:        "Flash cross-domain policy file found with potentially overly permissive settings",
+		sev:         severity.Low,
+		desc:        "Flash cross-domain policy (crossdomain.xml) grants cross-origin access to ALL domains via a wildcard `domain=\"*\"` (or `permitted-cross-domain-policies=\"all\"`), letting any site read responses on behalf of an authenticated user. A policy scoped to specific domains (e.g. `domain=\"*.example.com\"`) is benign and is not flagged. Note: crossdomain.xml is a Flash/Silverlight policy file and is not specific to ASP.NET.",
 	},
 	{
 		path:        "/Global.asa",
@@ -159,9 +186,11 @@ var sensitiveFiles = []sensitiveFile{
 		desc:        "Classic ASP Global.asa file exposed, revealing application lifecycle configuration",
 	},
 	{
-		path:        "/includes/config.inc",
-		name:        "Classic ASP Config Include",
-		markers:     []string{"ADODB", "Connection", "password"},
+		path: "/includes/config.inc",
+		name: "Classic ASP Config Include",
+		// Require the full ADODB.Connection + password co-occurrence a real DB
+		// include always carries — a lone reflected "password" cannot trigger it.
+		requireAll:  [][]string{{"ADODB"}, {"Connection"}, {"password", "Password", "pwd", "Pwd"}},
 		antiMarkers: defaultAntiMarkers,
 		sev:         severity.Critical,
 		desc:        "Classic ASP configuration include file exposed with potential database credentials",
@@ -169,7 +198,7 @@ var sensitiveFiles = []sensitiveFile{
 	{
 		path:        "/includes/db.inc",
 		name:        "Classic ASP DB Include",
-		markers:     []string{"ADODB", "Connection", "password"},
+		requireAll:  [][]string{{"ADODB"}, {"Connection"}, {"password", "Password", "pwd", "Pwd"}},
 		antiMarkers: defaultAntiMarkers,
 		sev:         severity.Critical,
 		desc:        "Classic ASP database include file exposed with potential connection credentials",
@@ -177,7 +206,7 @@ var sensitiveFiles = []sensitiveFile{
 	{
 		path:        "/includes/conn.inc",
 		name:        "Classic ASP Connection Include",
-		markers:     []string{"ADODB", "Connection", "password"},
+		requireAll:  [][]string{{"ADODB"}, {"Connection"}, {"password", "Password", "pwd", "Pwd"}},
 		antiMarkers: defaultAntiMarkers,
 		sev:         severity.Critical,
 		desc:        "Classic ASP database connection include file exposed with potential credentials",

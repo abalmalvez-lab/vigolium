@@ -68,17 +68,29 @@ func (m *Module) ScanPerRequest(
 
 	host := service.Host()
 
+	urlx, err := ctx.URL()
+	if err != nil {
+		return nil, nil
+	}
+
+	// Walk the web root plus any context-path prefixes of the observed URL so a
+	// known endpoint mounted under a context path (e.g. /myapp/<endpoint>) is
+	// reached, not just the root. Claim each (host, base) pair up front so a
+	// fully-deduped request issues no traffic — including the soft-404 fingerprint.
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	bases := modkit.UnclaimedBasePaths(diskSet, host, modkit.CandidateBasePaths(urlx.Path))
+	if len(bases) == 0 {
 		return nil, nil
 	}
 
 	fp := m.fingerprint404(ctx, httpClient)
 
 	var results []*output.ResultEvent
-	for _, p := range probes {
-		if result := m.probeEndpoint(ctx, httpClient, p, fp); result != nil {
-			results = append(results, result)
+	for _, base := range bases {
+		for _, p := range probes {
+			if result := m.probeEndpoint(ctx, httpClient, scanCtx, p, base+p.path, fp); result != nil {
+				results = append(results, result)
+			}
 		}
 	}
 
@@ -100,11 +112,9 @@ func (m *Module) fingerprint404(
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -122,23 +132,23 @@ func (m *Module) fingerprint404(
 func (m *Module) probeEndpoint(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
+	scanCtx *modkit.ScanContext,
 	p probe,
+	probePath string,
 	fp *notFoundFingerprint,
 ) *output.ResultEvent {
 	modifiedRaw, err := httpmsg.SetMethod(ctx.Request().Raw(), "GET")
 	if err != nil {
 		return nil
 	}
-	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, p.path)
+	modifiedRaw, err = httpmsg.SetPath(modifiedRaw, probePath)
 	if err != nil {
 		return nil
 	}
 
-	fuzzedReq, err := httpmsg.ParseRawRequest(string(modifiedRaw))
-	if err != nil {
-		return nil
-	}
-	fuzzedReq = fuzzedReq.WithService(ctx.Service())
+	// SetMethod/SetPath produce well-formed raw, so wrap directly instead of
+	// re-parsing on this hot path.
+	fuzzedReq := httpmsg.NewRequestResponseRaw(modifiedRaw, ctx.Service())
 
 	resp, _, err := httpClient.Execute(fuzzedReq, http.Options{})
 	if err != nil {
@@ -177,6 +187,13 @@ func (m *Module) probeEndpoint(
 		}
 	}
 
+	// Catch-all / shell guard: a body textually equivalent to the originally
+	// observed page means the app served its standard shell for this path —
+	// "the same body with or without the probe".
+	if modkit.ResemblesObservedPage(ctx, body) {
+		return nil
+	}
+
 	for _, anti := range p.antiMarkers {
 		if strings.Contains(body, anti) {
 			return nil
@@ -187,10 +204,14 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
+	// Strip the reflected probe path before matching so a marker that is also the
+	// path slug ("ready" for /health/ready) can't match on a reflected href alone.
+	matchBody := modkit.StripReflectedProbePath(body, probePath)
+
 	matched := false
 	var matchedMarkers []string
 	for _, marker := range p.markers {
-		if strings.Contains(body, marker) {
+		if strings.Contains(matchBody, marker) {
 			matched = true
 			matchedMarkers = append(matchedMarkers, marker)
 		}
@@ -199,8 +220,37 @@ func (m *Module) probeEndpoint(
 		return nil
 	}
 
+	// Wildcard-shell / path-reflecting-SPA guard (memoized, cheapest-first). A
+	// brand/CMS shell (e.g. Frontify) serves one application shell for every unknown
+	// path and reflects the requested slug into it ({"view":"healthchecks-ui"}), so a
+	// weak slug marker self-matches with no endpoint behind it — and the reflected
+	// slug + per-request CSRF token defeat the random-path 404 fingerprint above.
+	// ResemblesCatchAllShell confirms the shell POSITIVELY from independent samples
+	// (site root + a random directory) via body similarity; a genuinely exposed
+	// dashboard is never ~equal to the homepage, so it costs no true positives.
+	if modkit.ResemblesCatchAllShell(scanCtx, ctx, httpClient, body) {
+		return nil
+	}
+
+	// Sub-directory catch-all guard: now that we probe under context-path prefixes,
+	// drop the finding if a nonexistent sibling under the same parent returns the
+	// same markers (a handler that 200s every child path).
+	if modkit.SiblingServesAnyMarker(scanCtx, ctx, httpClient, probePath, p.markers) {
+		return nil
+	}
+
+	// Slug-reflection guard: several markers ARE their own last path segment
+	// ("healthchecks-ui" for /healthchecks-ui, "browserLink" for /_vs/browserLink), so
+	// a route that echoes the requested slug self-matches them. SlugReflectionFP probes
+	// a canary at the probe's base directory (the web root for these single-segment
+	// paths) and drops only when the whole match is the reflected slug — the residual
+	// reflecting host that the shell guard above misses (e.g. a 302 root). See its doc.
+	if modkit.SlugReflectionFP(ctx, httpClient, probePath, matchedMarkers) {
+		return nil
+	}
+
 	urlx, _ := ctx.URL()
-	targetURL := urlx.Scheme + "://" + urlx.Host + p.path
+	targetURL := urlx.Scheme + "://" + urlx.Host + probePath
 
 	return &output.ResultEvent{
 		URL:              targetURL,

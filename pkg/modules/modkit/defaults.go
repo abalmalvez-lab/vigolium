@@ -8,7 +8,6 @@ import (
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/types/severity"
-	"github.com/vigolium/vigolium/pkg/utils"
 )
 
 func validateModuleID(id string) {
@@ -26,6 +25,18 @@ func validateModuleID(id string) {
 // DefaultModulePriority is the priority assigned to modules that don't implement
 // the Prioritized interface. Lower values = higher priority.
 const DefaultModulePriority = 100
+
+// CapSeverity returns s clamped to at most max (severity is an ordered int, so
+// Critical/High collapse to a Medium ceiling while anything already at or below
+// max passes through unchanged). It is the shared knob the heuristic, FP-prone
+// path-probe families use to report at a fixed ceiling regardless of how
+// sensitive the underlying artifact would be if the match were genuine.
+func CapSeverity(s, max severity.Severity) severity.Severity {
+	if s > max {
+		return max
+	}
+	return s
+}
 
 // BaseModule provides default implementations for common Module methods.
 type BaseModule struct {
@@ -107,13 +118,13 @@ func (b BaseActiveModule) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
 		return false
 	}
 
-	urlx, err := ctx.URL()
-	if err != nil {
+	if _, err := ctx.URL(); err != nil {
 		return false
 	}
 
-	// Default: skip media/JS extensions
-	if utils.IsMediaAndJSURL(urlx.Path) {
+	// Default: skip media/JS extensions. Memoized on the request so the regex
+	// runs once per request rather than once per module's CanProcess.
+	if ctx.Request().IsMediaPath() {
 		return false
 	}
 

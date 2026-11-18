@@ -9,17 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects open redirect vulnerabilities by injecting external URLs into parameters
-and checking if the server responds with a redirect to the injected location.
+	ModuleDesc = `**What it means:** A redirect parameter accepts an arbitrary, attacker-supplied destination without validating it against an allowlist. The server bounces visitors to any external site while appearing to come from the trusted domain.
 
-## Notes
-- Tests parameters for unvalidated redirect behavior
-- Checks both Location header and meta refresh redirects
-- Uses request deduplication to avoid redundant checks
+**How it's exploited:** An attacker sets the redirect parameter to a domain they control, confirmed when the injected URL appears in a Location/Refresh header, meta refresh tag, or JavaScript redirect. This drives phishing lures and steals OAuth tokens on SSO return-URL sinks.
 
-## References
-- https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html`
+**Fix:** Validate redirect targets against a server-side allowlist of permitted destinations and reject or default any value pointing off-site.`
 
 	ModuleConfirmation = "Confirmed when injected external URL appears in a redirect Location header or meta refresh tag"
 	ModuleSeverity     = severity.Medium

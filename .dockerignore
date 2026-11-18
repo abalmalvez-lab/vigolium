@@ -1,7 +1,7 @@
 # Keep Docker build context small. The repo is ~5GB without this — most of
 # that is .git, node_modules, and test fixtures that the Dockerfiles never
 # need. Source-build Dockerfiles still get all of pkg/, internal/, cmd/,
-# public/, platform/vigolium-audit, platform/jsscan, Makefile, go.mod, go.sum.
+# public/, platform/vigolium-audit, platform/jstangle, Makefile, go.mod, go.sum.
 
 # Git metadata (Makefile gracefully falls back to commit="unknown")
 .git/
@@ -24,6 +24,7 @@ platform/*/dist/
 # by go:embed. Keep the build-host's copy out of the context; Docker stages the
 # correct Linux blob from platform/vigolium-audit/build/dist/ per target arch.
 pkg/audit/bin/_bin/vigolium-audit
+pkg/audit/bin/_bin/vigolium-audit.*
 
 # Test fixtures (large, not needed for build)
 test/testdata/

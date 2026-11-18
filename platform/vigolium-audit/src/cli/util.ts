@@ -1,4 +1,21 @@
 import chalk from "chalk";
+import { homedir } from "os";
+
+/**
+ * Abbreviate a home-directory path to `~/…` for display. Only rewrites paths
+ * that are the home dir itself or sit under it (with a `/` boundary, so a
+ * sibling like `/Users/janet-backup` next to `/Users/jane` isn't mangled);
+ * everything else — `/var/folders/…` temp dirs, relative paths — passes through
+ * unchanged. Purely cosmetic: never use on a path that gets handed to a syscall.
+ * Tilde-prefixed words stay copy-pasteable because shells expand a leading `~/`.
+ */
+export function tildify(p: string): string {
+  const home = homedir();
+  if (home.length === 0) return p;
+  if (p === home) return "~";
+  if (p.startsWith(home + "/")) return "~" + p.slice(home.length);
+  return p;
+}
 
 /**
  * Exit with a user-facing error message. In JSON mode emits a single object on
@@ -27,6 +44,21 @@ export function failCli(opts: { json?: boolean }, kind: string, msg: string, exi
 export function parsePositiveUsd(raw: number | string): number | null {
   const n = typeof raw === "number" ? raw : Number(raw);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * Parse `--clone-depth`. Accepts a non-negative integer (the shallow-clone
+ * depth) or the sentinels `0` / `"full"` / `"unshallow"` / `"all"`, all of
+ * which mean a full-history clone and normalize to `0`. Returns null for
+ * anything else (negatives, non-integers, junk).
+ */
+export function parseCloneDepth(raw: number | string): number | null {
+  if (typeof raw === "string") {
+    const s = raw.trim().toLowerCase();
+    if (s === "full" || s === "unshallow" || s === "all") return 0;
+  }
+  const n = typeof raw === "number" ? raw : Number(raw.toString().trim());
+  return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
 const STATUS_ARROW_COLORS: Record<string, (s: string) => string> = {

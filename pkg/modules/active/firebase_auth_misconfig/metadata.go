@@ -9,24 +9,13 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Extracts Firebase API keys from crawled responses and probes the Identity
-Toolkit API for authentication misconfigurations including anonymous signup,
-email enumeration, unrestricted API keys, and weak password policies.
+	ModuleDesc = `**What it means:** A publishable Firebase apiKey allowed selected Identity Toolkit behavior. Anonymous sign-in and a nonexistent-email error are observations; provider discovery is a candidate only when parsed data says registered:true and names providers.
 
-## Notes
-- Extracts apiKey from Firebase config in HTML/JS responses
-- Tests anonymous authentication (signUp without email/password)
-- Tests email enumeration via signInWithPassword error differentiation
-- Tests unrestricted API key usage from scanner origin
-- Cleans up any test accounts created during scanning
-- Deduplicates by API key to avoid redundant probing
+**How it's exploited:** Anonymous tokens matter only if separate resource rules trust them. Email enumeration requires an existing-account differential. Firebase client API keys identify projects and are intentionally public, so key presence is never treated as a secret leak.
 
-## References
-- https://firebase.google.com/docs/auth/web/start
-- https://cloud.google.com/identity-platform/docs/reference/rest`
+**Fix:** Disable unused anonymous sign-in, enable email-enumeration protection, restrict the API key by referrer or app, and enforce rules that distrust anonymous accounts.`
 
-	ModuleConfirmation = "Confirmed when Identity Toolkit endpoints respond with auth tokens or distinguishable error codes indicating misconfiguration"
+	ModuleConfirmation = "Observes supported auth behavior with structured responses; provider-discovery candidate requires registered:true plus non-empty methods, and protected access is never inferred from an anonymous token"
 	ModuleSeverity     = severity.Medium
 	ModuleConfidence   = severity.Firm
 	ModuleTags         = []string{"firebase", "misconfiguration", "auth-bypass", "moderate"}

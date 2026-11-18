@@ -2,14 +2,18 @@ package cli
 
 import (
 	"context"
+	"crypto/md5" //nolint:gosec // dedup key, not a security boundary
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/pkg/agent"
+	"github.com/vigolium/vigolium/pkg/apicontract"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/output"
 	"github.com/vigolium/vigolium/pkg/terminal"
@@ -25,7 +29,10 @@ var findingLoadCmd = &cobra.Command{
 	Short: "Import findings from a file or stdin",
 	Long: `Import findings from JSON, JSONL, or markdown-wrapped agent output.
 
-Supports multiple formats with auto-detection:
+Supports multiple formats with auto-detection, tried in this order:
+  - Export JSONL: {"type": "finding", "data": {...}} lines from
+    'vigolium export --format jsonl' or 'db export' (other types are skipped)
+  - A 'vigolium finding -j' document: its items[] are stored
   - Agent findings: {"findings": [...]} or markdown-wrapped variants
   - Single finding:  {"title": "...", "severity": "..."}
   - ResultEvent JSONL: one Nuclei-compatible JSON per line
@@ -69,17 +76,35 @@ func runFindingLoad(cmd *cobra.Command, args []string) error {
 
 	findings, formatName, err := detectAndParse(raw, findingLoadScan, projectUUID)
 	if err != nil {
-		return fmt.Errorf("failed to parse findings: %w", err)
+		return codedErrorf(apicontract.CodeInputUnparsed, "failed to parse findings: %w", err)
+	}
+	if err := normalizeLoadedFindings(findings); err != nil {
+		return codedErrorf(apicontract.CodeInputUnparsed, "%w; nothing was stored", err)
 	}
 
 	if len(findings) == 0 {
+		if globalJSON {
+			return emitFindingLoadJSON(cmd, projectUUID, formatName, 0, nil, 0)
+		}
 		fmt.Printf("%s No findings found in input\n", terminal.WarningSymbol())
+		return nil
+	}
+
+	if findingLoadDryRun {
+		if globalJSON {
+			return emitMutation(cmd, "", mutationResult{
+				Action: "import", DryRun: true, Items: []int64{},
+				Extra: map[string]any{"format": formatName, "parsed": len(findings), "saved": 0, "skipped": 0},
+			}, withProjectScope(projectUUID), withDBPath(resolvedReadDBPath()))
+		}
+		fmt.Printf("%s Dry run: %d finding(s) parsed from %s format; nothing stored\n", terminal.InfoSymbol(), len(findings), formatName)
 		return nil
 	}
 
 	ctx := context.Background()
 	repo := database.NewRepository(db)
 	saved, skipped := 0, 0
+	savedIDs := []int64{}
 	for _, f := range findings {
 		if err := repo.SaveFindingDirect(ctx, f); err != nil {
 			// Check if the error indicates a constraint violation (unlikely with ON CONFLICT DO NOTHING)
@@ -91,21 +116,38 @@ func runFindingLoad(cmd *cobra.Command, args []string) error {
 			skipped++
 		} else {
 			saved++
+			savedIDs = append(savedIDs, f.ID)
 		}
 	}
 
 	if globalJSON {
-		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-			"format":  formatName,
-			"total":   len(findings),
-			"saved":   saved,
-			"skipped": skipped,
-		})
+		return emitFindingLoadJSON(cmd, projectUUID, formatName, len(findings), savedIDs, skipped)
 	}
 
 	fmt.Printf("%s Loaded %d findings from %s format (%d new, %d duplicates skipped)\n",
 		terminal.SuccessSymbol(), len(findings), formatName, saved, skipped)
 	return nil
+}
+
+// emitFindingLoadJSON writes the load result as a mutation: items are the ids
+// of the findings stored (total counts them), and the old counters stay at the
+// top level — except the old `total`, the parsed count, which the envelope's
+// own total now means something else for and is reported as `parsed`.
+func emitFindingLoadJSON(cmd *cobra.Command, projectUUID, format string, parsed int, savedIDs []int64, skipped int) error {
+	if savedIDs == nil {
+		savedIDs = []int64{}
+	}
+	return emitMutation(cmd, "", mutationResult{
+		Changed: len(savedIDs) > 0,
+		Action:  "import",
+		Items:   savedIDs,
+		Extra: map[string]any{
+			"format":  format,
+			"parsed":  parsed,
+			"saved":   len(savedIDs),
+			"skipped": skipped,
+		},
+	}, withProjectScope(projectUUID), withDBPath(resolvedReadDBPath()))
 }
 
 // readFindingInput reads finding data from positional arg, --finding-file, or stdin.
@@ -126,7 +168,7 @@ func readFindingInput(args []string) (string, error) {
 		return "", fmt.Errorf("no input provided; use a file path, --finding-file, or pipe data via stdin")
 	}
 
-	data, err := io.ReadAll(os.Stdin)
+	data, err := readStdin()
 	if err != nil {
 		return "", fmt.Errorf("failed to read stdin: %w", err)
 	}
@@ -143,6 +185,16 @@ func readFileContent(path string) (string, error) {
 
 // detectAndParse tries multiple format parsers and returns the first successful result.
 func detectAndParse(raw string, scanUUID string, projectUUID string) ([]*database.Finding, string, error) {
+	// 0. vigolium's own dialects: export envelopes, then a finding -j document.
+	// Tried first because the agent parser below accepts any JSON array and
+	// would read them as untitled agent findings.
+	if findings, err := tryParseExportEnvelopes(raw, scanUUID, projectUUID); err == nil && len(findings) > 0 {
+		return findings, "export-jsonl", nil
+	}
+	if findings, err := tryParseFindingDocument(raw, scanUUID, projectUUID); err == nil && len(findings) > 0 {
+		return findings, "finding-json", nil
+	}
+
 	// 1. Try agent findings format (handles markdown fences, {"findings":[...]}, bare arrays)
 	if findings, err := tryParseAgentFindings(raw, scanUUID, projectUUID); err == nil && len(findings) > 0 {
 		return findings, "agent-findings", nil
@@ -301,4 +353,108 @@ func tryParseDBFindings(raw string, projectUUID string) ([]*database.Finding, er
 		f.ProjectUUID = projectUUID
 	}
 	return []*database.Finding{&f}, nil
+}
+
+// rehomeLoadedFinding prepares a finding read from vigolium's own output for
+// the destination: the row id is the source store's, the project is the one
+// being loaded into, and --scan-uuid wins over the source's scan.
+func rehomeLoadedFinding(f *database.Finding, scanUUID, projectUUID string) {
+	f.ID = 0
+	f.ProjectUUID = projectUUID
+	if scanUUID != "" {
+		f.ScanUUID = scanUUID
+	}
+	if f.FindingSource == "" {
+		f.FindingSource = database.FindingSourceImport
+	}
+}
+
+// tryParseExportEnvelopes reads export JSONL: every non-blank line must be a
+// {"type", "data"} envelope; the finding ones are returned.
+func tryParseExportEnvelopes(raw, scanUUID, projectUUID string) ([]*database.Finding, error) {
+	var findings []*database.Finding
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var env struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(line), &env); err != nil || env.Type == "" || len(env.Data) == 0 {
+			return nil, fmt.Errorf("not an export envelope")
+		}
+		if env.Type != "finding" {
+			continue
+		}
+		f := new(database.Finding)
+		if err := json.Unmarshal(env.Data, f); err != nil {
+			return nil, fmt.Errorf("finding envelope: %w", err)
+		}
+		rehomeLoadedFinding(f, scanUUID, projectUUID)
+		findings = append(findings, f)
+	}
+	return findings, nil
+}
+
+// tryParseFindingDocument reads a `vigolium finding -j` document: an object
+// whose items[] are finding views (module_id or finding_hash set).
+func tryParseFindingDocument(raw, scanUUID, projectUUID string) ([]*database.Finding, error) {
+	var doc struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &doc); err != nil || len(doc.Items) == 0 {
+		return nil, fmt.Errorf("not a finding document")
+	}
+	findings := make([]*database.Finding, 0, len(doc.Items))
+	for _, item := range doc.Items {
+		f := new(database.Finding)
+		if err := json.Unmarshal(item, f); err != nil {
+			return nil, err
+		}
+		if f.ModuleID == "" && f.FindingHash == "" {
+			return nil, fmt.Errorf("items[] are not findings")
+		}
+		rehomeLoadedFinding(f, scanUUID, projectUUID)
+		findings = append(findings, f)
+	}
+	return findings, nil
+}
+
+// normalizeLoadedFindings validates and completes parsed findings before any
+// is stored: the severity must be one vigolium knows (case-folded; empty is
+// info), and a finding with a URL but no hostname gets one.
+func normalizeLoadedFindings(findings []*database.Finding) error {
+	for i, f := range findings {
+		sev := strings.ToLower(strings.TrimSpace(f.Severity))
+		if sev == "" {
+			sev = "info"
+		}
+		if !slices.Contains(validLoadSeverities, sev) {
+			return fmt.Errorf("finding %d (%q) has severity %q; valid: %s",
+				i+1, f.ModuleName, f.Severity, strings.Join(validLoadSeverities, ", "))
+		}
+		f.Severity = sev
+		if f.Hostname == "" && f.URL != "" {
+			if u, err := url.Parse(f.URL); err == nil {
+				f.Hostname = u.Hostname()
+			}
+		}
+		if f.FindingHash == "" {
+			f.FindingHash = loadedFindingHash(f)
+		}
+	}
+	return nil
+}
+
+var validLoadSeverities = []string{"critical", "high", "medium", "low", "info"}
+
+// loadedFindingHash identifies a parsed finding that carried no hash of its
+// own: module, title, location and evidence.
+func loadedFindingHash(f *database.Finding) string {
+	sum := md5.Sum([]byte(strings.Join([]string{
+		f.ModuleID, f.ModuleName, f.URL, strings.Join(f.MatchedAt, ","), strings.Join(f.ExtractedResults, ","),
+	}, "|")))
+	return hex.EncodeToString(sum[:])
 }

@@ -9,17 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively detects when request parameter values are reflected verbatim in the response body.
-Input reflection is a prerequisite for many injection vulnerabilities including XSS.
+	ModuleDesc = `**What it means:** A request parameter value was echoed back verbatim in the HTML response body. Informational: reflection alone is not a vulnerability, but it is a common prerequisite for reflected cross-site scripting (XSS), so the parameter is worth active testing.
 
-## Notes
-- Only checks text/html responses
-- Filters out short values (<4 chars), all-numeric values, and token-like values
-- Reports reflected parameters as informational findings for further investigation
+**How it's exploited:** If the value is not output-encoded, an attacker crafts a parameter containing markup or script in a malicious link; when the victim loads it, the payload runs in their session. This confirms only the reflection point, not missing encoding.
 
-## References
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/01-Testing_for_Reflected_Cross_Site_Scripting`
+**Fix:** Apply context-aware output encoding to every reflected parameter value, and validate input against an allowlist.`
 
 	ModuleConfirmation = "Indicated when a request parameter value appears verbatim in the response body"
 	ModuleSeverity     = severity.Info

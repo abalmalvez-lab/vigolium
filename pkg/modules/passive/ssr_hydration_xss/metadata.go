@@ -9,31 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Detects unsafe patterns in server-side rendered (SSR) pages where JSON data is
-embedded in inline script tags for client-side hydration. If the serialized JSON
-is not properly encoded, an attacker can inject a closing </script> tag followed
-by arbitrary HTML/JavaScript, leading to XSS on page load.
+	ModuleDesc = `**What it means:** Recognized hydration data is structurally truncated at a script end-tag while still inside a value, followed by executable markup. Raw less-than characters inside JSON are ignored. Passive evidence remains a candidate pending controlled browser replay.
 
-Common vulnerable patterns include:
-- __NEXT_DATA__ script tags with unescaped user content
-- window.__PRELOADED_STATE__ assignments with raw JSON.stringify output
-- Hydration scripts that embed user-controlled data without HTML escaping
+**How it's exploited:** Attacker input forms a closing script tag, escapes serialized state, and injects JavaScript into the victim's page.
 
-## Notes
-- Scans HTML responses for inline script tags containing hydration data
-- Detects unescaped </script> sequences within JSON hydration blocks
-- Checks for missing HTML entity encoding of < characters in embedded JSON
-- Correlates with request parameters to identify user-controlled data in hydration
-- Deduplicates by host+path
+**Fix:** Use an HTML-safe serializer that escapes less-than characters, preventing user content from forming a script end-tag.`
 
-## References
-- https://snyk.io/blog/10-react-security-best-practices/
-- https://owasp.org/www-community/attacks/xss/
-- https://cwe.mitre.org/data/definitions/79.html`
-
-	ModuleConfirmation = "Confirmed when user-controlled data appears unescaped in a JSON hydration script block"
-	ModuleSeverity     = severity.High
+	ModuleConfirmation = "Candidate when a hydration serialization is structurally truncated at a script boundary and executable markup follows; confirmed only by controlled reflection and browser execution"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"xss", "javascript", "light"}
 )

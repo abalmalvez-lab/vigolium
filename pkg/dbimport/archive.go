@@ -11,8 +11,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/vigolium/vigolium/internal/scratch"
 )
 
 // ArchiveExt inspects a path and returns one of: ".tar.gz", ".tgz", ".zip",
@@ -40,7 +43,7 @@ func ArchiveExt(path string) string {
 // and returns its path. The caller must defer cleanup().
 func ExtractArchiveToDir(archivePath string) (dir string, cleanup func(), err error) {
 	cleanup = func() {}
-	tmpDir, err := os.MkdirTemp("", "vigolium-extract-*")
+	tmpDir, err := scratch.MkdirTemp("extract-*")
 	if err != nil {
 		return "", cleanup, fmt.Errorf("failed to create extract dir: %w", err)
 	}
@@ -63,53 +66,77 @@ func ExtractArchiveToDir(archivePath string) (dir string, cleanup func(), err er
 }
 
 func extractTarGzInto(archivePath, destDir string) error {
+	_, err := ExtractTarGz(archivePath, destDir, false)
+	return err
+}
+
+// ExtractTarGz unpacks the .tar.gz at archivePath into destDir and returns how
+// many files it wrote. Only directories and regular files are written (links
+// and devices are skipped, never followed); an entry that would land outside
+// destDir fails the extraction. stripTopDir drops every entry's first path
+// element and the top-level entries themselves — a release archive's
+// "<name>-<version>/" wrapper.
+func ExtractTarGz(archivePath, destDir string, stripTopDir bool) (int, error) {
 	f, err := os.Open(archivePath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = f.Close() }()
 
 	gr, err := gzip.NewReader(f)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = gr.Close() }()
 
 	tr := tar.NewReader(gr)
 	cleanDest := filepath.Clean(destDir) + string(os.PathSeparator)
+	files := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return err
+			return files, err
 		}
-		fPath := filepath.Join(destDir, hdr.Name)
+		name := hdr.Name
+		if stripTopDir {
+			name = path.Clean(strings.TrimPrefix(name, "./"))
+			i := strings.IndexByte(name, '/')
+			if i < 0 {
+				continue // the top-level directory itself
+			}
+			name = name[i+1:]
+		}
+		fPath := filepath.Join(destDir, filepath.FromSlash(name))
 		if !strings.HasPrefix(fPath, cleanDest) {
-			return fmt.Errorf("illegal file path in archive: %s", hdr.Name)
+			return files, fmt.Errorf("illegal file path in archive: %s", hdr.Name)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(fPath, os.FileMode(hdr.Mode)); err != nil {
-				return err
+			if err := os.MkdirAll(fPath, 0o755); err != nil {
+				return files, err
 			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(fPath), 0o755); err != nil {
-				return err
+				return files, err
 			}
-			out, err := os.OpenFile(fPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(hdr.Mode))
+			out, err := os.OpenFile(fPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 			if err != nil {
-				return err
+				return files, err
 			}
-			if _, err := io.Copy(out, tr); err != nil {
+			if _, err := io.Copy(out, io.LimitReader(tr, hdr.Size)); err != nil {
 				_ = out.Close()
-				return err
+				return files, err
 			}
-			_ = out.Close()
+			if err := out.Close(); err != nil {
+				return files, err
+			}
+			files++
 		}
 	}
-	return nil
+	return files, nil
 }
 
 func extractZipInto(archivePath, destDir string) error {

@@ -2,45 +2,167 @@ package cli
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/configcmd"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
+
+var scopeSetProject string
 
 var scopeSetCmd = &cobra.Command{
 	Use:   "set <component.field> <value>",
 	Short: "Set a scope rule",
-	Long:  "Set a scope rule using component.field notation (e.g. host.exclude \"*.internal.com,admin.*\").",
-	Args:  cobra.ExactArgs(2),
-	RunE:  runScopeSet,
+	Long: "Set a scope rule using component.field notation (e.g. host.exclude \"*.internal.com,admin.*\").\n\n" +
+		"Lists take the comma form or JSON/YAML flow syntax ('[\"*.example.com\",\"example.com\"]'); '<rule>.add <value>' " +
+		"appends, '<rule>.remove <value>' removes and '<rule>.clear' (no value) empties. The value is checked with the same rules as 'config validate' and refused " +
+		"(exit 2, nothing written) when it would break the scope. Writes the global config, or with --project the " +
+		"project's overlay (~/.vigolium/projects/<uuid>/config.yaml). The file is edited in place, keeping its comments " +
+		"and ${VAR} placeholders. A config that fails to load is never overwritten.",
+	Args: cobra.RangeArgs(1, 2),
+	RunE: runScopeSet,
 }
 
 func init() {
+	scopeSetCmd.Flags().StringVar(&scopeSetProject, "project", "", "Write the rule to this project's config overlay instead of the global config (an existing project: UUID, name or unique 8+ char UUID prefix); the global --project-uuid/--project-name flags do the same")
 	scopeCmd.AddCommand(scopeSetCmd)
 }
 
 func runScopeSet(cmd *cobra.Command, args []string) error {
+	// An overlay is written only for a project that exists: writing one for a
+	// typo created ~/.vigolium/projects/<typo>/ that no scan would ever read.
+	if scopeSetProject != "" {
+		resolved, err := resolveProjectRefArg(cmd.Context(), scopeSetProject)
+		if err != nil {
+			return err
+		}
+		scopeSetProject = resolved
+	} else if globalProjectFlagTyped(cmd) {
+		// --project-uuid / --project-name typed on the command line select the
+		// overlay like --project does (an environment pin does not: it would
+		// silently move every global rule into one project).
+		resolved, err := resolveProjectUUID()
+		if err != nil {
+			return err
+		}
+		scopeSetProject = resolved
+	}
+
 	key := "scope." + args[0]
-	value := args[1]
+	var value string
+	switch {
+	case len(args) == 2:
+		value = args[1]
+	case !strings.HasSuffix(key, ".clear"):
+		return usageErrorf("scope set %s needs a value (only '<rule>.clear' takes none)", args[0])
+	}
 
-	// Load current settings
-	configPath := effectiveConfigPath()
-	settings, err := config.LoadSettings(globalConfig)
+	// config.LoadSettings*, not clicommon.LoadSettings: the CLI loader answers a
+	// discovered-but-unreadable config with built-in defaults, and saving those
+	// back would replace the operator's file with them. Refuse instead.
+	settings, err := config.LoadSettingsWithProject(globalConfig, scopeSetProject)
 	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
+		return fmt.Errorf("failed to load config, refusing to write: %w", err)
 	}
 
-	// Update the field
-	if err := config.SetField(settings, key, value); err != nil {
-		return fmt.Errorf("failed to set %q: %w", key, err)
+	// The rule's value before the write, for the -j old/new pair. A list-op key
+	// (`.add`/`.clear`) reports the list it changes.
+	ruleKey := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(key, ".add"), ".clear"), ".remove")
+	oldValue := flatSettingValue(settings, ruleKey)
+
+	edit, err := config.SetFieldEdit(settings, key, value)
+	if err != nil {
+		err = fmt.Errorf("failed to set %q: %w", key, err)
+		if configcmd.IsBadSetting(err) {
+			return clicommon.AsUsageError(err)
+		}
+		return err
 	}
 
-	// Save back to file
-	if err := config.SaveSettings(configPath, settings); err != nil {
+	where := ""
+	layer, configPath := "global", effectiveConfigPath()
+	if scopeSetDryRun {
+		if scopeSetProject != "" {
+			layer, configPath = "project", config.ProjectConfigPath(scopeSetProject)
+		}
+	} else if scopeSetProject != "" {
+		path, err := config.SetProjectOverlayEdit(scopeSetProject, key, edit)
+		if err != nil {
+			if configcmd.IsBadSetting(err) {
+				return clicommon.AsUsageError(err)
+			}
+			return fmt.Errorf("failed to save project config: %w", err)
+		}
+		where = " (" + config.ContractPath(path) + ")"
+		layer, configPath = "project", path
+	} else if _, err := config.EditConfigFile(configPath, edit); err != nil {
+		if configcmd.IsBadSetting(err) {
+			return clicommon.AsUsageError(fmt.Errorf("failed to set %q: %w", key, err))
+		}
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	fmt.Printf("%s Set %s = %s\n", terminal.SuccessSymbol(), terminal.Cyan(key), value)
+	if globalJSON {
+		newValue := flatSettingValue(settings, ruleKey)
+		changed := oldValue != newValue
+		action := "update"
+		if !changed {
+			action = "noop"
+		}
+		opts := []envOpt{}
+		if scopeSetProject != "" {
+			opts = append(opts, withProjectUUID(scopeSetProject))
+		}
+		return emitMutation(cmd, "", mutationResult{
+			Changed: changed,
+			Action:  action,
+			DryRun:  scopeSetDryRun,
+			Items: []scopeSetView{{
+				Key: ruleKey, Old: oldValue, New: newValue,
+				Layer: layer, ConfigPath: config.ContractPath(configPath),
+			}},
+		}, opts...)
+	}
+
+	if scopeSetDryRun {
+		fmt.Printf("%s Dry run: would set %s = %s in %s\n", terminal.InfoSymbol(), terminal.Cyan(key), value, terminal.Gray(config.ContractPath(configPath)))
+		return nil
+	}
+	fmt.Printf("%s Set %s = %s%s\n", terminal.SuccessSymbol(), terminal.Cyan(key), value, terminal.Gray(where))
 	return nil
+}
+
+// scopeSetView is the `scope set -j` row: the rule, its value before and after
+// (in `config ls` rendering), and which config layer was written.
+type scopeSetView struct {
+	Key        string `json:"key"`
+	Old        string `json:"old"`
+	New        string `json:"new"`
+	Layer      string `json:"layer"`
+	ConfigPath string `json:"config_path"`
+}
+
+// flatSettingValue renders one setting the way `config ls` does, or "" when the
+// key is unset.
+func flatSettingValue(settings *config.Settings, key string) string {
+	for _, e := range config.FlattenSettings(settings) {
+		if e.Key == key {
+			return e.Value
+		}
+	}
+	return ""
+}
+
+// globalProjectFlagTyped reports whether --project-uuid or --project-name was
+// given on this command line.
+func globalProjectFlagTyped(cmd *cobra.Command) bool {
+	for _, name := range []string{"project-uuid", "project-name"} {
+		if f := cmd.Flags().Lookup(name); f != nil && f.Changed {
+			return true
+		}
+	}
+	return false
 }

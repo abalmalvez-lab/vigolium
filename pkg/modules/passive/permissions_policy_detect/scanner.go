@@ -45,6 +45,13 @@ func New() *Module {
 	return m
 }
 
+// CanProcess prevents an unsuitable JSON/error/static response from claiming
+// the host before a representative HTML document arrives.
+func (m *Module) CanProcess(ctx *httpmsg.HttpRequestResponse) bool {
+	return ctx != nil && ctx.Request() != nil && ctx.Response() != nil &&
+		strings.Contains(strings.ToLower(ctx.Response().Header("Content-Type")), "text/html")
+}
+
 // ScanPerHost checks Permissions-Policy and Feature-Policy headers once per host.
 func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.ScanContext) ([]*output.ResultEvent, error) {
 	service := ctx.Service()
@@ -55,7 +62,7 @@ func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.S
 	host := service.Host()
 
 	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if diskSet != nil && diskSet.Contains(host) {
 		return nil, nil
 	}
 
@@ -120,6 +127,11 @@ func (m *Module) ScanPerHost(ctx *httpmsg.HttpRequestResponse, scanCtx *modkit.S
 		return nil, nil
 	}
 
+	// Claim the host only now that it matched: a host whose
+	// first response showed nothing stays open for later responses.
+	if diskSet != nil && !diskSet.ClaimOnMatch(host) {
+		return nil, nil
+	}
 	return []*output.ResultEvent{
 		{
 			Host:             host,

@@ -204,23 +204,23 @@ func (c *Cache) LearnAndCache(ctx context.Context, key CacheKey, baseURL *url.UR
 		return nil, fmt.Errorf("no learner configured")
 	}
 
-	// Learn signature
-	sig, err := learner.Learn(ctx, baseURL)
+	// Learn from children of the key's directory carrying its extension
+	// (LearnKey), not from mutations of the base URL's last segment.
+	sigs, err := learner.LearnKey(ctx, key, baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to learn signature: %w", err)
 	}
 
-	// Debug: Log learned signature details
-	logger.Debug("Learned fingerprint signature",
-		zap.String("key", key.String()),
-		zap.String("url", baseURL.String()),
-		zap.Int("stable_attrs", sig.StableAttributeCount()),
-		zap.String("signature", sig.DebugString()))
+	for _, sig := range sigs {
+		logger.Debug("Learned fingerprint signature",
+			zap.String("key", key.String()),
+			zap.String("url", baseURL.String()),
+			zap.Int("stable_attrs", sig.StableAttributeCount()),
+			zap.String("signature", sig.DebugString()))
+		c.Add(key, sig)
+	}
 
-	// Add to cache
-	c.Add(key, sig)
-
-	return sig, nil
+	return sigs[0], nil
 }
 
 // Size returns the number of cache entries (keys)
@@ -493,12 +493,45 @@ func (c *Cache) HasSignaturesForHost(host string) bool {
 	return ok
 }
 
+// defaultPreWarmConcurrency is the fallback cap when the caller passes <= 0.
+const defaultPreWarmConcurrency = 4
+
+// maxPreWarmConcurrency bounds the pre-warm fan-out regardless of the configured
+// discovery concurrency.
+//
+// The learner runs on the raw *http.Client, so these probes bypass the per-host
+// limiter AND the edge pacer entirely — nothing downstream will throttle them.
+// They are also the FIRST traffic a host sees, before it has been fingerprinted
+// and before WAF pre-arming can run, so an unpaced burst here is exactly the
+// shape that arms a rate-based WAF; a throttled host then costs the rest of the
+// scan far more than this preamble ever saves. 16 keeps nearly all of the win
+// (measured 0.45s at 16 vs 1.49s at 4 against a local server) while keeping the
+// opening burst in the range a normal browser session produces.
+const maxPreWarmConcurrency = 16
+
 // PreWarm probes common (path, extension) combinations to seed the fingerprint cache
 // before discovery workers start. This front-loads baseline learning and reduces
 // inline learning pauses during the main discovery phase.
-func (c *Cache) PreWarm(ctx context.Context, baseURL *url.URL) int {
+//
+// concurrency caps how many probe chains run at once and should be the engine's
+// configured discovery concurrency; <= 0 falls back to defaultPreWarmConcurrency.
+// The paths x extensions below produce a fixed preamble every host pays before any
+// fuzzing starts, so running it at the old hardcoded 4 cost 53-66s per host against
+// a ~1.8s-RTT target — two thirds of that host's entire discovery time, at ~0.01
+// CPU cores.
+//
+// The cap is deliberately on chains, not requests: Learn stays serial inside, so
+// in-flight requests never exceed concurrency and the operator's --concurrency
+// contract still holds. Parallelizing Learn's probes as well would multiply real
+// in-flight load behind the same number, which is not what the flag promises — and
+// would aim a large burst at a host that has not been fingerprinted yet.
+func (c *Cache) PreWarm(ctx context.Context, baseURL *url.URL, concurrency int) int {
+	// The root gets every common extension (each learned with that extension on
+	// the wire); the other common directories only the "" key, which also
+	// learns their directory form. ~12 keys x 4 probes = ~48 requests, where
+	// the old 5 dirs x 8 extensions spent ~160 learning the same root shape.
 	commonPaths := []string{"/", "/api/", "/admin/", "/static/", "/assets/"}
-	commonExts := []string{"", ".html", ".php", ".js", ".json", ".xml", ".asp", ".jsp"}
+	rootExts := []string{"", ".html", ".php", ".js", ".json", ".xml", ".asp", ".jsp"}
 
 	type probeTarget struct {
 		path string
@@ -508,7 +541,11 @@ func (c *Cache) PreWarm(ctx context.Context, baseURL *url.URL) int {
 	var targets []probeTarget
 	host := baseURL.Host
 	for _, p := range commonPaths {
-		for _, ext := range commonExts {
+		exts := []string{""}
+		if p == "/" {
+			exts = rootExts
+		}
+		for _, ext := range exts {
 			if c.HasSignaturesForHostPath(host, p) {
 				// Already has some signatures for this path — check specific ext
 				key := CacheKey{Host: host, Path: p, Extension: ext}
@@ -524,7 +561,16 @@ func (c *Cache) PreWarm(ctx context.Context, baseURL *url.URL) int {
 		return 0
 	}
 
-	sem := make(chan struct{}, 4)
+	if concurrency <= 0 {
+		concurrency = defaultPreWarmConcurrency
+	}
+	// Bound the unpaced opening burst (see maxPreWarmConcurrency), then report the
+	// cap that can actually bind rather than the one requested — one goroutine per
+	// target is spawned regardless, so a concurrency above the target count would
+	// only be misleading in the log line below.
+	concurrency = min(concurrency, maxPreWarmConcurrency, len(targets))
+
+	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var learned atomic.Int32
 
@@ -545,6 +591,8 @@ func (c *Cache) PreWarm(ctx context.Context, baseURL *url.URL) int {
 
 			dirURL := *baseURL
 			dirURL.Path = p
+			dirURL.RawPath = ""
+			dirURL.RawQuery = ""
 			key := CacheKey{Host: host, Path: p, Extension: ext}
 
 			if _, err := c.LearnAndCache(ctx, key, &dirURL); err != nil {
@@ -563,7 +611,8 @@ func (c *Cache) PreWarm(ctx context.Context, baseURL *url.URL) int {
 	zap.L().Info("Fingerprint cache pre-warmed",
 		zap.String("host", host),
 		zap.Int32("learned", learned.Load()),
-		zap.Int("total_probes", len(targets)))
+		zap.Int("total_probes", len(targets)),
+		zap.Int("concurrency", concurrency))
 
 	return int(learned.Load())
 }

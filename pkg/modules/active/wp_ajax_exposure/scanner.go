@@ -85,9 +85,7 @@ func (m *Module) ScanPerRequest(
 		return nil, nil
 	}
 
-	host := service.Host()
-	diskSet := m.ds.Get(scanCtx.DedupMgr())
-	if diskSet != nil && diskSet.IsSeen(host) {
+	if !modkit.BeginHostProbeFor(scanCtx, httpClient, &m.ds, ctx) {
 		return nil, nil
 	}
 
@@ -201,6 +199,40 @@ func looksLikeWPControl(c *controlProbe) bool {
 	return true
 }
 
+// genericErrorMarkers are substrings (lowercase) that identify a generic HTML
+// error / challenge / SPA-shell page served by a CDN, WAF, or front-end router
+// rather than by WordPress's admin-ajax. The reported false positive was
+// help.initech.com answering every admin-ajax POST with a "load-failed … Refresh"
+// HTML page; any of these in the body marks the response as untrusted.
+var genericErrorMarkers = []string{
+	"load-failed",
+	"load_failed",
+	"window.location.reload",
+	"location.reload",
+	"<!doctype",
+	"<html",
+	"</html>",
+	"</body>",
+	"please enable javascript",
+	"enable javascript to run",
+	"access denied",
+	"request blocked",
+	"are unable to process",
+	"cloudflare",
+	"captcha",
+	"ray id",
+}
+
+// containsAny reports whether body contains any of the (lowercase) substrings.
+func containsAny(body string, subs []string) bool {
+	for _, s := range subs {
+		if s != "" && strings.Contains(body, s) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Module) probeAction(
 	ctx *httpmsg.HttpRequestResponse,
 	httpClient *http.Requester,
@@ -255,12 +287,39 @@ func (m *Module) probeAction(
 		return nil
 	}
 
-	// Check for anti-markers (generic error pages)
 	lowerBody := strings.ToLower(respBody)
-	if strings.Contains(lowerBody, "<!doctype") || strings.Contains(lowerBody, "<html") {
-		if !strings.Contains(lowerBody, "admin-ajax") {
-			return nil
-		}
+
+	// Reflected-request strip. A universal catch-all / echo host answers every
+	// admin-ajax POST by mirroring the request back — and the POST body is
+	// "action=<name>", so the action name (and any marker that is a substring of
+	// it, e.g. "revslider" and "show_image" inside "revslider_show_image") appears
+	// in the response even though no plugin handler ran. Under the gzip/
+	// Content-Length:0 transport quirk only a reflecting tail fragment is captured,
+	// so the control-probe and wildcard-shell guards above — which key on the body
+	// head/length — miss it, and the reflected action name forges a plugin token.
+	// Strip the echoed action name before marker matching so a bare reflection
+	// cannot satisfy a marker; a genuine nopriv handler emits its OWN plugin/
+	// error tokens (plugin name, error code), which are not part of the action name
+	// and survive the strip.
+	markerBody := modkit.StripReflected(lowerBody, strings.ToLower(action.name))
+
+	// Positive confirmation: the response must contain a substring that ties it
+	// to THIS plugin/action. This is the core gate against false positives — a
+	// generic error page contains none of these, while a genuinely exposed
+	// nopriv handler echoes them even in its error/permission responses.
+	matched, ok := modkit.MatchAllGroups(markerBody, action.markers)
+	if !ok {
+		return nil
+	}
+
+	// Defense in depth: drop generic error / challenge / SPA-shell pages. A
+	// CDN/WAF/app router serves a boilerplate HTML page (the help.initech.com
+	// "load-failed … Refresh" page that produced a false positive is one) for
+	// every admin-ajax POST regardless of action. If such a page also matched a
+	// plugin token by coincidence, only trust it when it's clearly an
+	// admin-ajax response rather than a router/error shell.
+	if containsAny(lowerBody, genericErrorMarkers) && !strings.Contains(lowerBody, "admin-ajax") {
+		return nil
 	}
 
 	targetURL := scheme + "://" + host + path + "?action=" + action.name
@@ -275,7 +334,7 @@ func (m *Module) probeAction(
 		Matched:          targetURL,
 		Request:          rawReq,
 		Response:         respBody,
-		ExtractedResults: []string{action.name, action.plugin},
+		ExtractedResults: append([]string{action.name, action.plugin}, matched...),
 		Info: output.Info{
 			Name:        fmt.Sprintf("WordPress AJAX Action Exposed: %s", action.name),
 			Description: fmt.Sprintf("The wp_ajax_nopriv_%s action (plugin: %s) responds to unauthenticated requests. %s", action.name, action.plugin, action.desc),

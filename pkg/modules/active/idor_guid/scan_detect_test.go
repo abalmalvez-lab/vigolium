@@ -4,14 +4,19 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/modules/modkit"
 	"github.com/vigolium/vigolium/pkg/modules/modtest"
+	"github.com/vigolium/vigolium/pkg/types/severity"
 )
 
 // TestScanPerInsertionPoint_DetectsSequentialIDOR drives the real scan method
@@ -70,4 +75,310 @@ func TestScanPerInsertionPoint_NoFalsePositive(t *testing.T) {
 	res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
 	require.NoError(t, err)
 	assert.Empty(t, res, "404 for neighbor ids means authorization is enforced — no finding")
+}
+
+// listingBody renders a paginated public listing for the given id that links to
+// its previous and next siblings (e.g. /list?id=2 with href="/list?id=1" and
+// href="/list?id=3") — the shape of a blog/catalog index where every id serves
+// distinct content by design.
+func listingBody(id string) string {
+	n, _ := strconv.Atoi(id)
+	return fmt.Sprintf(
+		`<html><body><h1>Listing %s</h1><div class="posts">%s</div>`+
+			`<a href="/list?id=%d" class="prev">Prev</a>`+
+			`<a href="/list?id=%d" class="next">Next</a></body></html>`,
+		id, strings.Repeat("post ", 60), n-1, n+1)
+}
+
+// TestScanPerInsertionPoint_LinkedNeighborSkipped is the regression for the
+// reported blog-pagination false positive: GET /list?id=2 serves a listing whose
+// body already links id 1 (Prev) and id 3 (Next) — the exact ±1 ids this module
+// predicts. Both are intended public navigation, so the module must skip them
+// before sending any probe and report nothing.
+func TestScanPerInsertionPoint_LinkedNeighborSkipped(t *testing.T) {
+	t.Parallel()
+	var probes int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&probes, 1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprint(w, listingBody(r.URL.Query().Get("id")))
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(
+		modtest.Request(t, srv.URL+"/list?id=2"),
+		"text/html",
+		listingBody("2"),
+	)
+	ip := modtest.InsertionPoint(t, rr, "id")
+
+	res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "the ±1 ids are linked from the page itself — intended navigation, not a predictable-reference leak")
+	assert.Zero(t, atomic.LoadInt64(&probes), "both predicted neighbors are linked, so no probe should be sent")
+}
+
+// TestScanPerInsertionPoint_NoCredentialTentative verifies the
+// authorization-boundary gate: a predictable-id hit on an unauthenticated
+// request (no Authorization, Cookie or token) is reported as Medium/Tentative,
+// since "different id → different page" is the expected behavior of public
+// content rather than a confirmed broken-authorization finding.
+func TestScanPerInsertionPoint_NoCredentialTentative(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		_, _ = fmt.Fprintf(w, "{\"id\":%q,\"owner\":%q,\"pad\":%q}", id, "user-"+id, strings.Repeat("x", 120))
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(
+		modtest.Request(t, srv.URL+"/api/objects?id=100"),
+		"application/json",
+		"{\"id\":\"100\",\"owner\":\"user-100\",\"pad\":\""+strings.Repeat("x", 120)+"\"}",
+	)
+	ip := modtest.InsertionPoint(t, rr, "id")
+
+	res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	require.NotEmpty(t, res)
+	assert.Equal(t, severity.Medium, res[0].Info.Severity)
+	assert.Equal(t, severity.Tentative, res[0].Info.Confidence, "an unauthenticated predictable-id hit is a Tentative lead, not Firm")
+}
+
+// keycloakLoginBody is a trimmed Keycloak Sign-In form — the page the predicted
+// header value returned in the reported false positive. It contains login-form
+// markers (password input, login-actions/authenticate action) and a per-request
+// session token so two fetches always "differ".
+func keycloakLoginBody(sessionCode string) string {
+	return fmt.Sprintf(`<!DOCTYPE html><html><body>
+<form id="kc-form-login" action="/realms/master/login-actions/authenticate?session_code=%s&execution=fc587d0a" method="post">
+  <input id="username" name="username" value="" type="text" autocomplete="username"/>
+  <input id="password" name="password" value="" type="password" autocomplete="current-password"/>
+  <button name="login" id="kc-login" type="submit">Sign In</button>
+</form>
+<div>%s</div>
+</body></html>`, sessionCode, strings.Repeat("x", 120))
+}
+
+// rawRequestWithHeader builds an HttpRequestResponse for rawURL carrying the
+// given extra header line (e.g. "Upgrade-Insecure-Requests: 1"), so a test can
+// target a header insertion point that modtest.Request does not synthesize.
+func rawRequestWithHeader(t *testing.T, rawURL, headerLine string) *httpmsg.HttpRequestResponse {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(u.Port())
+	require.NoError(t, err)
+	svc, err := httpmsg.NewService(u.Hostname(), port, u.Scheme)
+	require.NoError(t, err)
+
+	target := u.RequestURI()
+	if target == "" {
+		target = "/"
+	}
+	raw := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\n%s\r\n\r\n", target, u.Host, headerLine)
+	req := httpmsg.NewHttpRequestWithService(svc, []byte(raw))
+	return httpmsg.NewHttpRequestResponse(req, nil)
+}
+
+// TestScanPerInsertionPoint_SkipsNonIDHeader is the regression for the reported
+// false positive: the scanner treated the numeric value of the standard request
+// header Upgrade-Insecure-Requests as an object reference and fuzzed neighbor
+// "0". A standard request header is never an object reference, so the module
+// must skip it without sending a single probe.
+func TestScanPerInsertionPoint_SkipsNonIDHeader(t *testing.T) {
+	t.Parallel()
+	var hits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt64(&hits, 1)
+		_, _ = w.Write([]byte(keycloakLoginBody("sess-" + strconv.FormatInt(atomic.LoadInt64(&hits), 10))))
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := rawRequestWithHeader(t, srv.URL+"/realms/master/protocol/openid-connect/auth", "Upgrade-Insecure-Requests: 1")
+	ip := modtest.InsertionPoint(t, rr, "Upgrade-Insecure-Requests")
+
+	res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "a standard request header is not an IDOR candidate")
+	assert.Zero(t, atomic.LoadInt64(&hits), "the module must not probe a non-ID header at all")
+}
+
+// TestScanPerInsertionPoint_AuthChallengePageNotIDOR ensures the confirmation
+// content gate rejects a neighbor id that returns a login / SSO page. The
+// owner's id (100) serves a real JSON object; any other id serves the Keycloak
+// Sign-In form. Without the gate this looks like a textbook predictable-id IDOR
+// (200, body > 100, differs from baseline, and the same-id refetch is stable so
+// the determinism gate passes) — but the "leaked object" is just the login page.
+func TestScanPerInsertionPoint_AuthChallengePageNotIDOR(t *testing.T) {
+	t.Parallel()
+	var sess int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("id") == "100" {
+			_, _ = fmt.Fprintf(w, "{\"id\":\"100\",\"owner\":\"user-100\",\"pad\":%q}", strings.Repeat("x", 120))
+			return
+		}
+		// Neighbor ids redirect (unauthenticated) to the login shell, with a fresh
+		// session token per request so the body always differs.
+		n := atomic.AddInt64(&sess, 1)
+		_, _ = w.Write([]byte(keycloakLoginBody("sess-" + strconv.FormatInt(n, 10))))
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(
+		modtest.Request(t, srv.URL+"/api/objects?id=100"),
+		"application/json",
+		"{\"id\":\"100\",\"owner\":\"user-100\",\"pad\":\""+strings.Repeat("x", 120)+"\"}",
+	)
+	ip := modtest.InsertionPoint(t, rr, "id")
+
+	res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "a neighbor id that returns a login/SSO page is not a leaked object")
+}
+
+// noiseBody renders a body (comfortably over the module's 100-byte floor) whose
+// only variable part is a 20-digit counter token, so two such bodies are always
+// 200/distinct — the shape of a tracking endpoint that returns different content
+// on every request regardless of the id.
+func noiseBody(n int64) string {
+	return fmt.Sprintf("{\"data\":\"%020d\",\"pad\":%q}", n, strings.Repeat("x", 120))
+}
+
+// distinctObjectServer serves a valid 200 object embedding whatever value the
+// given parameter carries, so any neighbor value returns a distinct >100-byte
+// body — the exact shape that trips the neighbor-differs IDOR oracle. It is used
+// by the control-parameter regressions to prove those params are skipped BEFORE
+// any probe is sent (probe counter stays zero), not merely filtered afterwards.
+func distinctObjectServer(t *testing.T, param string, probes *int64) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(probes, 1)
+		v := r.URL.Query().Get(param)
+		_, _ = fmt.Fprintf(w, "{\"%s\":%q,\"owner\":%q,\"pad\":%q}", param, v, "user-"+v, strings.Repeat("x", 120))
+	}))
+}
+
+// TestScanPerInsertionPoint_PaginationParamSkipped is the regression for the
+// reported pagination false positive: a page_size / page_number / limit
+// parameter carries a windowing value, not an object reference, so predicting
+// ±1 legitimately returns a shorter/longer page. Even though the backend serves
+// a distinct 200 body for every value, the module must skip the parameter
+// without sending a single probe.
+func TestScanPerInsertionPoint_PaginationParamSkipped(t *testing.T) {
+	t.Parallel()
+	for _, param := range []string{"page_size", "page_number", "limit", "offset"} {
+		param := param
+		t.Run(param, func(t *testing.T) {
+			t.Parallel()
+			var probes int64
+			srv := distinctObjectServer(t, param, &probes)
+			defer srv.Close()
+
+			client := modtest.Requester(t)
+			rr := modtest.Response(
+				modtest.Request(t, srv.URL+"/api/objects?"+param+"=20"),
+				"application/json",
+				"{\"owner\":\"user-20\",\"pad\":\""+strings.Repeat("x", 120)+"\"}",
+			)
+			ip := modtest.InsertionPoint(t, rr, param)
+
+			res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+			require.NoError(t, err)
+			assert.Empty(t, res, "a pagination parameter is not an object reference")
+			assert.Zero(t, atomic.LoadInt64(&probes), "a pagination parameter must not be probed at all")
+		})
+	}
+}
+
+// TestScanPerInsertionPoint_FrameworkCounterSkipped is the regression for the
+// Salesforce Aura false positives: `r` is a per-page request counter and `_dfs`
+// is a framework definition-service version — neither is an enumerable object
+// reference, and the underscore-prefixed convention marks reserved framework
+// parameters. The module must skip them before probing.
+func TestScanPerInsertionPoint_FrameworkCounterSkipped(t *testing.T) {
+	t.Parallel()
+	for _, param := range []string{"r", "_dfs", "_lrmc"} {
+		param := param
+		t.Run(param, func(t *testing.T) {
+			t.Parallel()
+			var probes int64
+			srv := distinctObjectServer(t, param, &probes)
+			defer srv.Close()
+
+			client := modtest.Requester(t)
+			rr := modtest.Response(
+				modtest.Request(t, srv.URL+"/s/sfsites/aura?"+param+"=31"),
+				"application/json",
+				"{\"owner\":\"user-31\",\"pad\":\""+strings.Repeat("x", 120)+"\"}",
+			)
+			ip := modtest.InsertionPoint(t, rr, param)
+
+			res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+			require.NoError(t, err)
+			assert.Empty(t, res, "a framework request counter / version is not an object reference")
+			assert.Zero(t, atomic.LoadInt64(&probes), "a framework control parameter must not be probed at all")
+		})
+	}
+}
+
+// TestScanPerInsertionPoint_EpochTimestampSkipped is the regression for the
+// Salesforce static-resource cache-buster false positive:
+// /resource/1603755438000/NavStyleSheet embeds a 13-digit millisecond epoch
+// timestamp as a positional path segment. That value is a last-modified cache
+// key, not an enumerable id, so its ±1 neighbor is meaningless and the module
+// must not probe it.
+func TestScanPerInsertionPoint_EpochTimestampSkipped(t *testing.T) {
+	t.Parallel()
+	var probes int64
+	// "modified" is neither id-named nor a control param, so the finding can only
+	// be suppressed by the epoch-timestamp value guard itself.
+	srv := distinctObjectServer(t, "modified", &probes)
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(
+		modtest.Request(t, srv.URL+"/resource?modified=1603755438000"),
+		"application/json",
+		"{\"owner\":\"user\",\"pad\":\""+strings.Repeat("x", 120)+"\"}",
+	)
+	ip := modtest.InsertionPoint(t, rr, "modified")
+
+	res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "a 13-digit epoch-ms cache-buster is not an object reference")
+	assert.Zero(t, atomic.LoadInt64(&probes), "an epoch-timestamp value must not be probed at all")
+}
+
+// TestScanPerInsertionPoint_NonDeterministicEndpoint is the regression for the
+// sequential-id false positive: the backend returns different content on every
+// request regardless of the id, so a predicted id+/-1 "returns a valid different
+// resource" exactly like a real predictable-reference IDOR. The determinism gate
+// re-issues the ORIGINAL id, sees the same-id response vary just as much, and
+// suppresses the finding.
+func TestScanPerInsertionPoint_NonDeterministicEndpoint(t *testing.T) {
+	t.Parallel()
+	var counter int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Ignore id entirely: every request gets fresh, distinct content.
+		n := atomic.AddInt64(&counter, 1)
+		_, _ = w.Write([]byte(noiseBody(n)))
+	}))
+	defer srv.Close()
+
+	client := modtest.Requester(t)
+	rr := modtest.Response(
+		modtest.Request(t, srv.URL+"/api/objects?id=100"),
+		"application/json",
+		noiseBody(0),
+	)
+	ip := modtest.InsertionPoint(t, rr, "id")
+
+	res, err := New().ScanPerInsertionPoint(rr, ip, client, &modkit.ScanContext{})
+	require.NoError(t, err)
+	assert.Empty(t, res, "a non-deterministic endpoint (same id → different content) must not be reported as predictable-id IDOR")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -12,10 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vigolium/vigolium/internal/scratch"
+
 	"github.com/uptrace/bun"
 
 	"github.com/vigolium/vigolium/pkg/deparos/internal/dedup"
-	"github.com/vigolium/vigolium/pkg/deparos/jsscan/linkfinder"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle/linkfinder"
 )
 
 // SiteMap implements Storage using database backend with bun
@@ -96,12 +99,23 @@ func NewSiteMap(cfg *StorageConfig) (*SiteMap, error) {
 		cfg = DefaultConfig()
 	}
 
+	// Work on a copy: allocating the temp database below rewrites
+	// Database.FilePath, and mutating the caller's config silently converts a
+	// second NewSiteMap call on the same value from ephemeral into persistent
+	// (it would reuse the first target's database) and makes IsEphemeral() report
+	// false for the database we just created.
+	cfgCopy := *cfg
+	cfg = &cfgCopy
+
 	driver := NewDriver(cfg.Database.Driver)
 	var tempPath string
 
-	// Handle ephemeral SQLite mode
+	// Asked BEFORE FilePath is rewritten below, which would make it answer false
+	// for the database we are about to create.
 	if cfg.IsEphemeral() {
-		f, err := os.CreateTemp("", "sitemap-*.db")
+		// Under this process's scratch directory: an ephemeral sitemap that
+		// outlives its run is pure litter. See internal/scratch.
+		f, err := scratch.CreateTemp("sitemap-*.db")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create temp file: %w", err)
 		}
@@ -109,6 +123,17 @@ func NewSiteMap(cfg *StorageConfig) (*SiteMap, error) {
 		cfg.Database.FilePath = tempPath
 		_ = f.Close()
 	}
+
+	// One unwind for every failure past this point, rather than a call at each
+	// return: a startup that fails after creating the temp database strands it
+	// exactly like the missing Close did, and a future early return must not be
+	// able to reintroduce that by forgetting to clean up.
+	ok := false
+	defer func() {
+		if !ok && tempPath != "" {
+			_ = driver.CleanupFiles(tempPath)
+		}
+	}()
 
 	// Ensure parent directory exists for SQLite file paths
 	if cfg.Database.Driver == DriverSQLite && cfg.Database.FilePath != "" {
@@ -144,7 +169,7 @@ func NewSiteMap(cfg *StorageConfig) (*SiteMap, error) {
 		observedRepo:   NewObservedRepository(bunDB),
 		config:         cfg,
 		tempPath:       tempPath,
-		ephemeral:      cfg.IsEphemeral(),
+		ephemeral:      tempPath != "",
 		sessionName:    cfg.SessionName,
 		hostname:       ExtractHostname(cfg.TargetURL),
 	}
@@ -155,6 +180,7 @@ func NewSiteMap(cfg *StorageConfig) (*SiteMap, error) {
 		return nil, fmt.Errorf("failed to ensure session: %w", err)
 	}
 
+	ok = true
 	return s, nil
 }
 
@@ -187,11 +213,12 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 			resp_title TEXT,
 			resp_words INTEGER,
 			resp_lines INTEGER,
+			resp_duration_ms INTEGER,
 			found_by TEXT,
 			discovered_at INTEGER,
 			fingerprint_attrs TEXT,
 			tags TEXT,
-			kingfisher_findings TEXT,
+			secret_findings TEXT,
 			first_seen_session INTEGER,
 			last_seen_session INTEGER,
 			hash TEXT
@@ -217,6 +244,14 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 			content_type TEXT,
 			headers TEXT,
 			cookies TEXT,
+			source_url TEXT,
+			record_kind TEXT,
+			confidence TEXT,
+			extractor TEXT,
+			module_path TEXT,
+			source_line INTEGER,
+			template_json TEXT,
+			schema_version INTEGER NOT NULL DEFAULT 1,
 			created_at INTEGER NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS observed (
@@ -227,6 +262,19 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 			frequency INTEGER NOT NULL DEFAULT 1,
 			updated_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS jstangle_source_artifacts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_node_id INTEGER NOT NULL,
+			session_id INTEGER NOT NULL,
+			hash TEXT NOT NULL,
+			generated_url TEXT NOT NULL,
+			virtual_url TEXT NOT NULL,
+			source_path TEXT NOT NULL,
+			language TEXT NOT NULL,
+			content_sha256 TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
 	}
 
 	for _, ddl := range tables {
@@ -235,18 +283,62 @@ func migrateSchema(ctx context.Context, db *bun.DB) error {
 		}
 	}
 
+	// CREATE TABLE IF NOT EXISTS does not add columns to existing scan DBs.
+	// Apply additive, nullable v2 columns and tolerate duplicate-column errors on
+	// databases that already carry them.
+	columnMigrations := []string{
+		"ALTER TABLE extractions ADD COLUMN source_url TEXT",
+		"ALTER TABLE extractions ADD COLUMN record_kind TEXT",
+		"ALTER TABLE extractions ADD COLUMN confidence TEXT",
+		"ALTER TABLE extractions ADD COLUMN extractor TEXT",
+		"ALTER TABLE extractions ADD COLUMN module_path TEXT",
+		"ALTER TABLE extractions ADD COLUMN source_line INTEGER",
+		"ALTER TABLE extractions ADD COLUMN template_json TEXT",
+		"ALTER TABLE extractions ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+		"ALTER TABLE nodes ADD COLUMN resp_duration_ms INTEGER",
+	}
+	for _, ddl := range columnMigrations {
+		if _, err := db.ExecContext(ctx, ddl); err != nil {
+			message := strings.ToLower(err.Error())
+			if !strings.Contains(message, "duplicate column") && !strings.Contains(message, "already exists") {
+				return fmt.Errorf("failed to migrate extraction schema: %w", err)
+			}
+		}
+	}
+
 	indexes := []string{
 		"CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(session_name)",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_hash ON nodes(hash)",
+		// Keyset-walk indexes. These match the ORDER BY and the > predicate of the
+		// paged walkers in repository.go EXACTLY, COALESCE included — an index on
+		// the bare column would not be seekable for a COALESCE predicate, and the
+		// walkers need the COALESCE because both leading columns are nullable.
+		// Without these a walk re-scans and re-sorts the whole table once per page
+		// (reading every row's body to do it), which is worse than the single full
+		// scan paging replaced.
+		"CREATE INDEX IF NOT EXISTS idx_nodes_walk_depth ON nodes(COALESCE(depth, -1), url, id)",
+		"CREATE INDEX IF NOT EXISTS idx_nodes_walk_discovered ON nodes(COALESCE(discovered_at, 0), id)",
 		"CREATE INDEX IF NOT EXISTS idx_session_nodes_timestamp ON session_nodes(timestamp)",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_ext_hash ON extractions(hash)",
 		"CREATE INDEX IF NOT EXISTS idx_ext_hostname ON extractions(hostname)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_jstangle_source_artifact_hash ON jstangle_source_artifacts(hash)",
+		"CREATE INDEX IF NOT EXISTS idx_jstangle_source_artifact_session ON jstangle_source_artifacts(session_id)",
+		"CREATE INDEX IF NOT EXISTS idx_jstangle_source_artifact_generated ON jstangle_source_artifacts(generated_url)",
 		"CREATE INDEX IF NOT EXISTS idx_obs_hostname ON observed(hostname)",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_hostname_type_value ON observed(hostname, type, value)",
 	}
 
 	for _, idx := range indexes {
 		if _, err := db.ExecContext(ctx, idx); err != nil {
+			// An index over a column this store predates is skipped, not fatal.
+			// Stores created by older versions can be missing a column that a
+			// later index wants, and columnMigrations above only backfills the
+			// ones it knows about. The index is an optimization; refusing to open
+			// an otherwise-usable database over a missing one would be worse than
+			// running the query without it.
+			if strings.Contains(strings.ToLower(err.Error()), "no such column") {
+				continue
+			}
 			return fmt.Errorf("failed to create index: %w", err)
 		}
 	}
@@ -278,10 +370,10 @@ func (s *SiteMap) ensureSession() error {
 	return nil
 }
 
-// BatchUpdateKingfisherFindings updates kingfisher findings for nodes identified by URL.
-func (s *SiteMap) BatchUpdateKingfisherFindings(urlFindings map[string]string) error {
+// BatchUpdateSecretFindings updates secret findings for nodes identified by URL.
+func (s *SiteMap) BatchUpdateSecretFindings(urlFindings map[string]string) error {
 	ctx := context.Background()
-	return s.repo.BatchUpdateKingfisherFindings(ctx, urlFindings)
+	return s.repo.BatchUpdateSecretFindings(ctx, urlFindings)
 }
 
 // Close ends the session and releases resources
@@ -299,16 +391,18 @@ func (s *SiteMap) Close() error {
 	}
 
 	// Close database
-	if err := s.bunDB.Close(); err != nil {
-		return err
-	}
+	closeErr := s.bunDB.Close()
 
-	// Clean up temp files if ephemeral
+	// Clean up the temp database we own. Done even when the close above failed —
+	// otherwise a failing close is a permanent disk leak — but only for tempPath,
+	// never for a user-supplied persistent file.
+	var cleanupErr error
 	if s.tempPath != "" && s.driver != nil {
-		_ = s.driver.CleanupFiles(s.tempPath)
+		cleanupErr = s.driver.CleanupFiles(s.tempPath)
+		s.tempPath = "" // idempotent: a second Close must not re-report
 	}
 
-	return nil
+	return errors.Join(closeErr, cleanupErr)
 }
 
 // computeStats calculates session statistics
@@ -330,7 +424,7 @@ func (s *SiteMap) SessionDBID() int64 {
 	return s.sessionDBID
 }
 
-// Extractions returns the extraction repository for storing spider/jsscan/form extractions.
+// Extractions returns the extraction repository for storing spider/jstangle/form extractions.
 func (s *SiteMap) Extractions() *ExtractionRepository {
 	return s.extractionRepo
 }
@@ -370,7 +464,10 @@ func (s *SiteMap) Store(result *Result) error {
 			result.Request.Method,
 			result.Response.StatusCode,
 			serverHeader,
-			result.URL.Path,
+			// Escaped (wire) path: keeps a path-normalization bypass distinct
+			// ("/%23/../x" vs "/x", or the decoded "/#/../x" whose "#" would
+			// otherwise strip to "/"), matching the request actually sent.
+			result.URL.EscapedPath(),
 			result.URL.RawQuery,
 			result.Request.Body,
 		)
@@ -492,6 +589,37 @@ func (s *SiteMap) StreamAllResults(fn NodeCallback) error {
 		}
 		return fn(NodeModelToDiscoveredNode(m))
 	})
+}
+
+// StreamResultsSince streams the results stored after lastNodeID (exclusive),
+// in insertion order, and returns the cursor to pass next time: the highest
+// node id read. Pass 0 to start from the beginning. Spam URLs are skipped but
+// still advance the cursor.
+//
+// It is the incremental counterpart of StreamAllResults for a crawl that is
+// still writing: a consumer can flush what landed so far, then resume from the
+// returned id without re-reading or missing a row. On a callback error the
+// returned id is the last row fully handled before it, so a retry resumes at the
+// failing row.
+func (s *SiteMap) StreamResultsSince(lastNodeID int64, fn NodeCallback) (int64, error) {
+	ctx := context.Background()
+	return s.repo.WalkNodesSince(ctx, lastNodeID, func(m *NodeModel) error {
+		if linkfinder.IsSpamURL(extractPath(m.URL)) {
+			return nil
+		}
+		return fn(NodeModelToDiscoveredNode(m))
+	})
+}
+
+// LatestNodeID returns the highest node id stored so far (0 when empty). A
+// cheap primary-key lookup, so a flusher can poll it to tell how many nodes
+// landed since its cursor without counting rows.
+func (s *SiteMap) LatestNodeID() int64 {
+	id, err := s.repo.MaxNodeID(context.Background())
+	if err != nil {
+		return 0
+	}
+	return id
 }
 
 // StreamResultsBySessionName streams results for a session through callback.

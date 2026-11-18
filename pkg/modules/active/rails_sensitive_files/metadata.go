@@ -9,24 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Probes for Rails-specific sensitive files that may be exposed due to misconfigured web
-servers or containerized deployments serving the application root as static files.
-Checks for master keys, encrypted credentials, database configs, Gemfiles, logs,
-SQLite databases, and server configurations.
+	ModuleDesc = `**What it means:** A sensitive Ruby on Rails file is reachable over HTTP from the web root because a misconfigured server serves the application directory as static content, leaking the master key, encrypted credentials, database.yml, secret_key_base, or a full SQLite database.
 
-## Notes
-- Sends GET/HEAD requests to known Rails configuration file paths
-- Uses content markers to confirm file type and reduce false positives
-- Fingerprints 404 responses to avoid custom error page false positives
-- Each finding has severity based on the sensitivity of the exposed file
+**How it's exploited:** An attacker requests the file and reads it. A leaked master.key or secrets.yml decrypts credentials and forges session cookies for account takeover; database.yml yields DB credentials; Gemfile.lock pins versions to map known CVEs.
 
-## References
-- https://guides.rubyonrails.org/security.html
-- https://owasp.org/www-project-web-security-testing-guide/`
+**Fix:** Block direct access to source and config directories at the proxy, never serve the Rails root statically, and rotate exposed credentials.`
 
 	ModuleConfirmation = "Confirmed when Rails configuration files are accessible and contain expected content markers"
-	ModuleSeverity     = severity.Critical
-	ModuleConfidence   = severity.Firm
+	ModuleSeverity     = severity.Suspect
+	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"rails", "ruby", "file-exposure", "info-disclosure", "light"}
 )

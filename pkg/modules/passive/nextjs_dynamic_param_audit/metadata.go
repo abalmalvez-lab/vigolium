@@ -9,29 +9,14 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Scans JavaScript and TypeScript response bodies for Next.js pages and route handlers
-that use dynamic route params or searchParams directly in database queries, authorization
-decisions, or sensitive operations without runtime validation. Dynamic route segments
-([param]) and searchParams are user-controlled strings that must be validated before
-use in security-sensitive contexts.
+	ModuleDesc = `**What it means:** A source-like JS/TS file contains route/search parameter syntax near a database, authorization, SQL, or redirect pattern, with no recognized validation token elsewhere in the file.
 
-## Notes
-- Passive only - does not send any HTTP requests
-- Detects params.id, params.slug, searchParams.* used directly in DB queries
-- Detects searchParams used in authorization decisions (isAdmin, role, etc.)
-- Flags when no schema validation is applied before use
-- Deduplicates by host+path
-- CWE-20: Improper Input Validation
+**How it's exploited:** A real flaw requires the same attacker-controlled value to reach the sink without imported/manual validation. Regex proximity cannot establish that flow or impact, so every result remains a candidate.
 
-## References
-- https://nextjs.org/docs/app/building-your-application/routing/dynamic-routes
-- https://nextjs.org/blog/security-nextjs-server-components-actions
-- https://cwe.mitre.org/data/definitions/20.html
-- https://cwe.mitre.org/data/definitions/89.html`
+**Fix:** Validate and coerce every param and searchParam (Zod, parseInt, or UUID parser) before using it in queries, auth logic, or redirects.`
 
-	ModuleConfirmation = "Confirmed when dynamic params or searchParams are used directly in sensitive operations without validation"
-	ModuleSeverity     = severity.Medium
+	ModuleConfirmation = "Candidate when source-like code co-locates param and sensitive-sink patterns without recognized validation; taint tracing or dynamic impact is required"
+	ModuleSeverity     = severity.Suspect
 	ModuleConfidence   = severity.Tentative
 	ModuleTags         = []string{"nextjs", "javascript", "injection", "light"}
 )

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/vigolium/vigolium/pkg/deparos/internal/dedup"
+	"github.com/vigolium/vigolium/pkg/deparos/jstangle"
 	"github.com/vigolium/vigolium/pkg/deparos/responsechain"
 	"github.com/vigolium/vigolium/pkg/deparos/spider"
 	"github.com/vigolium/vigolium/pkg/deparos/wordlist"
@@ -45,9 +46,22 @@ func (e *Engine) extractLinks(baseURL *url.URL, rc *responsechain.ResponseChain,
 	// Extract words from response body for wordlist augmentation
 	e.extractWordsFromResponse(rc)
 
-	// Process script tags with jsscan for HTML responses.
+	// Process script tags with jstangle for HTML responses.
 	// This extracts HTTP requests from inline <script> content.
-	e.processScriptTagsWithJSScan(e.ctx, baseURL, rc)
+	e.processScriptTagsWithJSTangle(e.ctx, baseURL, rc)
+
+	// Harvest Next.js route manifests (_buildManifest.js / _ssgManifest.js) for
+	// the full page-route table and concrete pre-rendered paths, which are often
+	// not linked anywhere in the HTML.
+	e.queueNextJSManifests(baseURL, rc, parentDepth)
+
+	// Harvest SPA/PWA asset manifests + service workers (Angular ngsw.json, CRA
+	// asset-manifest.json, Nuxt builds, generic service workers + Workbox
+	// precache). These enumerate the lazy-loaded chunks that are built from a
+	// runtime chunk map and so are invisible to static link extraction — only the
+	// framework runtime or a service worker (neither of which discovery runs)
+	// would otherwise fetch them.
+	e.queueSPAAssetManifests(baseURL, rc, parentDepth)
 
 	result, err := e.spiderCoordinator.Extract(e.ctx, baseURL, rc)
 	if err != nil {
@@ -65,7 +79,8 @@ func (e *Engine) extractLinks(baseURL *url.URL, rc *responsechain.ResponseChain,
 	// Queue JS files for path extraction
 	// These are processed by spider workers and populate observed collections
 	if len(result.JSURLs) > 0 {
-		e.queueJSFetch(result.JSURLs, parentDepth)
+		// Links the page itself carries.
+		e.queueJSFetch(result.JSURLs, ProvenanceReferenced)
 	}
 
 	// Queue form requests for testing
@@ -73,40 +88,99 @@ func (e *Engine) extractLinks(baseURL *url.URL, rc *responsechain.ResponseChain,
 		e.queueFormSubmission(result.FormRequests, baseURL, parentDepth)
 	}
 
-	if len(result.Links) == 0 {
+	if len(result.DiscoveredLinks) == 0 {
 		return
 	}
 
 	logger.Debug("Links extracted from response",
 		zap.String("url", baseURL.String()),
-		zap.Int("count", len(result.Links)),
+		zap.Int("count", len(result.DiscoveredLinks)),
 		zap.Uint16("parent_depth", parentDepth))
 
-	// Collect and validate all links
-	batch := e.collectValidatedLinks(result.Links, parentDepth)
-	if batch == nil {
-		return
-	}
+	// Collect and validate all links (DiscoveredLinks carry the source type used
+	// to gate server-side extension confirmation). Links are grouped by origin so
+	// each batch is replayed against its own host — see collectValidatedLinks.
+	batches := e.collectValidatedLinks(result.DiscoveredLinks, parentDepth)
 
-	// Create single batched task
-	e.createSpiderBatchTask(batch)
+	// Create one batched task set per origin.
+	for _, batch := range batches {
+		e.createSpiderBatchTask(batch)
+	}
 }
 
-// collectValidatedLinks validates all extracted links and returns a batch.
-// Handles observed name/extension extraction and breadcrumb processing.
+// extensionConfirmAllowed reports whether a spider link from the given source
+// may *eagerly* confirm a server-side extension for wordlist fuzzing.
+//
+// This gate only applies in legacy (non-ConfirmRequired) mode. Under
+// ConfirmRequired — the default — link-time confirmation is disabled entirely
+// and the decision is made on the served response (see collectValidatedLinks /
+// OnFileDiscovered), so a genuine reference is no longer treated as proof.
+//
+// Two guards keep this from firing on noise:
+//
+//   - SPA gate: on a JS-shell SPA (Next.js/React/Angular/Vue/Svelte) the server
+//     returns the same index shell for every path, so a path bearing .php/.aspx/
+//     .do/… is almost never a real route. Every confirmation candidate is a
+//     server-side extension, so on a SPA we never confirm one from a link.
+//   - Source gate: only links the application genuinely references count (see
+//     LinkSourceType.IsGenuineReference); URL-like strings scavenged from JS/HTML
+//     body text are not proof the server serves that extension.
+func (e *Engine) extensionConfirmAllowed(src spider.LinkSourceType) bool {
+	return !e.startURLIsModernApp && src.IsGenuineReference()
+}
+
+// collectValidatedLinks validates all extracted links and returns one batch per
+// origin (scheme://host). Handles observed name/extension extraction and
+// breadcrumb processing.
+//
+// Links are grouped by origin because the spider scope admits sibling
+// subdomains, so a single page can legitimately reference links on multiple
+// hosts (e.g. api.example.com/users and admin.example.com/panel). Batching all
+// paths under one BaseURL — historically the first link's host — would replay
+// every path against whichever host appeared first, silently requesting paths
+// against the wrong host. One batch per origin keeps each path bound to its own
+// host.
+//
 // NOTE: Spider tasks do NOT increment depth and have no maxDepth limit.
-func (e *Engine) collectValidatedLinks(links []*url.URL, parentDepth uint16) *SpiderLinkBatch {
-	var files, dirs [][]byte
-	var baseURL []byte
+func (e *Engine) collectValidatedLinks(links []*spider.DiscoveredLink, parentDepth uint16) []*SpiderLinkBatch {
+	// originBatch accumulates the files/directories for a single origin.
+	type originBatch struct {
+		files, dirs [][]byte
+	}
+	batches := make(map[string]*originBatch)
+	var order []string // first-seen origin order → deterministic task creation
 
-	for _, link := range links {
+	// Pre-pass: record every directory that directly holds a content-hash
+	// fingerprinted bundle before breadcrumb processing (below) recurses into any
+	// of them, so the skip decision is independent of link order within the batch.
+	for _, dl := range links {
+		if dl != nil && dl.URL != nil {
+			e.recordHashedAssetParent(dl.URL)
+		}
+	}
+
+	for _, dl := range links {
+		if dl == nil || dl.URL == nil {
+			continue
+		}
+		link := dl.URL
+
+		// Under ConfirmRequired (the default) a spider link never confirms a
+		// server-side extension: a path like /citation.cfm or /sharer.php in an
+		// <a href> — even a genuine same-host one — is no proof the server serves
+		// it. Confirmation is deferred to the served path (OnFileDiscovered, gated
+		// on scope + the analyzer's non-soft-404 verdict). Names/paths are still
+		// harvested. Legacy mode keeps the old source-type-gated eager behaviour.
+		eagerConfirm := !e.config.Extensions.ConfirmRequired && e.extensionConfirmAllowed(dl.SourceType)
+
 		// Extract and track observed names/extensions using unified metadata extractor.
-		// Spider links are trusted sources - they come from actual URLs in the response.
 		// Pass depth=0 here; extension task generation is handled separately below.
-		meta := e.applyFileMetadata(link.Path, 0)
+		meta := e.applyFileMetadata(link.Path, 0, eagerConfirm)
 
-		// Generate dynamic extension tasks for newly discovered extensions during spidering
-		if meta.Extension != "" {
+		// Legacy-mode only: generate dynamic extension tasks for newly discovered
+		// extensions during spidering. Under ConfirmRequired this whole branch is
+		// off (eagerConfirm is false) — the served path drives confirmation + fuzz.
+		if eagerConfirm && meta.Extension != "" {
 			wasNew := e.addObservedExtensionIfNew(meta.Extension)
 			linkDepth := pathDepth(link.Path)
 			if wasNew && e.config.Extensions.TestObserved && linkDepth > 0 {
@@ -134,9 +208,14 @@ func (e *Engine) collectValidatedLinks(links []*url.URL, parentDepth uint16) *Sp
 		// Extract breadcrumbs (triggers recursive brute force)
 		e.processSpiderPathBreadcrumbs(link, parentDepth)
 
-		// Set base URL from first valid link
-		if baseURL == nil {
-			baseURL = []byte(link.Scheme + "://" + link.Host)
+		// Resolve the batch for this link's own origin (never re-based onto a
+		// different sibling host).
+		origin := link.Scheme + "://" + link.Host
+		b := batches[origin]
+		if b == nil {
+			b = &originBatch{}
+			batches[origin] = b
+			order = append(order, origin)
 		}
 
 		// Build path with query params for HTTP request
@@ -148,22 +227,57 @@ func (e *Engine) collectValidatedLinks(links []*url.URL, parentDepth uint16) *Sp
 
 		// Categorize as file or directory based on path (not query)
 		if len(link.Path) > 0 && link.Path[len(link.Path)-1] == '/' {
-			dirs = append(dirs, []byte(pathWithQuery))
+			b.dirs = append(b.dirs, []byte(pathWithQuery))
 		} else {
-			files = append(files, []byte(pathWithQuery))
+			b.files = append(b.files, []byte(pathWithQuery))
 		}
 	}
 
-	if len(files) == 0 && len(dirs) == 0 {
+	if len(order) == 0 {
 		return nil
 	}
 
-	return &SpiderLinkBatch{
-		Files:       files,
-		Directories: dirs,
-		Depth:       parentDepth, // Pass as-is, NOT incremented
-		BaseURL:     baseURL,
+	result := make([]*SpiderLinkBatch, 0, len(order))
+	for _, origin := range order {
+		b := batches[origin]
+		if len(b.files) == 0 && len(b.dirs) == 0 {
+			continue
+		}
+		result = append(result, &SpiderLinkBatch{
+			Files:       b.files,
+			Directories: b.dirs,
+			Depth:       parentDepth, // Pass as-is, NOT incremented
+			BaseURL:     []byte(origin),
+		})
 	}
+	return result
+}
+
+// queueReferencedURL enqueues one application-referenced URL (a redirect
+// Location) as a spider task: in scope only, path + query kept, directory form
+// when the path ends in "/". The request cache dedups repeats.
+func (e *Engine) queueReferencedURL(rawURL string, depth uint16) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return
+	}
+	if e.spiderScope != nil && !e.spiderScope.IsInScope(u) {
+		return
+	}
+	p := u.EscapedPath()
+	if p == "" {
+		p = "/"
+	}
+	if u.RawQuery != "" {
+		p += "?" + u.RawQuery
+	}
+	batch := &SpiderLinkBatch{Depth: depth, BaseURL: []byte(u.Scheme + "://" + u.Host)}
+	if strings.HasSuffix(u.Path, "/") || u.Path == "" {
+		batch.Directories = [][]byte{[]byte(p)}
+	} else {
+		batch.Files = [][]byte{[]byte(p)}
+	}
+	e.createSpiderBatchTask(batch)
 }
 
 // createSpiderBatchTask creates a single task from batched spider links.
@@ -191,16 +305,33 @@ func (e *Engine) createSpiderBatchTask(batch *SpiderLinkBatch) {
 	}
 }
 
+// vendorJSFetchBudget caps how many vendor/CDN/library JS bundles are fetched
+// per scan for jstangle endpoint extraction. These bundles are analyzed for the
+// real API calls they make (their path→wordlist amplification is suppressed
+// separately in the coordinator), but a site that self-hosts many framework
+// files must not flood the JS fetcher — hence a bounded, scan-lifetime budget.
+const vendorJSFetchBudget = 50
+
+// admitVendorJSFetch reports whether another vendor/CDN/library JS bundle may be
+// fetched under the per-scan asset budget. Safe for concurrent callers.
+func (e *Engine) admitVendorJSFetch() bool {
+	return e.vendorJSFetched.Add(1) <= vendorJSFetchBudget
+}
+
 // queueJSFetch creates a single batched JSFetchTask for all JavaScript URLs.
 // JS files are fetched and parsed to extract API paths
 // that get added to observedPaths and observedNames collections.
 //
-// CDN domains and known library files are skipped entirely
-// as they don't contain application-specific endpoints.
+// Vendor/CDN/library assets are NOT skipped entirely: they are still fetched for
+// jstangle endpoint extraction (the API calls a bundle makes are real regardless
+// of where it's hosted — the coordinator suppresses only their path→wordlist
+// amplification), but under a bounded per-scan asset budget and excluded from the
+// observed-JS-dir wordlist sweep. Previously they were dropped here, which made
+// the coordinator's vendor-analysis branch dead code.
 //
 // URLs are deduplicated by normalized form (scheme://host/path, query params stripped)
 // before batching to avoid fetching the same file multiple times.
-func (e *Engine) queueJSFetch(jsURLs []*url.URL, _ uint16) {
+func (e *Engine) queueJSFetch(jsURLs []*url.URL, provenance TaskProvenance) {
 	if len(jsURLs) == 0 {
 		return
 	}
@@ -214,20 +345,31 @@ func (e *Engine) queueJSFetch(jsURLs []*url.URL, _ uint16) {
 			continue
 		}
 
-		// Skip CDN domains and library files entirely
-		if spider.ShouldSkipJSPathExtraction(jsURL) {
-			continue
-		}
-
 		// Normalize URL for dedup: scheme://host/path (strip query params)
 		normalizedURL := strings.ToLower(jsURL.Scheme) + "://" +
 			strings.ToLower(jsURL.Host) + jsURL.Path
 
-		// URL-level dedup across all batches
+		// URL-level dedup across all batches (before consuming any budget).
 		if e.seenJSURLs != nil && e.seenJSURLs.IsSeen(normalizedURL) {
 			logger.Debug("JS URL already seen, skipping",
 				zap.String("url", jsURL.String()))
 			continue
+		}
+
+		if spider.ShouldSkipJSPathExtraction(jsURL) {
+			// Vendor/CDN/library asset: still fetched for jstangle endpoint
+			// extraction, but capped by a separate asset budget so a site that
+			// self-hosts many framework files can't flood the JS fetcher. Not fed
+			// to the observed-JS-dir wordlist sweep.
+			if !e.admitVendorJSFetch() {
+				logger.Debug("Vendor JS asset budget exhausted, skipping",
+					zap.String("url", jsURL.String()))
+				continue
+			}
+		} else {
+			// First-party JS: remember the app's real JS mount directory for the
+			// JS-bundle sweep (e.g. /js/, /assets/js/) so it probes there too.
+			e.recordObservedJSDir(jsURL)
 		}
 
 		// Add full URL (with query if present) for actual fetch
@@ -240,7 +382,8 @@ func (e *Engine) queueJSFetch(jsURLs []*url.URL, _ uint16) {
 
 	// Create single batched task
 	task := NewJSFetchTask(&JSFetchTaskConfig{
-		JSURLs: validURLs,
+		JSURLs:     validURLs,
+		Provenance: provenance,
 	})
 
 	if task != nil && e.AddTask(task) {
@@ -292,6 +435,13 @@ func (e *Engine) queueFormSubmission(forms []*spider.FormRequest, sourceURL *url
 			logger.Debug("Skipping out-of-scope form action",
 				zap.String("action", form.URL.String()),
 				zap.String("source", sourceURL.String()))
+			continue
+		}
+
+		// Replay safety: a form the policy refuses is never sent; it
+		// survives as a request-only stub (TemplateWithheldPolicy).
+		if reason := e.formSafety().FormWithheldReason(form.Method, form); reason != "" {
+			e.noteWithheldForm(sourceURL, form, reason)
 			continue
 		}
 
@@ -389,5 +539,51 @@ func (e *Engine) extractWordsFromResponse(rc *responsechain.ResponseChain) {
 		logger.Debug("Words extracted from response body",
 			zap.String("content_type", contentType),
 			zap.Int("count", extractedCount))
+	}
+}
+
+// formSafety is the replay-safety policy for form submission: the engine's
+// FormSafety, else the JS replay policy.
+func (e *Engine) formSafety() ReplaySafety {
+	if v := strings.TrimSpace(e.config.Engine.FormSafety); v != "" {
+		return ParseReplaySafety(v)
+	}
+	return ParseReplaySafety(e.config.JSTangle.ReplaySafety)
+}
+
+// noteWithheldForm records a refused form as a withheld request template so
+// RequestTemplateOutcomes persists it as a stub.
+func (e *Engine) noteWithheldForm(sourceURL *url.URL, form *spider.FormRequest, reason string) {
+	if form == nil || form.URL == nil {
+		return
+	}
+	src := ""
+	if sourceURL != nil {
+		src = sourceURL.String()
+	}
+	method := strings.ToUpper(strings.TrimSpace(form.Method))
+	if method == "" {
+		method = "GET"
+	}
+	fact := jstangle.HTTPRequestFact{
+		URL:        jstangle.ValueTemplate{Rendered: form.URL.String(), Static: true},
+		Method:     jstangle.ValueTemplate{Rendered: method, Static: true},
+		Client:     "html-form",
+		Provenance: jstangle.Provenance{Extractor: "html-form", Confidence: "high"},
+	}
+	if form.Body != "" {
+		fact.Body = &jstangle.BodyTemplate{Kind: "form", ContentType: form.ContentType,
+			Value: jstangle.ValueTemplate{Rendered: form.Body, Static: true}}
+	}
+	if form.ContentType != "" {
+		fact.Headers = append(fact.Headers, jstangle.HeaderTemplate{
+			Name:  jstangle.ValueTemplate{Rendered: "Content-Type", Static: true},
+			Value: jstangle.ValueTemplate{Rendered: form.ContentType, Static: true},
+		})
+	}
+	fact.ID = stableTemplateID(src, fact.URL.Rendered, method, form.Body)
+	if e.templateRegistry().AddWithheld(src, fact, ReplayNote{Outcome: TemplateWithheldPolicy, Reason: reason, Method: method, URL: form.URL.String()}) {
+		logger.Debug("Form withheld by replay safety policy",
+			zap.String("action", form.URL.String()), zap.String("method", method), zap.String("reason", reason))
 	}
 }

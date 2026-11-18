@@ -9,22 +9,11 @@ const (
 )
 
 var (
-	ModuleDesc = `## Description
-Passively identifies Ruby on Rails installations by analyzing HTTP response headers
-(X-Request-Id, X-Runtime, Server), cookies (_session suffix), default error page
-patterns, and body content markers (__VIEWSTATE absence with Rails patterns).
+	ModuleDesc = `**What it means:** The application reveals it is built on Ruby on Rails, fingerprinted passively via signals such as the X-Request-Id and X-Runtime headers, a Rails _session cookie, or HTML markers like default 404/500 pages and the CSRF meta tag. Informational technology disclosure, not a vulnerability.
 
-## Notes
-- Passive only: does not send any HTTP requests
-- Detects Rails via X-Request-Id + X-Runtime header combination
-- Identifies Puma/Unicorn/Passenger server headers
-- Recognizes default Rails 404/500 error page text
-- Detects Rails session cookies by naming convention
-- Deduplicates by host to avoid redundant processing
+**How it's exploited:** Knowing the framework lets an attacker target Rails-specific weaknesses: deserialization and CVE chains in Rails, Devise, or gems, mass-assignment, and Action Cable or Active Storage endpoints.
 
-## References
-- https://guides.rubyonrails.org/configuring.html
-- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/02-Fingerprint_Web_Server`
+**Fix:** Strip framework-identifying headers (X-Runtime, X-Request-Id, Server) at the reverse proxy and replace default Rails error pages with generic custom pages.`
 
 	ModuleConfirmation = "Confirmed when Rails-specific headers, cookies, or body patterns are detected in the response"
 	ModuleSeverity     = severity.Info

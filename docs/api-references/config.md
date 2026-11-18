@@ -9,7 +9,7 @@ Returns the full server configuration as flattened dot-notation key-value pairs.
 | Parameter        | Type   | Default | Description                                  |
 |------------------|--------|---------|----------------------------------------------|
 | `filter`         | string |         | Substring match on key name                  |
-| `show_sensitive` | string | `false` | Set to `true` to show unredacted sensitive values |
+| `show_sensitive` | string | `false` | Set to `true` to show unredacted sensitive values. Admin role only; ignored for viewer and operator tokens and on `--view-only` servers |
 
 ```bash
 # View all config
@@ -18,7 +18,7 @@ curl -s http://localhost:9002/api/config | jq .
 # Filter by section
 curl -s 'http://localhost:9002/api/config?filter=scope' | jq .
 
-# Show sensitive values
+# Show sensitive values (admin token required)
 curl -s 'http://localhost:9002/api/config?show_sensitive=true' | jq .
 ```
 
@@ -57,7 +57,9 @@ curl -s 'http://localhost:9002/api/config?show_sensitive=true' | jq .
 
 Updates one or more configuration values using dot-notation keys. Values are coerced to match the existing field type (bool, int, float, string, or comma-separated list). Changes are persisted to the config file on disk.
 
-Reloadable sections (scope, notify, audit, mutation_strategy) take effect immediately. Server and database changes require a restart.
+Reloadable sections (`scope`, `notify`, `dynamic-assessment`,
+`mutation_strategy`, `scanning_strategy`, `scanning_pace`, `storage`, and
+`agent`) take effect immediately. Other sections require a restart.
 
 **Request body:** JSON object mapping dot-notation keys to string values.
 
@@ -75,16 +77,30 @@ curl -s -X POST http://localhost:9002/api/config \
   -d '{
     "notify.enabled": "true",
     "scope.applied_on_ingest": "true",
-    "audit.extensions.enabled": "false"
+    "dynamic-assessment.extensions.enabled": "false"
   }' | jq .
 
 # Update a list value (comma-separated)
 curl -s -X POST http://localhost:9002/api/config \
   -H "Content-Type: application/json" \
   -d '{
-    "audit.enabled_modules.active_modules": "xss-scanner,sqli-error-based,lfi-path-traversal"
+    "dynamic-assessment.enabled_modules.active_modules": "xss-scanner,sqli-error-based,lfi-path-traversal"
+  }' | jq .
+
+# Update a list value (JSON list inside the string)
+curl -s -X POST http://localhost:9002/api/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope.host.include": "[\"*.example.com\",\"example.com\"]"
   }' | jq .
 ```
+
+Values are parsed exactly as `vigolium config set` parses them: list and map
+settings take JSON or YAML flow syntax checked against the setting's type (or
+the comma form for lists), and a value that would introduce an error-level
+`config validate` issue at its key (an empty or malformed scope pattern, a host
+pattern with a scheme, an unknown `cli_origin_mode`, ...) is rejected and
+reported under `errors` without being applied.
 
 **Response (success):**
 
@@ -120,8 +136,10 @@ If some keys are valid and others are not, valid keys are still applied. The res
 
 The server watches the config file (`~/.vigolium/vigolium-configs.yaml`) for changes. When the file is modified — whether by a text editor, the CLI (`vigolium config set`), or any other tool — reloadable sections are automatically applied without restarting the server.
 
-**Reloadable sections:** `scope`, `notify`, `audit`, `mutation_strategy`
+**Reloadable sections:** `scope`, `notify`, `dynamic-assessment`,
+`mutation_strategy`, `scanning_strategy`, `scanning_pace`, `storage`, `agent`
 
-**Non-reloadable sections:** `server`, `database` (a warning is logged; restart required)
+All other top-level sections are non-reloadable (a warning is logged; restart
+the server for those changes).
 
 Changes made via the API (`POST /api/config`, `POST /api/scope`) do not trigger a redundant reload.
